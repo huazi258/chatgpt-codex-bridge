@@ -1,0 +1,59 @@
+:root {
+  color: #162036;
+  background: #eff3f9;
+  font-family: Inter, "Microsoft YaHei UI", system-ui, sans-serif;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 900px; }
+button, input, textarea { font: inherit; }
+button { cursor: pointer; }
+
+.shell { display: grid; grid-template-columns: 290px minmax(610px, 1fr); min-height: 100vh; }
+.sidebar { display: flex; flex-direction: column; gap: 26px; padding: 34px 24px; color: #f5f8ff; background: #18233c; }
+.workspace { max-width: 940px; width: 100%; padding: 44px 56px 60px; }
+header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+h1, h2, h3, p { margin-top: 0; }
+h1 { margin-bottom: 8px; font-size: 27px; letter-spacing: -.04em; }
+h2 { margin-bottom: 0; font-size: 32px; letter-spacing: -.04em; }
+h3 { margin-bottom: 20px; font-size: 16px; }
+.eyebrow, .section-label { margin-bottom: 8px; color: #7891b7; font-size: 11px; font-weight: 800; letter-spacing: .11em; }
+.muted, .empty { color: #b6c4dc; font-size: 14px; line-height: 1.55; }
+.status-pill { padding: 7px 10px; border: 1px solid #9fceac; border-radius: 999px; color: #196340; background: #e7f7eb; font-size: 12px; font-weight: 800; letter-spacing: .07em; }
+.notice { min-height: 48px; margin-bottom: 26px; padding: 14px 16px; border: 1px solid #d6e0ed; border-radius: 10px; background: #f8fbff; color: #49617f; line-height: 1.45; }
+.form-section { margin-bottom: 22px; padding: 26px; border: 1px solid #d9e1ec; border-radius: 14px; background: #fff; box-shadow: 0 6px 20px rgba(24, 35, 60, .04); }
+label { display: grid; gap: 8px; margin-bottom: 17px; color: #47536a; font-size: 13px; font-weight: 700; }
+label:last-child { margin-bottom: 0; }
+input { width: 100%; padding: 11px 12px; border: 1px solid #cbd5e3; border-radius: 8px; outline: none; color: #17233b; background: #fcfdff; font-size: 14px; font-weight: 500; }
+input:focus { border-color: #5379c7; box-shadow: 0 0 0 3px rgba(83, 121, 199, .14); }
+textarea { width: 100%; resize: vertical; padding: 11px 12px; border: 1px solid #cbd5e3; border-radius: 8px; outline: none; color: #17233b; background: #fcfdff; font-size: 14px; font-weight: 500; line-height: 1.45; }
+textarea:focus { border-color: #5379c7; box-shadow: 0 0 0 3px rgba(83, 121, 199, .14); }
+.budget-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.actions { display: flex; justify-content: space-between; gap: 12px; }
+.primary, .danger { padding: 11px 15px; border: 0; border-radius: 8px; font-weight: 800; }
+.primary { color: white; background: #355fba; }
+.primary:hover { background: #284e9f; }
+.full { width: 100%; }
+.danger { color: #a82f39; background: #ffeef0; }
+button:disabled { cursor: wait; opacity: .55; }
+nav { display: grid; gap: 9px; }
+.module-card { display: grid; gap: 5px; width: 100%; padding: 13px; border: 1px solid transparent; border-radius: 9px; color: #dce6f6; background: transparent; text-align: left; }
+.module-card:hover, .module-card.selected { border-color: #5e78aa; background: #26385d; }
+.module-card strong { font-size: 14px; }
+.module-card span { color: #9fb1d0; font-size: 12px; }
+.execution-section { display: grid; gap: 15px; }
+.execution-heading { display: flex; justify-content: space-between; gap: 18px; }
+.execution-heading h3 { margin-bottom: 7px; }
+.execution-heading p { margin: 0; color: #66738a; font-size: 13px; line-height: 1.5; }
+.execution-phase { align-self: start; padding: 6px 9px; border-radius: 999px; color: #5a6981; background: #edf1f7; font-size: 11px; font-weight: 800; letter-spacing: .06em; }
+.execution-phase.running, .execution-phase.starting { color: #8a5b00; background: #fff3d4; }
+.execution-phase.completed { color: #196340; background: #e7f7eb; }
+.execution-phase.blocked, .execution-phase.failed { color: #a82f39; background: #ffeef0; }
+.execution-status { margin: -3px 0 0; color: #52637d; font-size: 13px; }
+.execution-result { display: grid; gap: 8px; padding: 14px; border: 1px solid #d9e1ec; border-radius: 9px; background: #f8fbff; color: #33445f; font-size: 13px; }
+.execution-result pre { max-height: 190px; margin: 0; overflow: auto; white-space: pre-wrap; font: 12px/1.5 ui-monospace, Consolas, monospace; }
+.execution-result small { color: #74839a; }
+.secondary { align-self: start; padding: 11px 15px; border: 1px solid #aac0e7; border-radius: 8px; color: #284e9f; background: #edf3ff; font-weight: 800; }
+.inline-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.protocol-result { margin: 0; color: #196340; font-size: 13px; font-weight: 800; }

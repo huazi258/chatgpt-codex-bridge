@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>ChatGPT middleware</title>
+    <style>
+      body { width: 320px; font: 14px system-ui, sans-serif; margin: 16px; }
+      button { width: 100%; padding: 9px; }
+      pre { white-space: pre-wrap; word-break: break-word; color: #333; }
+    </style>
+  </head>
+  <body>
+    <label>Desktop pairing secret<input id="pairing-secret" type="password" autocomplete="off"></label>
+    <button id="pair">Pair active ChatGPT tab</button>
+    <button id="inspect">Check current adapter</button>
+    <button id="run">Run harmless ChatGPT smoke test</button>
+    <pre id="result">Open a signed-in ChatGPT conversation, pair this tab, then run a test.</pre>
+    <script src="popup.js"></script>
+  </body>
+</html>

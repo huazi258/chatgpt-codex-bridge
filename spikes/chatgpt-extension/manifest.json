@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT × Codex Middleware",
+  "version": "0.4.0",
+  "description": "Local ChatGPT adapter for the ChatGPT × Codex middleware.",
+  "permissions": ["activeTab", "tabs", "scripting", "storage"],
+  "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1:8765/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:8765"
+  },
+  "action": {
+    "default_title": "ChatGPT × Codex Middleware",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["protocol-text.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,166 @@
+const bridgeUrl = 'ws://127.0.0.1:8765';
+const contentAdapterVersion = '0.6.0';
+let socket = null;
+let sessionId = null;
+let pairedTabId = null;
+let pairingSecret = null;
+let reconnectTimer = null;
+let heartbeatTimer = null;
+
+function hasNoReceiver(error) {
+  return /Receiving end does not exist/i.test(error?.message ?? '');
+}
+
+async function sendToChatGPTTab(tabId, message) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch (error) {
+    if (!hasNoReceiver(error)) throw error;
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['protocol-text.js', 'content.js'] });
+    return chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
+async function ensureLatestContentAdapter(tabId) {
+  let status;
+  try {
+    status = await chrome.tabs.sendMessage(tabId, { type: 'adapterStatusV2' });
+  } catch (error) {
+    if (!hasNoReceiver(error)) throw error;
+  }
+
+  if (status?.ok && status.adapterVersion === contentAdapterVersion) return;
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['protocol-text.js', 'content.js']
+  });
+  status = await chrome.tabs.sendMessage(tabId, { type: 'adapterStatusV2' });
+  if (!status?.ok || status.adapterVersion !== contentAdapterVersion) {
+    throw new Error('The current ChatGPT tab did not load the required protocol adapter version.');
+  }
+}
+
+async function inspectProtocolAdapter(tabId) {
+  await ensureLatestContentAdapter(tabId);
+  const probe = await chrome.tabs.sendMessage(tabId, { type: 'adapterProbeV3' });
+  if (!probe?.ok || probe.adapterVersion !== contentAdapterVersion) {
+    throw new Error('The ChatGPT tab did not return a valid adapter inspection result.');
+  }
+  return { extensionVersion: contentAdapterVersion, ...probe };
+}
+
+async function savePairing(pairingSecret, tabId) {
+  await chrome.storage.local.set({ pairingSecret, pairedTabId: tabId });
+}
+
+function connectionStatus() {
+  return {
+    connected: socket?.readyState === WebSocket.OPEN,
+    paired: Boolean(sessionId),
+    tabId: pairedTabId
+  };
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (socket?.readyState === WebSocket.OPEN && sessionId) {
+      socket.send(JSON.stringify({ type: 'keepAlive', sessionId }));
+    }
+  }, 15_000);
+}
+
+function scheduleReconnect() {
+  if (!pairingSecret || !pairedTabId || reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect(pairingSecret, pairedTabId).catch(() => scheduleReconnect());
+  }, 2_000);
+}
+
+async function connect(secret, tabId) {
+  if (socket) socket.close();
+  pairingSecret = secret;
+  sessionId = null;
+  pairedTabId = tabId;
+  stopHeartbeat();
+  await savePairing(secret, tabId);
+
+  const nextSocket = new WebSocket(bridgeUrl);
+  socket = nextSocket;
+  nextSocket.addEventListener('open', () => {
+    nextSocket.send(JSON.stringify({ type: 'pair', pairingSecret: secret, tabId }));
+  });
+  nextSocket.addEventListener('message', async (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === 'paired') {
+      sessionId = message.sessionId;
+      startHeartbeat();
+      return;
+    }
+    if (message.type === 'sendChatGptMessage' && message.sessionId === sessionId) {
+      try {
+        await ensureLatestContentAdapter(pairedTabId);
+        const response = await chrome.tabs.sendMessage(pairedTabId, {
+          type: 'sendMiddlewareMessageV2',
+          text: message.text
+        });
+        if (!response?.ok) throw new Error(response?.error || 'ChatGPT tab did not return a reply.');
+        socket?.send(JSON.stringify({
+          type: 'chatgptReply',
+          sessionId,
+          text: response.response,
+          protocolJson: typeof response.protocolJson === 'string' ? response.protocolJson : undefined
+        }));
+      } catch (error) {
+        socket?.send(JSON.stringify({
+          type: 'chatgptReply',
+          sessionId,
+          text: `Protocol adapter failed before a reply was received: ${error.message}`
+        }));
+      }
+    }
+  });
+  nextSocket.addEventListener('close', () => {
+    if (socket !== nextSocket) return;
+    sessionId = null;
+    stopHeartbeat();
+    scheduleReconnect();
+  });
+  nextSocket.addEventListener('error', () => undefined);
+}
+
+async function restorePairing() {
+  const { pairingSecret, pairedTabId: tabId } = await chrome.storage.local.get(['pairingSecret', 'pairedTabId']);
+  if (pairingSecret && Number.isInteger(tabId) && tabId > 0) {
+    connect(pairingSecret, tabId).catch(() => undefined);
+  }
+}
+
+chrome.runtime.onStartup.addListener(restorePairing);
+chrome.runtime.onInstalled.addListener(restorePairing);
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'pairDesktop') {
+    ensureLatestContentAdapter(message.tabId)
+      .then(() => connect(message.pairingSecret, message.tabId))
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message?.type === 'inspectProtocolAdapter') {
+    inspectProtocolAdapter(message.tabId)
+      .then((inspection) => sendResponse({ ok: true, inspection }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message?.type === 'bridgeStatus') {
+    sendResponse({ ok: true, ...connectionStatus() });
+  }
+});
