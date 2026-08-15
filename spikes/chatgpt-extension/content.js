@@ -1,5 +1,5 @@
 (() => {
-const contentAdapterVersion = '0.6.0';
+const contentAdapterVersion = '1.0.0';
 const assistantMessageSelector = '[data-message-author-role="assistant"]';
 const composerSelector = '#prompt-textarea';
 const sendButtonSelectors = [
@@ -19,8 +19,7 @@ function isGenerating() {
   return Boolean(document.querySelector(stopButtonSelector));
 }
 
-function latestAssistantReply() {
-  const message = assistantMessages().at(-1);
+function replyFromAssistantMessage(message) {
   if (!message) return { text: '', protocolJson: null };
   const codeNodes = [...message.querySelectorAll('pre code')];
   const fallbackNodes = codeNodes.length ? codeNodes : [...message.querySelectorAll('pre')];
@@ -29,6 +28,28 @@ function latestAssistantReply() {
     text: globalThis.restoreProtocolCodeBlock(message.innerText, codeBlocks),
     protocolJson: globalThis.extractProtocolJsonObject(message.innerText, codeBlocks)
   };
+}
+
+function latestAssistantReply() {
+  return replyFromAssistantMessage(assistantMessages().at(-1));
+}
+
+function protocolReplySince(previousCount) {
+  return assistantMessages()
+    .slice(previousCount)
+    .reverse()
+    .map(replyFromAssistantMessage)
+    .find((reply) => Boolean(reply.protocolJson)) ?? null;
+}
+
+function assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages) {
+  return assistantMessages().map((message, index) => {
+    const reply = replyFromAssistantMessage(message);
+    const codeBlocks = message.querySelectorAll('pre, pre code').length;
+    const isNew = !baselineAssistantText.has(message);
+    const changed = changedAssistantMessages.has(message) || baselineAssistantText.get(message) !== message.innerText;
+    return `#${index}${index >= previousCount ? '*' : ''}(chars=${message.innerText.length},new=${isNew},changed=${changed},code=${codeBlocks},json=${Boolean(reply.protocolJson)})`;
+  }).join(', ');
 }
 
 function textOfLatestAssistantMessage() {
@@ -67,11 +88,22 @@ function waitForSendButton(composer, timeoutMs = 2_000) {
   });
 }
 
-function waitForCompletedAssistantReply(previousCount, timeoutMs = 60_000) {
+function waitForCompletedAssistantReply(previousCount, baselineAssistantText, requireProtocolJson = false, timeoutMs = 90_000) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     let stableSince = 0;
-    const observer = new MutationObserver(check);
+    let latestSignature = '';
+    const changedAssistantMessages = new Set();
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        const element = mutation.target.nodeType === Node.ELEMENT_NODE
+          ? mutation.target
+          : mutation.target.parentElement;
+        const assistant = element?.closest?.(assistantMessageSelector);
+        if (assistant) changedAssistantMessages.add(assistant);
+      }
+      check();
+    });
     const timer = setInterval(check, 250);
 
     function finish(error, value) {
@@ -82,19 +114,38 @@ function waitForCompletedAssistantReply(previousCount, timeoutMs = 60_000) {
 
     function check() {
       const messageCount = assistantMessages().length;
+      const changedReplies = assistantMessages()
+        .filter((message) => changedAssistantMessages.has(message)
+          || !baselineAssistantText.has(message)
+          || baselineAssistantText.get(message) !== message.innerText)
+        .map(replyFromAssistantMessage);
+      const protocolReply = requireProtocolJson
+        ? changedReplies.find((reply) => Boolean(reply.protocolJson)) ?? null
+        : null;
+      const latestReply = protocolReply ?? latestAssistantReply();
+      const signature = `${messageCount}\n${latestReply.text}`;
       if (Date.now() - startedAt > timeoutMs) {
-        finish(new Error('Timed out waiting for the ChatGPT reply to finish.'));
+        const error = new Error(requireProtocolJson
+          ? 'Timed out waiting for a complete structured protocol JSON reply.'
+          : 'Timed out waiting for the ChatGPT reply to finish.');
+        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},current=${messageCount},changed=${changedAssistantMessages.size}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
+        finish(error);
         return;
       }
 
-      if (messageCount <= previousCount || isGenerating()) {
+      if (signature !== latestSignature) {
+        latestSignature = signature;
+        stableSince = 0;
+      }
+
+      if ((requireProtocolJson && !protocolReply) || (!requireProtocolJson && messageCount <= previousCount) || (!requireProtocolJson && isGenerating())) {
         stableSince = 0;
         return;
       }
 
       if (!stableSince) stableSince = Date.now();
-      if (Date.now() - stableSince >= 1_000) {
-        finish(null, latestAssistantReply());
+      if (Date.now() - stableSince >= 2_000) {
+        finish(null, latestReply);
       }
     }
 
@@ -141,7 +192,9 @@ async function sendAndWait(text, includeProtocolJson = false) {
     if (isGenerating()) throw new Error('ChatGPT is still generating; wait before starting the smoke test.');
 
     stage = 'counting existing assistant messages';
-    const previousCount = assistantMessages().length;
+    const previousMessages = assistantMessages();
+    const previousCount = previousMessages.length;
+    const baselineAssistantText = new Map(previousMessages.map((message) => [message, message.innerText]));
     stage = 'focusing composer';
     composer.focus();
     stage = 'setting composer text';
@@ -156,7 +209,7 @@ async function sendAndWait(text, includeProtocolJson = false) {
     sendButton.click();
 
     stage = 'waiting for completed reply';
-    const reply = await waitForCompletedAssistantReply(previousCount);
+    const reply = await waitForCompletedAssistantReply(previousCount, baselineAssistantText, includeProtocolJson);
     return includeProtocolJson ? reply : reply.text;
   } catch (error) {
     error.message = `${stage}: ${error.message}`;
@@ -171,7 +224,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === 'adapterProbeV3') {
-    const reply = latestAssistantReply();
+    const reply = protocolReplySince(0) ?? latestAssistantReply();
     sendResponse({
       ok: true,
       adapterVersion: contentAdapterVersion,
@@ -207,8 +260,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendAndWait(message.text, message.type === 'sendMiddlewareMessageV2')
       .then((response) => sendResponse(typeof response === 'string'
         ? { ok: true, response }
-        : { ok: true, response: response.text, protocolJson: response.protocolJson }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
+        : {
+            ok: true,
+            response: response.text,
+            protocolJson: response.protocolJson,
+            protocolJsonPresent: Boolean(response.protocolJson),
+            adapterVersion: contentAdapterVersion
+          }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: error.message,
+        protocolJsonPresent: false,
+        adapterVersion: contentAdapterVersion,
+        adapterDiagnostic: error.adapterDiagnostic ?? null
+      }));
     return true;
   }
 });

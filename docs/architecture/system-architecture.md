@@ -26,7 +26,7 @@ The extension binds one dedicated ChatGPT tab, submits middleware-owned messages
 
 The middleware is the system of record for an active module. It validates ChatGPT protocol messages, starts and monitors Codex turns, enforces run budgets, records audit data, and controls user-visible pauses.
 
-Task 2 establishes the local storage boundary with an SQLite database owned by the desktop process. The initial schema contains `modules`, `budgets`, `turns`, `protocol_messages`, and `audit_events`. The only currently exposed operations create, reopen, update, list, and delete `INACTIVE` modules; they do not start external work or inspect the chosen repository.
+Task 2 establishes the local storage boundary with an SQLite database owned by the desktop process. The schema contains `modules`, `budgets`, `turns`, `protocol_messages`, `audit_events`, and `module_runtime`. `module_runtime` stores the current serial orchestration phase and completed-round count; each transition also appends an audit event. On restart, any in-progress runtime is converted to `PAUSED_FOR_ACCEPTANCE` before new external work can begin.
 
 ### Codex App Server adapter
 
@@ -42,8 +42,8 @@ The verifier confirms that the selected repository and branch match the active m
 2. The middleware sends the protocol bootstrap to ChatGPT through the extension.
 3. The protocol validator accepts a `NEXT_TASK` message or pauses the module.
 4. The App Server adapter runs the wrapped Codex prompt in the selected repository.
-5. After Codex finishes, the Git verifier checks the reported push and the middleware sends only the final text summary, branch, and commit SHA to ChatGPT.
-6. ChatGPT returns the next protocol state; the orchestrator either starts another turn or pauses.
+5. After Codex finishes, the middleware requires a reported commit SHA, verifies it is reachable from the selected local branch, and requires that local branch head to equal `origin/<target branch>`. It then records the verified turn and sends only the compact final summary, target branch, and commit SHA to ChatGPT for Review.
+6. ChatGPT returns the next protocol state; the persisted orchestrator either starts another turn or pauses.
 
 ## Invariants
 
@@ -52,3 +52,4 @@ The verifier confirms that the selected repository and branch match the active m
 - No Codex turn begins without a valid `NEXT_TASK` payload.
 - A budget never interrupts a Codex turn; it blocks starting a subsequent one.
 - A pause or block never auto-resumes after application restart.
+- A Codex completion cannot reach ChatGPT Review until its reported commit and remote branch verification succeed.

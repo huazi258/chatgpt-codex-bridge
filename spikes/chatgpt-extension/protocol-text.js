@@ -59,5 +59,5 @@ function restoreProtocolCodeBlock(visibleText, codeBlocks) {
 
 globalThis.restoreProtocolCodeBlock = restoreProtocolCodeBlock;
 globalThis.extractProtocolJsonObject = extractProtocolJsonObject;
-globalThis.chatGptMiddlewareProtocolTextVersion = '0.6.0';
+globalThis.chatGptMiddlewareProtocolTextVersion = '1.0.0';
 })();

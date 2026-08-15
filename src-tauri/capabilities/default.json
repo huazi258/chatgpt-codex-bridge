@@ -3,6 +3,5 @@
   "identifier": "default",
   "description": "Default capability for the local middleware shell.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "notification:default"]
 }
-

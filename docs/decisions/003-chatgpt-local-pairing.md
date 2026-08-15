@@ -1,6 +1,6 @@
 # 003 — ChatGPT local pairing and protocol boundary
 
-- Status: Accepted; live-browser validation pending
+- Status: Accepted; live-browser validation completed
 - Date: 2026-08-15
 - Decision: Pair the dedicated ChatGPT extension tab to the desktop application through a loopback-only WebSocket and an in-memory, one-time pairing secret.
 
@@ -14,7 +14,7 @@ The desktop app sends middleware-owned ChatGPT text through the paired extension
 
 - `BRIDGE_SMOKE_OK`: the running desktop bridge rejected an unauthorized pairing attempt at `127.0.0.1:8765`.
 - Rust tests verify valid `PAUSE` parsing and rejection of malformed `NEXT_TASK` and multiple code blocks.
-- The Chrome extension's live signed-in ChatGPT pairing and protocol-bootstrap exchange still requires a one-time manual check after reloading the unpacked extension.
+- On 2026-08-16, the signed-in Chrome extension paired with the desktop application and a protocol bootstrap completed successfully. The desktop UI displayed `已验证 ChatGPT 协议状态：PAUSE` and `协议已验证：PAUSE`.
 
 ## Keepalive repair
 
@@ -33,3 +33,9 @@ The next captured DOM shape included presentation chrome around the JSON (`JSON`
 The repeated live failure showed that even normalized text is the wrong interface between the extension and desktop validator. Adapter version `0.5.0` now returns the extracted JSON object as a separate `protocolJson` bridge field. The desktop validates that structured field when present and uses the fenced-text parser only for backwards compatibility. The Rust test `protocol_validator_accepts_structured_json_from_extension` failed before this path existed and passes after the repair.
 
 The live adapter probe later confirmed version `0.6.0` on both extension and ChatGPT tab, and confirmed that it could extract structured JSON, while the desktop still received an unfenced response. The desktop validator therefore also accepts one unique JSON object embedded in otherwise rendered ChatGPT text, after its preferred structured-field and fenced-block paths. It uses `serde_json` streaming parsing rather than brace counting, so quoted braces do not corrupt extraction. `protocol_validator_accepts_unfenced_json_with_chatgpt_presentation_chrome` reproduces the observed `JSON`/`Copy code` text and passes.
+
+The remaining timing race was in the content script: it could return one second after an assistant node appeared even while text was still streaming, because completion depended on a fragile stop-button selector. Adapter `0.7.0` requires a parsed `protocolJson` for V2 protocol dispatch and then waits for two seconds of unchanged reply text. If no structured object is returned before timeout, the desktop reports that precise adapter failure rather than a misleading missing-code-block error. Manifest and adapter versions are now both `0.7.0`.
+
+The first precise timeout showed that the last assistant DOM node can be an empty auxiliary node even when a preceding node contains the completed JSON. Adapter `0.8.0` scans all assistant nodes created after the task started and selects the most recent one with a parsed protocol object. Manifest and adapter versions are both `0.8.0`.
+
+The next timeout established that ChatGPT can also reuse an existing assistant DOM node, so node counts and post-count slicing are not reliable task boundaries. Adapter `1.0.0` records the text of every assistant node immediately before dispatch, tracks mutation-observer changes, and accepts only protocol JSON found in a node that is new or changed by that dispatch. Timeout reports include only counts, lengths, and boolean extraction results; no conversation text is exposed.

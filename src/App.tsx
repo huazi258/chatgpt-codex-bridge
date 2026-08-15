@@ -1,15 +1,24 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import {
   CodexExecutionEvent,
   CodexTurnResult,
   ChatGptBridgeStatus,
   ChatGptPairingInfo,
+  AcceptanceAction,
   emptyDraft,
   ModuleDraft,
-  ModuleRecord
+  ModuleRecord,
+  OrchestrationSnapshot
 } from './types';
+
+async function notifyPause(title: string, body: string) {
+  let granted = await isPermissionGranted();
+  if (!granted) granted = (await requestPermission()) === 'granted';
+  if (granted) sendNotification({ title, body });
+}
 
 function asDraft(module: ModuleRecord): ModuleDraft {
   return {
@@ -47,6 +56,8 @@ export default function App() {
   const [codexResult, setCodexResult] = useState<CodexTurnResult | null>(null);
   const [pairing, setPairing] = useState<ChatGptPairingInfo | null>(null);
   const [chatgptStatus, setChatgptStatus] = useState<ChatGptBridgeStatus | null>(null);
+  const [runtime, setRuntime] = useState<OrchestrationSnapshot | null>(null);
+  const [replanRequest, setReplanRequest] = useState('');
 
   const selected = useMemo(
     () => modules.find((module) => module.id === selectedId) ?? null,
@@ -73,6 +84,18 @@ export default function App() {
     setPairing(info);
   }
 
+  async function refreshRuntime(moduleId = selectedId) {
+    if (!moduleId) {
+      setRuntime(null);
+      return;
+    }
+    setRuntime(await invoke<OrchestrationSnapshot | null>('get_orchestration_snapshot', { moduleId }));
+  }
+
+  useEffect(() => {
+    refreshRuntime().catch((error) => setNotice(`无法读取模块运行状态：${String(error)}`));
+  }, [selectedId]);
+
   useEffect(() => {
     refreshPairing().catch((error) => setNotice(`无法启动 ChatGPT 本机桥接：${String(error)}`));
   }, []);
@@ -92,6 +115,10 @@ export default function App() {
     void listen<ChatGptBridgeStatus>('chatgpt-status', (event) => {
       setChatgptStatus(event.payload);
       refreshPairing().catch(() => undefined);
+      if (event.payload.phase === 'PAUSED_FOR_ACCEPTANCE' || event.payload.phase === 'BLOCKED') {
+        void notifyPause('ChatGPT × Codex Middleware 需要处理', event.payload.detail).catch(() => undefined);
+      }
+      refreshRuntime().catch(() => undefined);
     }).then((unsubscribe) => {
       unlisten = unsubscribe;
     });
@@ -194,6 +221,51 @@ export default function App() {
     }
   }
 
+  async function startModuleOrchestration() {
+    if (!selected) {
+      setNotice('请先创建并保存一个未运行模块。');
+      return;
+    }
+    if (!pairing?.paired) {
+      setNotice('请先绑定专用 ChatGPT 标签页。');
+      return;
+    }
+    setBusy(true);
+    try {
+      await invoke('start_module_orchestration', { moduleId: selected.id });
+      setNotice('模块已启动，正在等待 ChatGPT 生成第一条 NEXT_TASK。');
+      await refreshRuntime(selected.id);
+    } catch (error) {
+      setNotice(`无法启动模块：${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyAcceptanceAction(action: AcceptanceAction) {
+    if (!selected || !runtime) return;
+    setBusy(true);
+    try {
+      const next = await invoke<OrchestrationSnapshot>('apply_acceptance_action', {
+        moduleId: selected.id,
+        action,
+        replanRequest: action === 'REPLAN' ? replanRequest : null
+      });
+      setRuntime(next);
+      if (action === 'APPROVE') setNotice('模块已验收通过。');
+      if (action === 'CONTINUE') setNotice('已继续自动编排，等待 ChatGPT 下一任务。');
+      if (action === 'STOP') setNotice('模块已终止，运行记录已保留。');
+      if (action === 'REPLAN') {
+        setReplanRequest('');
+        setNotice('重新规划请求已发送给 ChatGPT。');
+      }
+    } catch (error) {
+      setNotice(`无法执行验收操作：${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function sendProtocolBootstrap() {
     if (!pairing?.paired) {
       setNotice('请先在 Chrome 扩展中绑定专用 ChatGPT 标签页。');
@@ -240,10 +312,10 @@ export default function App() {
       <section className="workspace">
         <header>
           <div>
-            <p className="eyebrow">TASK 3 · CODEX EXECUTION ADAPTER</p>
+            <p className="eyebrow">TASK 6 · OUTCOME VERIFICATION & CONTROLS</p>
             <h2>{selected ? '编辑未运行模块' : '新建未运行模块'}</h2>
           </div>
-          <span className="status-pill">INACTIVE</span>
+          <span className="status-pill">{runtime?.phase ?? 'INACTIVE'}</span>
         </header>
 
         <p className="notice" role="status">{notice}</p>
@@ -310,8 +382,32 @@ export default function App() {
             </div>
           </section>
 
+          {runtime && (
+            <section className="form-section runtime-section">
+              <div className="execution-heading">
+                <div>
+                  <h3>模块运行与验收</h3>
+                  <p>第 {runtime.completedRounds} / {runtime.maxRounds} 轮 · {runtime.pauseAfterCurrentTurn ? '当前回合完成后暂停' : '预算正常'}</p>
+                </div>
+                <span className={`execution-phase ${runtime.phase.toLowerCase()}`}>{runtime.phase}</span>
+              </div>
+              <p className="execution-status">开始时间：{new Date(runtime.startedAt).toLocaleString()}</p>
+              {runtime.lastCommitSha && <p className="protocol-result">最近已验证 commit：{runtime.lastCommitSha}</p>}
+              {(runtime.phase === 'PAUSED_FOR_ACCEPTANCE' || runtime.phase === 'BLOCKED') && (
+                <div className="acceptance-controls">
+                  <button className="primary" type="button" onClick={() => applyAcceptanceAction('APPROVE')} disabled={busy || runtime.phase !== 'PAUSED_FOR_ACCEPTANCE'}>验收通过</button>
+                  <button className="secondary" type="button" onClick={() => applyAcceptanceAction('CONTINUE')} disabled={busy}>继续</button>
+                  <button className="danger" type="button" onClick={() => applyAcceptanceAction('STOP')} disabled={busy}>终止</button>
+                  <label>重新规划说明<textarea value={replanRequest} onChange={(event) => setReplanRequest(event.target.value)} rows={2} placeholder="例如：优先解决测试失败，再拆分下一轮任务" /></label>
+                  <button className="secondary" type="button" onClick={() => applyAcceptanceAction('REPLAN')} disabled={busy || !replanRequest.trim()}>发送重新规划</button>
+                </div>
+              )}
+            </section>
+          )}
+
           <footer className="actions">
             {selected && <button className="danger" type="button" onClick={removeSelected} disabled={busy}>删除模块</button>}
+            {selected && <button className="secondary" type="button" onClick={startModuleOrchestration} disabled={busy || !pairing?.paired || Boolean(runtime && runtime.phase !== 'COMPLETED' && runtime.phase !== 'STOPPED')}>启动模块</button>}
             <button className="primary" type="submit" disabled={busy}>{busy ? '正在保存…' : '保存未运行模块'}</button>
           </footer>
         </form>

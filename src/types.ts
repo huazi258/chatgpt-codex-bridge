@@ -50,6 +50,18 @@ export interface ChatGptBridgeStatus {
   protocolState?: string;
 }
 
+export type AcceptanceAction = 'APPROVE' | 'CONTINUE' | 'STOP' | 'REPLAN';
+
+export interface OrchestrationSnapshot {
+  moduleId: string;
+  phase: string;
+  completedRounds: number;
+  maxRounds: number;
+  startedAt: string;
+  pauseAfterCurrentTurn: boolean;
+  lastCommitSha?: string;
+}
+
 export interface ModuleDraft {
   name: string;
   repositoryPath: string;

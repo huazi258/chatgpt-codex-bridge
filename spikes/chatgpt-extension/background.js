@@ -1,5 +1,5 @@
 const bridgeUrl = 'ws://127.0.0.1:8765';
-const contentAdapterVersion = '0.6.0';
+const contentAdapterVersion = '1.0.0';
 let socket = null;
 let sessionId = null;
 let pairedTabId = null;
@@ -111,18 +111,28 @@ async function connect(secret, tabId) {
           type: 'sendMiddlewareMessageV2',
           text: message.text
         });
-        if (!response?.ok) throw new Error(response?.error || 'ChatGPT tab did not return a reply.');
+        if (!response?.ok) {
+          const error = new Error(response?.error || 'ChatGPT tab did not return a reply.');
+          error.adapterDiagnostic = response?.adapterDiagnostic ?? null;
+          throw error;
+        }
         socket?.send(JSON.stringify({
           type: 'chatgptReply',
           sessionId,
           text: response.response,
-          protocolJson: typeof response.protocolJson === 'string' ? response.protocolJson : undefined
+          protocolJson: typeof response.protocolJson === 'string' ? response.protocolJson : undefined,
+          protocolJsonPresent: Boolean(response.protocolJsonPresent),
+          adapterVersion: response.adapterVersion ?? contentAdapterVersion
         }));
       } catch (error) {
         socket?.send(JSON.stringify({
           type: 'chatgptReply',
           sessionId,
-          text: `Protocol adapter failed before a reply was received: ${error.message}`
+          text: `Protocol adapter failed before a reply was received: ${error.message}`,
+          protocolJsonPresent: false,
+          adapterVersion: contentAdapterVersion,
+          adapterError: error.message,
+          adapterDiagnostic: error.adapterDiagnostic ?? null
         }));
       }
     }

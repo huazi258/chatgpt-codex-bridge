@@ -47,4 +47,4 @@ When documents conflict, prefer the newest accepted decision record in `docs/dec
 
 ## Current delivery stage
 
-Task 4 is implemented and awaits one live Chrome pairing/protocol-bootstrap verification. Do not start Task 5 until the evidence is recorded in `docs/decisions/003-chatgpt-local-pairing.md`.
+Task 6 completed its implementation and automated verification on 2026-08-16. Task 7 pilot validation may now begin.

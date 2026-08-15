@@ -57,3 +57,8 @@ nav { display: grid; gap: 9px; }
 .secondary { align-self: start; padding: 11px 15px; border: 1px solid #aac0e7; border-radius: 8px; color: #284e9f; background: #edf3ff; font-weight: 800; }
 .inline-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .protocol-result { margin: 0; color: #196340; font-size: 13px; font-weight: 800; }
+.runtime-section { display: grid; gap: 15px; }
+.acceptance-controls { display: grid; grid-template-columns: repeat(3, max-content); gap: 10px; align-items: end; }
+.acceptance-controls label { grid-column: 1 / -1; margin: 8px 0 0; }
+.execution-phase.paused_for_acceptance { color: #8a5b00; background: #fff3d4; }
+.execution-phase.stopped, .execution-phase.blocked { color: #a82f39; background: #ffeef0; }

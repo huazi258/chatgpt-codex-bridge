@@ -42,7 +42,7 @@ Status: **Completed**. The desktop app launches one stdio App Server child proce
 
 Acceptance: the desktop application completes a protocol exchange and rejects malformed payloads safely.
 
-Status: **Awaiting live-browser verification**. The loopback bridge, authenticated extension pairing, message injection, response detection, and strict protocol validator are implemented. Automated checks confirm malformed pairing rejection and protocol-validator behavior; the single signed-in Chrome pairing and protocol-bootstrap exchange is documented in `spikes/chatgpt-extension/README.md`.
+Status: **Completed**. On 2026-08-16, the signed-in Chrome extension paired with the desktop bridge and the desktop UI displayed `已验证 ChatGPT 协议状态：PAUSE` / `协议已验证：PAUSE`. The loopback bridge, authenticated pairing, message injection, completion detection, and protocol validator are live-verified.
 
 ## Task 5 — Orchestration loop
 
@@ -52,6 +52,8 @@ Status: **Awaiting live-browser verification**. The loopback bridge, authenticat
 
 Acceptance: a simulated two-turn loop reaches `MODULE_DONE` without manual copy/paste.
 
+Status: **Completed**. The serial runtime is persisted in SQLite (`module_runtime`) together with an audit event for every transition. Starting a module sends a planning request to the paired ChatGPT tab; a valid `NEXT_TASK` starts one Codex App Server turn; completion sends a compact Review request back to ChatGPT. `MODULE_DONE`, `PAUSE`, and external-adapter failures enter a persisted safe pause/block state. Startup converts any in-progress persisted runtime to `PAUSED_FOR_ACCEPTANCE`. Unit tests simulate two `NEXT_TASK`/Codex cycles followed by `MODULE_DONE`, with no clipboard handoff.
+
 ## Task 6 — Outcome verification and user control
 
 - Verify the reported commit SHA and remote branch after Codex completes.
@@ -59,6 +61,8 @@ Acceptance: a simulated two-turn loop reaches `MODULE_DONE` without manual copy/
 - Add Windows notifications and the four acceptance actions: approve, continue, stop, replan.
 
 Acceptance: all budget and blocking paths pause correctly and expose the required user actions.
+
+Status: **Completed**. The middleware requires a commit SHA in Codex's final summary, confirms the selected branch, local commit ancestry, and matching `origin` branch head before a Review request is sent. It persists a verified turn, commit SHA, execution start time, and deferred-budget flag. Round/module/global budgets pause before a new turn or after the current turn completes. The desktop UI exposes approve, continue, stop, and replan controls for persisted pause/block states, and native Windows notifications are requested for pause/block events.
 
 ## Task 7 — End-to-end pilot
 

@@ -1,4 +1,6 @@
-use chrono::Utc;
+mod orchestration;
+
+use chrono::{DateTime, Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -16,10 +18,43 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/001_initial.sql");
+const ORCHESTRATION_SCHEMA: &str = include_str!("../migrations/002_orchestration_runtime.sql");
+const EXECUTION_CONTROL_SCHEMA: &str = include_str!("../migrations/003_execution_control.sql");
 
 struct AppState {
     connection: Mutex<Connection>,
     chatgpt_bridge: Arc<ChatGptBridge>,
+    orchestrator: Mutex<Option<ActiveOrchestration>>,
+    application_started_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct ActiveOrchestration {
+    module: ModuleRecord,
+    runtime: orchestration::Runtime,
+    started_at: DateTime<Utc>,
+    last_commit_sha: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestrationSnapshot {
+    module_id: String,
+    phase: String,
+    completed_rounds: u32,
+    max_rounds: i64,
+    started_at: String,
+    pause_after_current_turn: bool,
+    last_commit_sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum AcceptanceAction {
+    Approve,
+    Continue,
+    Stop,
+    Replan,
 }
 
 const CHATGPT_BRIDGE_PORT: u16 = 8765;
@@ -111,7 +146,7 @@ struct InactiveModuleInput {
     global_timeout_minutes: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Budget {
     max_rounds: i64,
@@ -119,7 +154,7 @@ struct Budget {
     global_timeout_minutes: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ModuleRecord {
     id: String,
@@ -179,6 +214,12 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
     connection
         .execute_batch(INITIAL_SCHEMA)
         .map_err(|error| format!("could not initialize the local database: {error}"))?;
+    connection
+        .execute_batch(ORCHESTRATION_SCHEMA)
+        .map_err(|error| format!("could not initialize orchestration storage: {error}"))?;
+    connection
+        .execute_batch(EXECUTION_CONTROL_SCHEMA)
+        .map_err(|error| format!("could not initialize execution-control storage: {error}"))?;
     Ok(connection)
 }
 
@@ -229,6 +270,411 @@ fn get_module(connection: &Connection, id: &str) -> Result<Option<ModuleRecord>,
         )
         .optional()
         .map_err(|error| error.to_string())
+}
+
+fn orchestration_phase_name(phase: orchestration::Phase) -> &'static str {
+    match phase {
+        orchestration::Phase::WaitingForChatGptPlan => "WAITING_FOR_CHATGPT_PLAN",
+        orchestration::Phase::StartingCodexTurn => "STARTING_CODEX_TURN",
+        orchestration::Phase::CodexRunning => "CODEX_RUNNING",
+        orchestration::Phase::WaitingForChatGptReview => "WAITING_FOR_CHATGPT_REVIEW",
+        orchestration::Phase::PausedForAcceptance => "PAUSED_FOR_ACCEPTANCE",
+        orchestration::Phase::Blocked => "BLOCKED",
+        orchestration::Phase::Completed => "COMPLETED",
+        orchestration::Phase::Stopped => "STOPPED",
+    }
+}
+
+fn orchestration_phase_from_name(phase: &str) -> Result<orchestration::Phase, String> {
+    match phase {
+        "WAITING_FOR_CHATGPT_PLAN" => Ok(orchestration::Phase::WaitingForChatGptPlan),
+        "STARTING_CODEX_TURN" => Ok(orchestration::Phase::StartingCodexTurn),
+        "CODEX_RUNNING" => Ok(orchestration::Phase::CodexRunning),
+        "WAITING_FOR_CHATGPT_REVIEW" => Ok(orchestration::Phase::WaitingForChatGptReview),
+        "PAUSED_FOR_ACCEPTANCE" => Ok(orchestration::Phase::PausedForAcceptance),
+        "BLOCKED" => Ok(orchestration::Phase::Blocked),
+        "COMPLETED" => Ok(orchestration::Phase::Completed),
+        "STOPPED" => Ok(orchestration::Phase::Stopped),
+        _ => Err(format!("unknown persisted orchestration phase: {phase}")),
+    }
+}
+
+fn persist_orchestration_state(
+    connection: &Connection,
+    module_id: &str,
+    runtime: &orchestration::Runtime,
+    message: &str,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    let phase = orchestration_phase_name(runtime.phase);
+    connection
+        .execute(
+            "INSERT INTO module_runtime (module_id, phase, completed_rounds, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(module_id) DO UPDATE SET phase = excluded.phase, completed_rounds = excluded.completed_rounds, updated_at = excluded.updated_at",
+            params![module_id, phase, runtime.completed_rounds, now],
+        )
+        .map_err(|error| format!("could not persist orchestration state: {error}"))?;
+    connection
+        .execute(
+            "INSERT INTO audit_events (id, module_id, event_type, message, metadata_json, created_at)
+             VALUES (?1, ?2, 'ORCHESTRATION_TRANSITION', ?3, ?4, ?5)",
+            params![Uuid::new_v4().to_string(), module_id, message, json!({ "phase": phase, "completedRounds": runtime.completed_rounds, "pauseAfterCurrentTurn": runtime.pause_after_current_turn }).to_string(), now],
+        )
+        .map_err(|error| format!("could not write orchestration audit event: {error}"))?;
+    Ok(())
+}
+
+fn persist_execution_details(
+    connection: &Connection,
+    active: &ActiveOrchestration,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO module_execution_state (module_id, started_at, pause_after_current_turn, last_commit_sha)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(module_id) DO UPDATE SET started_at = excluded.started_at, pause_after_current_turn = excluded.pause_after_current_turn, last_commit_sha = excluded.last_commit_sha",
+            params![
+                &active.module.id,
+                active.started_at.to_rfc3339(),
+                active.runtime.pause_after_current_turn as i64,
+                active.last_commit_sha.as_deref(),
+            ],
+        )
+        .map_err(|error| format!("could not persist execution details: {error}"))?;
+    Ok(())
+}
+
+fn snapshot_from_active(active: &ActiveOrchestration) -> OrchestrationSnapshot {
+    OrchestrationSnapshot {
+        module_id: active.module.id.clone(),
+        phase: orchestration_phase_name(active.runtime.phase).into(),
+        completed_rounds: active.runtime.completed_rounds,
+        max_rounds: active.module.budget.max_rounds,
+        started_at: active.started_at.to_rfc3339(),
+        pause_after_current_turn: active.runtime.pause_after_current_turn,
+        last_commit_sha: active.last_commit_sha.clone(),
+    }
+}
+
+fn run_git(repository_path: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_path)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not start git: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn extract_reported_commit_sha(summary: &str) -> Option<String> {
+    summary
+        .split(|character: char| !character.is_ascii_hexdigit())
+        .find(|candidate| (7..=64).contains(&candidate.len()))
+        .map(ToOwned::to_owned)
+}
+
+fn verify_codex_outcome(module: &ModuleRecord, summary: &str) -> Result<String, String> {
+    let commit_sha = extract_reported_commit_sha(summary)
+        .ok_or_else(|| "Codex final summary did not report a commit SHA".to_string())?;
+    if run_git(
+        &module.repository_path,
+        &["rev-parse", "--is-inside-work-tree"],
+    )? != "true"
+    {
+        return Err("selected repository is not a Git worktree".into());
+    }
+    let branch = run_git(&module.repository_path, &["branch", "--show-current"])?;
+    if branch != module.target_branch {
+        return Err(format!(
+            "Codex finished on branch `{branch}`, expected `{}`",
+            module.target_branch
+        ));
+    }
+    run_git(
+        &module.repository_path,
+        &["rev-parse", "--verify", &format!("{commit_sha}^{{commit}}")],
+    )?;
+    let local_branch_head = run_git(
+        &module.repository_path,
+        &["rev-parse", &module.target_branch],
+    )?;
+    let remote = run_git(&module.repository_path, &["remote", "get-url", "origin"])?;
+    if remote.trim().is_empty() {
+        return Err("target repository has no origin remote".into());
+    }
+    let remote_head = run_git(
+        &module.repository_path,
+        &[
+            "ls-remote",
+            "--exit-code",
+            "origin",
+            &format!("refs/heads/{}", module.target_branch),
+        ],
+    )?
+    .split_whitespace()
+    .next()
+    .ok_or_else(|| format!("origin does not expose branch `{}`", module.target_branch))?
+    .to_string();
+    if local_branch_head != remote_head {
+        return Err(format!(
+            "local `{}` ({local_branch_head}) does not match origin ({remote_head})",
+            module.target_branch
+        ));
+    }
+    let ancestry = Command::new("git")
+        .arg("-C")
+        .arg(&module.repository_path)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            &commit_sha,
+            &module.target_branch,
+        ])
+        .status()
+        .map_err(|error| format!("could not inspect commit ancestry: {error}"))?;
+    if !ancestry.success() {
+        return Err(format!(
+            "reported commit {commit_sha} is not reachable from `{}`",
+            module.target_branch
+        ));
+    }
+    Ok(commit_sha)
+}
+
+fn record_completed_turn(
+    connection: &Connection,
+    active: &ActiveOrchestration,
+    summary: &str,
+    commit_sha: &str,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO turns (id, module_id, turn_number, state, codex_summary, commit_sha, started_at, completed_at)
+             VALUES (?1, ?2, ?3, 'VERIFIED', ?4, ?5, ?6, ?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                &active.module.id,
+                active.runtime.completed_rounds + 1,
+                summary,
+                commit_sha,
+                active.started_at.to_rfc3339(),
+                now,
+            ],
+        )
+        .map_err(|error| format!("could not record verified Codex turn: {error}"))?;
+    Ok(())
+}
+
+fn budget_pause_reason(state: &AppState, active: &ActiveOrchestration) -> Option<String> {
+    if active.runtime.pause_after_current_turn {
+        return Some("模块或全局时间预算已在当前 Codex 回合期间到达。".into());
+    }
+    if active.runtime.completed_rounds as i64 >= active.module.budget.max_rounds {
+        return Some(format!(
+            "已达到最大任务轮次 {}。",
+            active.module.budget.max_rounds
+        ));
+    }
+    let now = Utc::now();
+    if now - active.started_at >= Duration::minutes(active.module.budget.module_timeout_minutes) {
+        return Some(format!(
+            "已达到模块最长运行时间 {} 分钟。",
+            active.module.budget.module_timeout_minutes
+        ));
+    }
+    if now - state.application_started_at
+        >= Duration::minutes(active.module.budget.global_timeout_minutes)
+    {
+        return Some(format!(
+            "已达到全局最长运行时间 {} 分钟。",
+            active.module.budget.global_timeout_minutes
+        ));
+    }
+    None
+}
+
+fn load_active_orchestration(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<ActiveOrchestration, String> {
+    let module = get_module(connection, module_id)?
+        .ok_or_else(|| "selected module was not found".to_string())?;
+    let (phase, completed_rounds, started_at, pause_after_current_turn, last_commit_sha): (
+        String,
+        i64,
+        String,
+        i64,
+        Option<String>,
+    ) = connection
+        .query_row(
+            "SELECT r.phase, r.completed_rounds, COALESCE(e.started_at, r.updated_at),
+                    COALESCE(e.pause_after_current_turn, 0), e.last_commit_sha
+             FROM module_runtime r
+             LEFT JOIN module_execution_state e ON e.module_id = r.module_id
+             WHERE r.module_id = ?1",
+            [module_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("could not load module runtime: {error}"))?;
+    let started_at = DateTime::parse_from_rfc3339(&started_at)
+        .map_err(|error| format!("could not parse persisted runtime timestamp: {error}"))?
+        .with_timezone(&Utc);
+    Ok(ActiveOrchestration {
+        module,
+        runtime: orchestration::Runtime {
+            phase: orchestration_phase_from_name(&phase)?,
+            completed_rounds: completed_rounds
+                .try_into()
+                .map_err(|_| "persisted completed-round count was invalid".to_string())?,
+            pause_after_current_turn: pause_after_current_turn != 0,
+        },
+        started_at,
+        last_commit_sha,
+    })
+}
+
+#[tauri::command]
+fn get_orchestration_snapshot(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<Option<OrchestrationSnapshot>, String> {
+    if let Some(active) = state
+        .orchestrator
+        .lock()
+        .map_err(|_| "orchestrator lock poisoned".to_string())?
+        .as_ref()
+        .filter(|active| active.module.id == module_id)
+    {
+        return Ok(Some(snapshot_from_active(active)));
+    }
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    match load_active_orchestration(&connection, &module_id) {
+        Ok(active) => Ok(Some(snapshot_from_active(&active))),
+        Err(error) if error.contains("Query returned no rows") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn user_continue_message(module: &ModuleRecord, replan_request: Option<&str>) -> String {
+    match replan_request {
+        Some(request) => format!(
+            "用户要求重新规划“{}”模块。补充说明：{}。请检查仓库后只返回一个 NEXT_TASK 协议包；必须包含完整 codex_prompt 和至少一条 acceptance_criteria。",
+            module.name,
+            request.trim()
+        ),
+        None => format!(
+            "用户已确认继续“{}”模块。请检查仓库后只返回一个 NEXT_TASK 协议包；必须包含完整 codex_prompt 和至少一条 acceptance_criteria。",
+            module.name
+        ),
+    }
+}
+
+#[tauri::command]
+fn apply_acceptance_action(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+    action: AcceptanceAction,
+    replan_request: Option<String>,
+) -> Result<OrchestrationSnapshot, String> {
+    let restored = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        load_active_orchestration(&connection, &module_id)?
+    };
+    let (snapshot, message_to_chatgpt, release_module) = {
+        let mut guard = state
+            .orchestrator
+            .lock()
+            .map_err(|_| "orchestrator lock poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = Some(restored);
+        }
+        let active = guard
+            .as_mut()
+            .ok_or_else(|| "no active orchestration is available".to_string())?;
+        if active.module.id != module_id {
+            return Err(
+                "another module is active; its acceptance decision must be resolved first".into(),
+            );
+        }
+        let (message, outbound, release) = match action {
+            AcceptanceAction::Approve => {
+                active.runtime.approve()?;
+                ("用户已验收通过，模块已完成。", None, true)
+            }
+            AcceptanceAction::Continue => {
+                active.runtime.continue_after_pause()?;
+                (
+                    "用户确认继续，正在等待 ChatGPT 下一任务。",
+                    Some(user_continue_message(&active.module, None)),
+                    false,
+                )
+            }
+            AcceptanceAction::Stop => {
+                active.runtime.stop()?;
+                ("用户已终止模块。", None, true)
+            }
+            AcceptanceAction::Replan => {
+                let request = replan_request
+                    .as_deref()
+                    .filter(|request| !request.trim().is_empty())
+                    .ok_or_else(|| "replan requires a short user instruction".to_string())?;
+                active.runtime.continue_after_pause()?;
+                (
+                    "用户要求重新规划，正在等待 ChatGPT。",
+                    Some(user_continue_message(&active.module, Some(request))),
+                    false,
+                )
+            }
+        };
+        let active_snapshot = active.clone();
+        persist_active_orchestration(&state, &active_snapshot, message)?;
+        (snapshot_from_active(&active_snapshot), outbound, release)
+    };
+    if release_module {
+        *state
+            .orchestrator
+            .lock()
+            .map_err(|_| "orchestrator lock poisoned".to_string())? = None;
+    }
+    if let Some(message) = message_to_chatgpt {
+        if let Err(error) = send_chatgpt_message_internal(&app, &state.chatgpt_bridge, &message) {
+            block_and_notify(&app, &state, format!("无法发送用户确认消息：{error}"));
+            return Err(error);
+        }
+    }
+    Ok(snapshot)
+}
+
+fn pause_unfinished_orchestrations(connection: &Connection) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "UPDATE module_runtime SET phase = 'PAUSED_FOR_ACCEPTANCE', updated_at = ?1
+             WHERE phase IN ('WAITING_FOR_CHATGPT_PLAN', 'STARTING_CODEX_TURN', 'CODEX_RUNNING', 'WAITING_FOR_CHATGPT_REVIEW')",
+            [now.as_str()],
+        )
+        .map_err(|error| format!("could not pause recovered orchestrations: {error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -585,6 +1031,10 @@ async fn handle_chatgpt_bridge_connection(
                         let session_id = message.get("sessionId").and_then(Value::as_str);
                         let reply = message.get("text").and_then(Value::as_str);
                         let structured_json = message.get("protocolJson").and_then(Value::as_str);
+                        let structured_json_present = message.get("protocolJsonPresent").and_then(Value::as_bool);
+                        let adapter_version = message.get("adapterVersion").and_then(Value::as_str);
+                        let adapter_error = message.get("adapterError").and_then(Value::as_str);
+                        let adapter_diagnostic = message.get("adapterDiagnostic").and_then(Value::as_str);
                         let valid_session = bridge.session.lock().ok().and_then(|session| session.clone()).is_some_and(|session| Some(session.session_id.as_str()) == session_id);
                         if !valid_session || reply.is_none() {
                             bridge.set_status(&app, ChatGptBridgeStatus {
@@ -593,6 +1043,26 @@ async fn handle_chatgpt_bridge_connection(
                                 tab_id: None,
                                 protocol_state: None,
                             });
+                            let _ = block_active_orchestration(
+                                &app.state::<AppState>(),
+                                "收到未配对或不完整的 ChatGPT 回复。".into(),
+                            );
+                            continue;
+                        }
+                        if structured_json_present == Some(false) {
+                            let version = adapter_version.unwrap_or("unknown");
+                            let detail = adapter_error.unwrap_or("ChatGPT completed without a protocol JSON object.");
+                            let diagnostic = adapter_diagnostic.map(|value| format!(" Observed assistant nodes: {value}")).unwrap_or_default();
+                            bridge.set_status(&app, ChatGptBridgeStatus {
+                                phase: "BLOCKED".into(),
+                                detail: format!("Protocol adapter v{version} did not return structured JSON: {detail}{diagnostic}"),
+                                tab_id: None,
+                                protocol_state: None,
+                            });
+                            let _ = block_active_orchestration(
+                                &app.state::<AppState>(),
+                                format!("ChatGPT 协议适配器未返回结构化 JSON：{detail}"),
+                            );
                             continue;
                         }
                         match validate_protocol_payload(reply.unwrap_or_default(), structured_json) {
@@ -605,13 +1075,31 @@ async fn handle_chatgpt_bridge_connection(
                                     tab_id,
                                     protocol_state: Some(state),
                                 });
+                                if let Err(error) = handle_orchestration_protocol(app.clone(), envelope) {
+                                    bridge.set_status(&app, ChatGptBridgeStatus {
+                                        phase: "BLOCKED".into(),
+                                        detail: format!("自动编排无法处理协议状态：{error}"),
+                                        tab_id: None,
+                                        protocol_state: None,
+                                    });
+                                    let _ = block_active_orchestration(
+                                        &app.state::<AppState>(),
+                                        format!("无法处理 ChatGPT 协议状态：{error}"),
+                                    );
+                                }
                             }
-                            Err(error) => bridge.set_status(&app, ChatGptBridgeStatus {
-                                phase: "BLOCKED".into(),
-                                detail: format!("Protocol validation failed: {error}"),
-                                tab_id: None,
-                                protocol_state: None,
-                            }),
+                            Err(error) => {
+                                bridge.set_status(&app, ChatGptBridgeStatus {
+                                    phase: "BLOCKED".into(),
+                                    detail: format!("Protocol validation failed: {error}"),
+                                    tab_id: None,
+                                    protocol_state: None,
+                                });
+                                let _ = block_active_orchestration(
+                                    &app.state::<AppState>(),
+                                    format!("ChatGPT 协议校验失败：{error}"),
+                                );
+                            }
                         }
                     }
                     Some("keepAlive") => {
@@ -691,23 +1179,30 @@ fn send_chatgpt_message(
     state: State<'_, AppState>,
     text: String,
 ) -> Result<(), String> {
+    send_chatgpt_message_internal(&app, &state.chatgpt_bridge, &text)
+}
+
+fn send_chatgpt_message_internal(
+    app: &AppHandle,
+    bridge: &ChatGptBridge,
+    text: &str,
+) -> Result<(), String> {
     if text.trim().is_empty() {
         return Err("a ChatGPT message is required".into());
     }
-    let session = state
-        .chatgpt_bridge
+    let session = bridge
         .session
         .lock()
         .map_err(|_| "ChatGPT bridge lock poisoned".to_string())?
         .clone()
         .ok_or_else(|| "no paired ChatGPT extension is connected".to_string())?;
-    state.chatgpt_bridge.send_to_extension(json!({
+    bridge.send_to_extension(json!({
         "type": "sendChatGptMessage",
         "sessionId": session.session_id,
         "text": text.trim()
     }))?;
-    state.chatgpt_bridge.set_status(
-        &app,
+    bridge.set_status(
+        app,
         ChatGptBridgeStatus {
             phase: "SENT".into(),
             detail: "已将协议消息发送到绑定的 ChatGPT 标签页。".into(),
@@ -715,6 +1210,88 @@ fn send_chatgpt_message(
             protocol_state: None,
         },
     );
+    Ok(())
+}
+
+fn module_planning_message(module: &ModuleRecord) -> String {
+    format!(
+        "你是“{}”模块的规划与 Review 决策者。模块仓库：{}；目标分支：{}。现在开始自动编排。请先规划并只返回一个 NEXT_TASK 协议包：必须包含完整 codex_prompt、至少一条 acceptance_criteria；JSON 代码块必须是回复最后且唯一的代码块。",
+        module.name, module.repository_path, module.target_branch
+    )
+}
+
+#[tauri::command]
+fn start_module_orchestration(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<(), String> {
+    let module = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let module = get_module(&connection, &module_id)?
+            .ok_or_else(|| "selected module was not found".to_string())?;
+        let previous_phase = connection
+            .query_row(
+                "SELECT phase FROM module_runtime WHERE module_id = ?1",
+                [&module_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("could not inspect module runtime: {error}"))?;
+        if matches!(previous_phase.as_deref(), Some(phase) if phase != "COMPLETED" && phase != "STOPPED")
+        {
+            return Err("this module already has a paused or active runtime; use its acceptance controls instead of starting a new run".into());
+        }
+        module
+    };
+    if state
+        .chatgpt_bridge
+        .session
+        .lock()
+        .map_err(|_| "ChatGPT bridge lock poisoned".to_string())?
+        .is_none()
+    {
+        return Err("bind the dedicated ChatGPT tab before starting a module".into());
+    }
+    let (runtime, action) = orchestration::Runtime::start();
+    let initial_active = {
+        let mut active = state
+            .orchestrator
+            .lock()
+            .map_err(|_| "orchestrator lock poisoned".to_string())?;
+        if active.is_some() {
+            return Err(
+                "another module is already active; pause or stop it before starting a new module"
+                    .into(),
+            );
+        }
+        let initial_active = ActiveOrchestration {
+            module: module.clone(),
+            runtime: runtime.clone(),
+            started_at: Utc::now(),
+            last_commit_sha: None,
+        };
+        *active = Some(initial_active.clone());
+        initial_active
+    };
+    persist_active_orchestration(
+        &state,
+        &initial_active,
+        "模块已启动，正在等待 ChatGPT 规划。",
+    )?;
+    if action == orchestration::Action::SendPlanningRequest {
+        if let Err(error) = send_chatgpt_message_internal(
+            &app,
+            &state.chatgpt_bridge,
+            &module_planning_message(&module),
+        ) {
+            block_active_orchestration(&state, format!("无法发送 ChatGPT 规划请求：{error}"))?;
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -1062,6 +1639,334 @@ fn execute_controlled_codex_turn(
     result
 }
 
+fn persist_active_orchestration(
+    state: &AppState,
+    active: &ActiveOrchestration,
+    message: &str,
+) -> Result<(), String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    persist_orchestration_state(&connection, &active.module.id, &active.runtime, message)?;
+    persist_execution_details(&connection, active)
+}
+
+fn block_active_orchestration(state: &AppState, reason: String) -> Result<(), String> {
+    let mut active = state
+        .orchestrator
+        .lock()
+        .map_err(|_| "orchestrator lock poisoned".to_string())?;
+    let active = active
+        .as_mut()
+        .ok_or_else(|| "no active orchestration to block".to_string())?;
+    active.runtime.block(reason);
+    let snapshot = active.clone();
+    persist_active_orchestration(state, &snapshot, "自动编排外部通信失败，模块已阻塞。")
+}
+
+fn block_and_notify(app: &AppHandle, state: &AppState, reason: String) {
+    let _ = block_active_orchestration(state, reason.clone());
+    state.chatgpt_bridge.set_status(
+        app,
+        ChatGptBridgeStatus {
+            phase: "BLOCKED".into(),
+            detail: reason,
+            tab_id: None,
+            protocol_state: None,
+        },
+    );
+}
+
+fn review_message(module: &ModuleRecord, round: u32, commit_sha: &str, summary: &str) -> String {
+    format!(
+        "“{}”模块第 {} 轮 Codex 已结束。分支：{}；已验证 commit：{}。Codex 最终摘要：\n{}\n\n请检查仓库后仅返回一个协议包：如需继续则 NEXT_TASK；如模块完成则 MODULE_DONE；如需要用户处理则 PAUSE 或 BLOCKED。",
+        module.name, round, module.target_branch, commit_sha, summary.trim()
+    )
+}
+
+fn run_orchestration_action(app: AppHandle, action: orchestration::Action) -> Result<(), String> {
+    match action {
+        orchestration::Action::SendPlanningRequest => Ok(()),
+        orchestration::Action::StartCodexTurn {
+            round,
+            codex_prompt,
+        } => {
+            let state = app.state::<AppState>();
+            let (module, budget_pause) = {
+                let mut active = state
+                    .orchestrator
+                    .lock()
+                    .map_err(|_| "orchestrator lock poisoned".to_string())?;
+                let active = active
+                    .as_mut()
+                    .ok_or_else(|| "no active orchestration owns the Codex turn".to_string())?;
+                if let Some(reason) = budget_pause_reason(&state, active) {
+                    active.runtime.pause(reason.clone());
+                    let snapshot = active.clone();
+                    persist_active_orchestration(
+                        &state,
+                        &snapshot,
+                        "预算已到达，未启动下一轮 Codex。",
+                    )?;
+                    (None, Some(reason))
+                } else {
+                    active.runtime.codex_started()?;
+                    let snapshot = active.clone();
+                    persist_active_orchestration(&state, &snapshot, "正在启动 Codex 回合。")?;
+                    (Some(snapshot.module), None)
+                }
+            };
+            if let Some(reason) = budget_pause {
+                state.chatgpt_bridge.set_status(
+                    &app,
+                    ChatGptBridgeStatus {
+                        phase: "PAUSED_FOR_ACCEPTANCE".into(),
+                        detail: reason,
+                        tab_id: None,
+                        protocol_state: None,
+                    },
+                );
+                return Ok(());
+            }
+            let module = module.expect("module exists when budget did not pause");
+            let app_for_turn = app.clone();
+            let module_id = module.id.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = process_app_server_turn(&app_for_turn, &module, &codex_prompt);
+                let state = app_for_turn.state::<AppState>();
+                match result {
+                    Ok(result) if result.status == CodexExecutionPhase::Completed => {
+                        let commit_sha = match verify_codex_outcome(&module, &result.summary) {
+                            Ok(commit_sha) => commit_sha,
+                            Err(error) => {
+                                block_and_notify(
+                                    &app_for_turn,
+                                    &state,
+                                    format!("Git 推送验证失败：{error}"),
+                                );
+                                return;
+                            }
+                        };
+                        let next_action = {
+                            let mut active = match state.orchestrator.lock() {
+                                Ok(active) => active,
+                                Err(_) => return,
+                            };
+                            let Some(active) = active.as_mut() else {
+                                return;
+                            };
+                            active.last_commit_sha = Some(commit_sha.clone());
+                            let turn_recorded = match state.connection.lock() {
+                                Ok(connection) => record_completed_turn(
+                                    &connection,
+                                    active,
+                                    &result.summary,
+                                    &commit_sha,
+                                ),
+                                Err(_) => return,
+                            };
+                            if turn_recorded.is_err() {
+                                return;
+                            }
+                            if budget_pause_reason(&state, active).is_some()
+                                && active.runtime.request_pause_after_current_turn().is_err()
+                            {
+                                return;
+                            }
+                            let action =
+                                match active.runtime.codex_completed(result.summary.clone()) {
+                                    Ok(action) => action,
+                                    Err(_) => return,
+                                };
+                            let action = if let Some(reason) = budget_pause_reason(&state, active) {
+                                active.runtime.pause(reason)
+                            } else {
+                                action
+                            };
+                            let snapshot = active.clone();
+                            if persist_active_orchestration(
+                                &state,
+                                &snapshot,
+                                if matches!(
+                                    action,
+                                    orchestration::Action::PauseForAcceptance { .. }
+                                ) {
+                                    "Codex 回合完成，预算已到达，等待用户验收。"
+                                } else {
+                                    "Codex 回合完成，正在等待 ChatGPT Review。"
+                                },
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
+                            action
+                        };
+                        if let orchestration::Action::SendReviewRequest {
+                            round,
+                            codex_summary,
+                        } = next_action
+                        {
+                            let message =
+                                review_message(&module, round, &commit_sha, &codex_summary);
+                            if let Err(error) = send_chatgpt_message_internal(
+                                &app_for_turn,
+                                &state.chatgpt_bridge,
+                                &message,
+                            ) {
+                                block_and_notify(
+                                    &app_for_turn,
+                                    &state,
+                                    format!("无法发送 ChatGPT Review 请求：{error}"),
+                                );
+                            }
+                        } else if matches!(
+                            next_action,
+                            orchestration::Action::PauseForAcceptance { .. }
+                        ) {
+                            state.chatgpt_bridge.set_status(
+                                &app_for_turn,
+                                ChatGptBridgeStatus {
+                                    phase: "PAUSED_FOR_ACCEPTANCE".into(),
+                                    detail: "预算已到达；当前 Codex 回合已完成，等待用户验收。"
+                                        .into(),
+                                    tab_id: None,
+                                    protocol_state: None,
+                                },
+                            );
+                        }
+                    }
+                    Ok(result) => {
+                        let mut active = match state.orchestrator.lock() {
+                            Ok(active) => active,
+                            Err(_) => return,
+                        };
+                        let Some(active) = active.as_mut() else {
+                            return;
+                        };
+                        active.runtime.block(result.summary);
+                        let snapshot = active.clone();
+                        let _ = persist_active_orchestration(
+                            &state,
+                            &snapshot,
+                            "Codex 回合未完成，模块已阻塞。",
+                        );
+                        state.chatgpt_bridge.set_status(
+                            &app_for_turn,
+                            ChatGptBridgeStatus {
+                                phase: "BLOCKED".into(),
+                                detail: "Codex 回合未完成，模块已阻塞。".into(),
+                                tab_id: None,
+                                protocol_state: None,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        let mut active = match state.orchestrator.lock() {
+                            Ok(active) => active,
+                            Err(_) => return,
+                        };
+                        let Some(active) = active.as_mut() else {
+                            return;
+                        };
+                        active
+                            .runtime
+                            .block(format!("Codex App Server 错误：{error}"));
+                        let snapshot = active.clone();
+                        let _ = persist_active_orchestration(
+                            &state,
+                            &snapshot,
+                            "Codex App Server 错误，模块已阻塞。",
+                        );
+                        state.chatgpt_bridge.set_status(
+                            &app_for_turn,
+                            ChatGptBridgeStatus {
+                                phase: "BLOCKED".into(),
+                                detail: "Codex App Server 错误，模块已阻塞。".into(),
+                                tab_id: None,
+                                protocol_state: None,
+                            },
+                        );
+                    }
+                }
+            });
+            emit_codex_event(
+                &app,
+                CodexExecutionEvent {
+                    module_id,
+                    phase: CodexExecutionPhase::Starting,
+                    status_line: format!("正在开始自动编排第 {round} 轮 Codex 任务。"),
+                    thread_id: None,
+                    turn_id: None,
+                },
+            );
+            Ok(())
+        }
+        orchestration::Action::SendReviewRequest { .. } => Ok(()),
+        orchestration::Action::PauseForAcceptance { .. } | orchestration::Action::Block { .. } => {
+            Ok(())
+        }
+    }
+}
+
+fn handle_orchestration_protocol(app: AppHandle, envelope: ProtocolEnvelope) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (action, message) = {
+        let mut active = state
+            .orchestrator
+            .lock()
+            .map_err(|_| "orchestrator lock poisoned".to_string())?;
+        let Some(active) = active.as_mut() else {
+            return Ok(());
+        };
+        let (action, message) = match envelope.state {
+            ProtocolState::NextTask => (
+                active
+                    .runtime
+                    .receive_next_task(envelope.codex_prompt.unwrap_or_default())?,
+                "已接收 ChatGPT NEXT_TASK，正在交给 Codex。",
+            ),
+            ProtocolState::ModuleDone => (
+                active.runtime.receive_module_done(envelope.reason)?,
+                "ChatGPT 已报告 MODULE_DONE，等待用户验收。",
+            ),
+            ProtocolState::Pause => (
+                active.runtime.receive_pause(envelope.reason),
+                "ChatGPT 请求暂停，等待用户处理。",
+            ),
+            ProtocolState::Blocked => (
+                active.runtime.block(envelope.reason),
+                "ChatGPT 报告阻塞，自动编排已停止。",
+            ),
+        };
+        let snapshot = active.clone();
+        persist_active_orchestration(&state, &snapshot, message)?;
+        (action, message.to_string())
+    };
+    if matches!(
+        action,
+        orchestration::Action::PauseForAcceptance { .. } | orchestration::Action::Block { .. }
+    ) {
+        state.chatgpt_bridge.set_status(
+            &app,
+            ChatGptBridgeStatus {
+                phase: orchestration_phase_name(match action {
+                    orchestration::Action::PauseForAcceptance { .. } => {
+                        orchestration::Phase::PausedForAcceptance
+                    }
+                    _ => orchestration::Phase::Blocked,
+                })
+                .into(),
+                detail: message,
+                tab_id: None,
+                protocol_state: None,
+            },
+        );
+    }
+    run_orchestration_action(app, action)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,6 +2011,80 @@ mod tests {
         assert!(get_module(&connection, &created.id)
             .expect("read after delete")
             .is_none());
+    }
+
+    #[test]
+    fn orchestration_transition_is_persisted_with_an_audit_event() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(INITIAL_SCHEMA)
+            .expect("initial schema");
+        connection
+            .execute_batch(ORCHESTRATION_SCHEMA)
+            .expect("orchestration schema");
+        let module = create_inactive_module_in(&mut connection, &input()).expect("create module");
+        let (runtime, _) = orchestration::Runtime::start();
+        persist_orchestration_state(&connection, &module.id, &runtime, "waiting for planning")
+            .expect("persist transition");
+
+        let phase: String = connection
+            .query_row(
+                "SELECT phase FROM module_runtime WHERE module_id = ?1",
+                [&module.id],
+                |row| row.get(0),
+            )
+            .expect("runtime record");
+        assert_eq!(phase, "WAITING_FOR_CHATGPT_PLAN");
+        let events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE module_id = ?1",
+                [&module.id],
+                |row| row.get(0),
+            )
+            .expect("audit record");
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn execution_details_keep_budget_pause_and_verified_commit() {
+        let mut connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(INITIAL_SCHEMA)
+            .expect("initial schema");
+        connection
+            .execute_batch(ORCHESTRATION_SCHEMA)
+            .expect("orchestration schema");
+        connection
+            .execute_batch(EXECUTION_CONTROL_SCHEMA)
+            .expect("execution control schema");
+        let module = create_inactive_module_in(&mut connection, &input()).expect("create module");
+        let (mut runtime, _) = orchestration::Runtime::start();
+        runtime.pause_after_current_turn = true;
+        let active = ActiveOrchestration {
+            module: module.clone(),
+            runtime,
+            started_at: Utc::now(),
+            last_commit_sha: Some("abcdef1234567".into()),
+        };
+        persist_execution_details(&connection, &active).expect("persist execution details");
+        let (paused, commit): (i64, Option<String>) = connection
+            .query_row(
+                "SELECT pause_after_current_turn, last_commit_sha FROM module_execution_state WHERE module_id = ?1",
+                [&module.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("execution details");
+        assert_eq!(paused, 1);
+        assert_eq!(commit.as_deref(), Some("abcdef1234567"));
+    }
+
+    #[test]
+    fn commit_sha_extraction_requires_a_git_sized_token() {
+        assert_eq!(
+            extract_reported_commit_sha("commit: abcdef1234567"),
+            Some("abcdef1234567".into())
+        );
+        assert_eq!(extract_reported_commit_sha("no commit reported"), None);
     }
 
     #[test]
@@ -1179,8 +2158,9 @@ mod tests {
   "acceptance_criteria": [],
   "requires_user_input": false
 }"#;
-        let envelope = validate_protocol_payload("ChatGPT rendered a code block without fences.", Some(json))
-            .expect("structured extension JSON is a valid protocol reply");
+        let envelope =
+            validate_protocol_payload("ChatGPT rendered a code block without fences.", Some(json))
+                .expect("structured extension JSON is a valid protocol reply");
         assert_eq!(protocol_state_name(&envelope.state), "PAUSE");
     }
 
@@ -1226,13 +2206,17 @@ Copy code"#;
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let connection = create_connection(app.handle())?;
+            pause_unfinished_orchestrations(&connection)?;
             let chatgpt_bridge = Arc::new(ChatGptBridge::new());
             start_chatgpt_bridge(app.handle().clone(), chatgpt_bridge.clone())?;
             app.manage(AppState {
                 connection: Mutex::new(connection),
                 chatgpt_bridge,
+                orchestrator: Mutex::new(None),
+                application_started_at: Utc::now(),
             });
             Ok(())
         })
@@ -1243,7 +2227,10 @@ pub fn run() {
             delete_inactive_module,
             execute_controlled_codex_turn,
             get_chatgpt_pairing,
-            send_chatgpt_message
+            send_chatgpt_message,
+            start_module_orchestration,
+            get_orchestration_snapshot,
+            apply_acceptance_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running the ChatGPT × Codex Middleware application");
