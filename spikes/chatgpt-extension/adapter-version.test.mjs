@@ -18,5 +18,7 @@ assert.match(content, /assistantDiagnosticsSummary\(previousCount, baselineAssis
 assert.match(background, /adapterDiagnostic/, 'desktop must receive non-sensitive protocol-timeout diagnostics');
 assert.match(content, /baselineAssistantText/, 'protocol dispatch must compare the post-send DOM against a pre-send assistant-message baseline');
 assert.match(content, /changedAssistantMessages/, 'protocol dispatch must track assistant nodes changed by the current request');
+assert.match(content, /hasPendingProtocolCandidate/, 'a partial structured response must be identified before the ordinary deadline expires');
+assert.match(content, /protocolReplyDeadlineMs/, 'protocol dispatch must use the bounded structured-response grace policy');
 
 console.log('ADAPTER_VERSION_SMOKE_OK');

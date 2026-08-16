@@ -1,5 +1,5 @@
 (() => {
-const contentAdapterVersion = '1.0.0';
+const contentAdapterVersion = '1.1.0';
 const assistantMessageSelector = '[data-message-author-role="assistant"]';
 const composerSelector = '#prompt-textarea';
 const sendButtonSelectors = [
@@ -50,6 +50,11 @@ function assistantDiagnosticsSummary(previousCount, baselineAssistantText, chang
     const changed = changedAssistantMessages.has(message) || baselineAssistantText.get(message) !== message.innerText;
     return `#${index}${index >= previousCount ? '*' : ''}(chars=${message.innerText.length},new=${isNew},changed=${changed},code=${codeBlocks},json=${Boolean(reply.protocolJson)})`;
   }).join(', ');
+}
+
+function hasPendingProtocolCandidate(message) {
+  return Boolean(message.querySelector('pre, pre code'))
+    || /"(?:state|module|reason)"\s*:/.test(message.innerText);
 }
 
 function textOfLatestAssistantMessage() {
@@ -114,21 +119,28 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
 
     function check() {
       const messageCount = assistantMessages().length;
-      const changedReplies = assistantMessages()
+      const changedMessages = assistantMessages()
         .filter((message) => changedAssistantMessages.has(message)
           || !baselineAssistantText.has(message)
-          || baselineAssistantText.get(message) !== message.innerText)
-        .map(replyFromAssistantMessage);
+          || baselineAssistantText.get(message) !== message.innerText);
+      const changedReplies = changedMessages.map(replyFromAssistantMessage);
       const protocolReply = requireProtocolJson
         ? changedReplies.find((reply) => Boolean(reply.protocolJson)) ?? null
         : null;
       const latestReply = protocolReply ?? latestAssistantReply();
       const signature = `${messageCount}\n${latestReply.text}`;
-      if (Date.now() - startedAt > timeoutMs) {
+      const pendingProtocolCandidate = requireProtocolJson
+        && changedMessages.some(hasPendingProtocolCandidate);
+      const deadlineMs = globalThis.protocolReplyDeadlineMs(
+        requireProtocolJson,
+        pendingProtocolCandidate,
+        timeoutMs
+      );
+      if (Date.now() - startedAt > deadlineMs) {
         const error = new Error(requireProtocolJson
           ? 'Timed out waiting for a complete structured protocol JSON reply.'
           : 'Timed out waiting for the ChatGPT reply to finish.');
-        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},current=${messageCount},changed=${changedAssistantMessages.size}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
+        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},current=${messageCount},changed=${changedAssistantMessages.size},pendingProtocolCandidate=${pendingProtocolCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
         finish(error);
         return;
       }

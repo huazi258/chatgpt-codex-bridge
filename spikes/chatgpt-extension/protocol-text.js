@@ -1,4 +1,11 @@
 (() => {
+const protocolReplyTimeoutMs = 90_000;
+const incompleteProtocolGraceMs = 90_000;
+
+function protocolReplyDeadlineMs(requireProtocolJson, hasPendingProtocolCandidate, timeoutMs = protocolReplyTimeoutMs) {
+  return timeoutMs + (requireProtocolJson && hasPendingProtocolCandidate ? incompleteProtocolGraceMs : 0);
+}
+
 function protocolJsonObjects(text) {
   const matches = [];
   for (let start = text.indexOf('{'); start >= 0; start = text.indexOf('{', start + 1)) {
@@ -59,5 +66,6 @@ function restoreProtocolCodeBlock(visibleText, codeBlocks) {
 
 globalThis.restoreProtocolCodeBlock = restoreProtocolCodeBlock;
 globalThis.extractProtocolJsonObject = extractProtocolJsonObject;
-globalThis.chatGptMiddlewareProtocolTextVersion = '1.0.0';
+globalThis.protocolReplyDeadlineMs = protocolReplyDeadlineMs;
+globalThis.chatGptMiddlewareProtocolTextVersion = '1.1.0';
 })();

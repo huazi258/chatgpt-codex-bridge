@@ -23,3 +23,7 @@ The system must prefer a recoverable pause to a speculative action. It pauses wh
 ## Observability
 
 The main view shows module, repository, branch, state, current round, elapsed time, configured budgets, and the latest status line. Detailed App Server events and protocol payloads remain available behind a diagnostics view, with secrets redacted.
+
+## Browser protocol completion window
+
+The browser adapter normally waits 90 seconds for a machine-readable protocol response. If the dispatched request has already produced or changed an assistant node containing a JSON/code-block candidate, it allows one additional bounded 90-second rendering grace period. This prevents a partially rendered protocol block from being misclassified as malformed while retaining a finite, user-actionable failure path. Diagnostics record only counts and boolean candidate state, never reply text.

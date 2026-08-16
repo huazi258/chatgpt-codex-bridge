@@ -21,4 +21,15 @@ assert.equal(
   '{\n  "state": "PAUSE"\n}',
   'must expose the raw protocol JSON for the structured bridge channel'
 );
+
+assert.equal(
+  context.globalThis.protocolReplyDeadlineMs(true, false),
+  90_000,
+  'an absent structured-reply candidate must retain the normal protocol deadline'
+);
+assert.equal(
+  context.globalThis.protocolReplyDeadlineMs(true, true),
+  180_000,
+  'a partially rendered structured-reply candidate must receive one bounded grace period'
+);
 console.log('PROTOCOL_TEXT_SMOKE_OK');
