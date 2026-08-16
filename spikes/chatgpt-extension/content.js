@@ -1,5 +1,5 @@
 (() => {
-const contentAdapterVersion = '1.1.0';
+const contentAdapterVersion = '1.2.0';
 const assistantMessageSelector = '[data-message-author-role="assistant"]';
 const composerSelector = '#prompt-textarea';
 const sendButtonSelectors = [
@@ -93,7 +93,7 @@ function waitForSendButton(composer, timeoutMs = 2_000) {
   });
 }
 
-function waitForCompletedAssistantReply(previousCount, baselineAssistantText, requireProtocolJson = false, timeoutMs = 90_000) {
+function waitForCompletedAssistantReply(previousCount, baselineAssistantText, requireProtocolJson = false, timeoutMs = 90_000, baselineProtocolJson = new Set()) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     let stableSince = 0;
@@ -124,8 +124,12 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
           || !baselineAssistantText.has(message)
           || baselineAssistantText.get(message) !== message.innerText);
       const changedReplies = changedMessages.map(replyFromAssistantMessage);
+      const currentReplies = assistantMessages().map(replyFromAssistantMessage);
+      const replyOutsideBaseline = requireProtocolJson
+        ? globalThis.findProtocolReplyOutsideBaseline(currentReplies, baselineProtocolJson)
+        : null;
       const protocolReply = requireProtocolJson
-        ? changedReplies.find((reply) => Boolean(reply.protocolJson)) ?? null
+        ? changedReplies.find((reply) => Boolean(reply.protocolJson)) ?? replyOutsideBaseline
         : null;
       const latestReply = protocolReply ?? latestAssistantReply();
       const signature = `${messageCount}\n${latestReply.text}`;
@@ -140,7 +144,7 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
         const error = new Error(requireProtocolJson
           ? 'Timed out waiting for a complete structured protocol JSON reply.'
           : 'Timed out waiting for the ChatGPT reply to finish.');
-        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},current=${messageCount},changed=${changedAssistantMessages.size},pendingProtocolCandidate=${pendingProtocolCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
+        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},baselineProtocolJson=${baselineProtocolJson.size},current=${messageCount},changed=${changedAssistantMessages.size},replyOutsideBaseline=${Boolean(replyOutsideBaseline)},pendingProtocolCandidate=${pendingProtocolCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
         finish(error);
         return;
       }
@@ -207,6 +211,12 @@ async function sendAndWait(text, includeProtocolJson = false) {
     const previousMessages = assistantMessages();
     const previousCount = previousMessages.length;
     const baselineAssistantText = new Map(previousMessages.map((message) => [message, message.innerText]));
+    const baselineProtocolJson = new Set(
+      previousMessages
+        .map(replyFromAssistantMessage)
+        .map((reply) => reply.protocolJson)
+        .filter(Boolean)
+    );
     stage = 'focusing composer';
     composer.focus();
     stage = 'setting composer text';
@@ -221,7 +231,13 @@ async function sendAndWait(text, includeProtocolJson = false) {
     sendButton.click();
 
     stage = 'waiting for completed reply';
-    const reply = await waitForCompletedAssistantReply(previousCount, baselineAssistantText, includeProtocolJson);
+    const reply = await waitForCompletedAssistantReply(
+      previousCount,
+      baselineAssistantText,
+      includeProtocolJson,
+      90_000,
+      baselineProtocolJson
+    );
     return includeProtocolJson ? reply : reply.text;
   } catch (error) {
     error.message = `${stage}: ${error.message}`;

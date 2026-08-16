@@ -6,6 +6,12 @@ function protocolReplyDeadlineMs(requireProtocolJson, hasPendingProtocolCandidat
   return timeoutMs + (requireProtocolJson && hasPendingProtocolCandidate ? incompleteProtocolGraceMs : 0);
 }
 
+function findProtocolReplyOutsideBaseline(replies, baselineProtocolJson) {
+  return replies.find((reply) => (
+    Boolean(reply.protocolJson) && !baselineProtocolJson.has(reply.protocolJson)
+  )) ?? null;
+}
+
 function protocolJsonObjects(text) {
   const matches = [];
   for (let start = text.indexOf('{'); start >= 0; start = text.indexOf('{', start + 1)) {
@@ -67,5 +73,6 @@ function restoreProtocolCodeBlock(visibleText, codeBlocks) {
 globalThis.restoreProtocolCodeBlock = restoreProtocolCodeBlock;
 globalThis.extractProtocolJsonObject = extractProtocolJsonObject;
 globalThis.protocolReplyDeadlineMs = protocolReplyDeadlineMs;
-globalThis.chatGptMiddlewareProtocolTextVersion = '1.1.0';
+globalThis.findProtocolReplyOutsideBaseline = findProtocolReplyOutsideBaseline;
+globalThis.chatGptMiddlewareProtocolTextVersion = '1.2.0';
 })();

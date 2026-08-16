@@ -20,5 +20,6 @@ assert.match(content, /baselineAssistantText/, 'protocol dispatch must compare t
 assert.match(content, /changedAssistantMessages/, 'protocol dispatch must track assistant nodes changed by the current request');
 assert.match(content, /hasPendingProtocolCandidate/, 'a partial structured response must be identified before the ordinary deadline expires');
 assert.match(content, /protocolReplyDeadlineMs/, 'protocol dispatch must use the bounded structured-response grace policy');
+assert.match(content, /findProtocolReplyOutsideBaseline/, 'protocol dispatch must recover a new JSON reply after ChatGPT reuses an assistant DOM node');
 
 console.log('ADAPTER_VERSION_SMOKE_OK');

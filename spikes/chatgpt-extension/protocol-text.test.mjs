@@ -32,4 +32,18 @@ assert.equal(
   180_000,
   'a partially rendered structured-reply candidate must receive one bounded grace period'
 );
+
+const pauseJson = '{"state":"PAUSE","module":"Task 7 bounded pilot","reason":"ready"}';
+const nextTaskJson = '{"state":"NEXT_TASK","module":"Task 7 bounded pilot","reason":"continue","codex_prompt":"write only test/task7-pilot.md","acceptance_criteria":["file exists"]}';
+assert.equal(
+  context.globalThis.findProtocolReplyOutsideBaseline(
+    [
+      { text: 'old visible reply', protocolJson: pauseJson },
+      { text: 'new visible reply', protocolJson: nextTaskJson }
+    ],
+    new Set([pauseJson])
+  )?.protocolJson,
+  nextTaskJson,
+  'a valid protocol reply must be accepted when DOM reuse hides its mutation but its JSON differs from the pre-send baseline'
+);
 console.log('PROTOCOL_TEXT_SMOKE_OK');
