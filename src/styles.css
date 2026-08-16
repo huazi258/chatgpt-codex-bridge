@@ -38,6 +38,8 @@ textarea:focus { border-color: #5379c7; box-shadow: 0 0 0 3px rgba(83, 121, 199,
 .danger { color: #a82f39; background: #ffeef0; }
 button:disabled { cursor: wait; opacity: .55; }
 nav { display: grid; gap: 9px; }
+.new-module-entry { width: 100%; padding: 11px 13px; border: 1px dashed #6e89bd; border-radius: 9px; color: #e6efff; background: rgba(94, 120, 170, .16); text-align: left; font-weight: 800; }
+.new-module-entry:hover, .new-module-entry.selected { border-style: solid; background: #26385d; }
 .module-card { display: grid; gap: 5px; width: 100%; padding: 13px; border: 1px solid transparent; border-radius: 9px; color: #dce6f6; background: transparent; text-align: left; }
 .module-card:hover, .module-card.selected { border-color: #5e78aa; background: #26385d; }
 .module-card strong { font-size: 14px; }

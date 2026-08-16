@@ -20,6 +20,7 @@ const defaultRetry = '请根据既定格式，在回复最后且仅输出一个�
 export default function App() {
   const [modules, setModules] = useState<RelayModule[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isCreatingModule, setIsCreatingModule] = useState(false);
   const [messages, setMessages] = useState<RelayMessage[]>([]);
   const [pairing, setPairing] = useState<PairingInfo | null>(null);
   const [bridge, setBridge] = useState<BridgeStatus | null>(null);
@@ -28,12 +29,19 @@ export default function App() {
   const [draft, setDraft] = useState({ name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry });
   const [text, setText] = useState('');
   const [kind, setKind] = useState<RelayKind>('MANUAL');
-  const selected = useMemo(() => modules.find((item) => item.id === selectedId) ?? null, [modules, selectedId]);
+  const selected = useMemo(
+    () => isCreatingModule ? null : modules.find((item) => item.id === selectedId) ?? null,
+    [isCreatingModule, modules, selectedId],
+  );
 
-  async function refreshModules(preferredId = selectedId) {
+  async function refreshModules(preferredId?: string, preserveCreationView = isCreatingModule) {
     const next = await invoke<RelayModule[]>('list_relay_modules');
     setModules(next);
-    setSelectedId((next.find((item) => item.id === preferredId) ?? next[0] ?? null)?.id ?? null);
+    if (preferredId) {
+      setSelectedId((next.find((item) => item.id === preferredId) ?? next[0] ?? null)?.id ?? null);
+    } else if (!preserveCreationView) {
+      setSelectedId((next.find((item) => item.id === selectedId) ?? next[0] ?? null)?.id ?? null);
+    }
   }
   async function refreshMessages(moduleId = selectedId) {
     if (!moduleId) return setMessages([]);
@@ -69,7 +77,8 @@ export default function App() {
         name: draft.name.trim(), workingDirectory: draft.workingDirectory.trim(), maxCycles: Number(draft.maxCycles),
         maxRuntimeMinutes: Number(draft.maxRuntimeMinutes), retryTemplate: draft.retryTemplate.trim()
       }});
-      await refreshModules(module.id);
+      await refreshModules(module.id, false);
+      setIsCreatingModule(false);
       setDraft({ name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry });
       setNotice(`已创建“${module.name}”。创建不会发送消息或启动 Codex。`);
     } catch (error) { setNotice(`创建失败：${String(error)}`); } finally { setBusy(false); }
@@ -93,7 +102,7 @@ export default function App() {
     <aside className="sidebar">
       <div><p className="eyebrow">CONVERSATION RELAY V2</p><h1>传话模块</h1><p className="muted">一个模块对应一个 ChatGPT 对话和一个由中间件持有的 Codex 对话。</p></div>
       <p className={`bridge-state ${pairing?.paired ? 'online' : 'offline'}`}>{pairing?.paired ? 'ChatGPT 已连接' : 'ChatGPT 未连接'}</p>
-      <nav aria-label="传话模块列表"><p className="section-label">模块 · {modules.length}</p>{modules.length === 0 ? <p className="empty">还没有传话模块。</p> : modules.map((module) => <button className={`module-card ${module.id === selectedId ? 'selected' : ''}`} key={module.id} onClick={() => { setSelectedId(module.id); setNotice(`已打开“${module.name}”。`); }} disabled={busy}><strong>{module.name}</strong><span>{module.phase}</span></button>)}</nav>
+      <nav aria-label="传话模块列表"><p className="section-label">模块 · {modules.length}</p><button className={`new-module-entry ${isCreatingModule || modules.length === 0 ? 'selected' : ''}`} type="button" onClick={() => { setSelectedId(null); setIsCreatingModule(true); setNotice('请填写新模块的信息。'); }} disabled={busy}>新建模块</button>{modules.length === 0 ? <p className="empty">还没有传话模块。</p> : modules.map((module) => <button className={`module-card ${!isCreatingModule && module.id === selectedId ? 'selected' : ''}`} key={module.id} onClick={() => { setIsCreatingModule(false); setSelectedId(module.id); setNotice(`已打开“${module.name}”。`); }} disabled={busy}><strong>{module.name}</strong><span>{module.phase}</span></button>)}</nav>
     </aside>
     <section className="workspace relay-workspace">
       <header><div><p className="eyebrow">受控文本传话</p><h2>{selected?.name ?? '创建传话模块'}</h2></div><span className="status-pill">{selected?.phase ?? 'READY'}</span></header>
