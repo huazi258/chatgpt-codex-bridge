@@ -1,5 +1,7 @@
 # Reliability and operating model
 
+> Historical V1 operating model. The active reliability and recovery rules are [Decision 004 — Conversation relay V2](../decisions/004-conversation-relay-v2.md); it supersedes this document where they conflict.
+
 ## Pause-first policy
 
 The system must prefer a recoverable pause to a speculative action. It pauses when the protocol is invalid, the bound tab is unavailable, Codex fails or asks for clarification, Git verification fails, a configured budget is reached, or the application restarts during active work.

@@ -1,5 +1,7 @@
 # System architecture
 
+> Historical V1 architecture. The active relay architecture is [Decision 004 — Conversation relay V2](../decisions/004-conversation-relay-v2.md); it supersedes this document where they conflict.
+
 ## Component view
 
 ```text

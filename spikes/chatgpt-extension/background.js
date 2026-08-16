@@ -108,7 +108,7 @@ async function connect(secret, tabId) {
       try {
         await ensureLatestContentAdapter(pairedTabId);
         const response = await chrome.tabs.sendMessage(pairedTabId, {
-          type: 'sendMiddlewareMessageV2',
+          type: message.relay ? 'sendMiddlewareMessage' : 'sendMiddlewareMessageV2',
           text: message.text
         });
         if (!response?.ok) {
@@ -122,7 +122,8 @@ async function connect(secret, tabId) {
           text: response.response,
           protocolJson: typeof response.protocolJson === 'string' ? response.protocolJson : undefined,
           protocolJsonPresent: Boolean(response.protocolJsonPresent),
-          adapterVersion: response.adapterVersion ?? contentAdapterVersion
+          adapterVersion: response.adapterVersion ?? contentAdapterVersion,
+          relay: Boolean(message.relay)
         }));
       } catch (error) {
         socket?.send(JSON.stringify({
@@ -132,7 +133,8 @@ async function connect(secret, tabId) {
           protocolJsonPresent: false,
           adapterVersion: contentAdapterVersion,
           adapterError: error.message,
-          adapterDiagnostic: error.adapterDiagnostic ?? null
+          adapterDiagnostic: error.adapterDiagnostic ?? null,
+          relay: Boolean(message.relay)
         }));
       }
     }

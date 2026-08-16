@@ -1,4 +1,5 @@
 mod orchestration;
+mod relay_protocol;
 
 use chrono::{DateTime, Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -10,7 +11,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{mpsc as std_mpsc, Arc, Mutex},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{net::TcpListener, sync::mpsc};
@@ -20,11 +21,13 @@ use uuid::Uuid;
 const INITIAL_SCHEMA: &str = include_str!("../migrations/001_initial.sql");
 const ORCHESTRATION_SCHEMA: &str = include_str!("../migrations/002_orchestration_runtime.sql");
 const EXECUTION_CONTROL_SCHEMA: &str = include_str!("../migrations/003_execution_control.sql");
+const CONVERSATION_RELAY_SCHEMA: &str = include_str!("../migrations/004_conversation_relay_v2.sql");
 
 struct AppState {
     connection: Mutex<Connection>,
     chatgpt_bridge: Arc<ChatGptBridge>,
     orchestrator: Mutex<Option<ActiveOrchestration>>,
+    relay_codex: Mutex<Option<RelayCodexSession>>,
     application_started_at: DateTime<Utc>,
 }
 
@@ -134,6 +137,16 @@ impl Drop for ManagedAppServer {
     }
 }
 
+#[derive(Clone)]
+struct RelayCodexSession {
+    module_id: String,
+    commands: std_mpsc::Sender<RelayCodexCommand>,
+}
+
+enum RelayCodexCommand {
+    StartTurn(String),
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InactiveModuleInput {
@@ -198,6 +211,65 @@ struct CodexTurnResult {
     turn_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayModuleInput {
+    name: String,
+    working_directory: String,
+    max_cycles: i64,
+    max_runtime_minutes: i64,
+    retry_template: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RelayModuleRecord {
+    id: String,
+    name: String,
+    working_directory: String,
+    max_cycles: i64,
+    max_runtime_minutes: i64,
+    retry_template: String,
+    phase: String,
+    codex_thread_id: Option<String>,
+    module_started_at: Option<String>,
+    stop_after_turn: bool,
+    invalid_reply_count: i64,
+    started_cycles: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayMessageKind {
+    Manual,
+    Automation,
+}
+
+impl RelayMessageKind {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Manual => "MANUAL",
+            Self::Automation => "AUTOMATION",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayMessageRecord {
+    id: String,
+    module_id: String,
+    sequence_number: i64,
+    direction: String,
+    kind: String,
+    text: String,
+    delivery_state: String,
+    created_at: String,
+    delivered_at: Option<String>,
+}
+
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
     let data_dir = app
         .path()
@@ -220,7 +292,28 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
     connection
         .execute_batch(EXECUTION_CONTROL_SCHEMA)
         .map_err(|error| format!("could not initialize execution-control storage: {error}"))?;
+    connection
+        .execute_batch(CONVERSATION_RELAY_SCHEMA)
+        .map_err(|error| format!("could not initialize conversation-relay storage: {error}"))?;
     Ok(connection)
+}
+
+fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String> {
+    let affected = connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'UNKNOWN'
+         WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+            [],
+        )
+        .map_err(|error| format!("could not recover relay delivery state: {error}"))?;
+    if affected > 0 {
+        connection.execute(
+            "UPDATE relay_modules SET phase = 'RECOVERY_REQUIRED', updated_at = ?1
+             WHERE id IN (SELECT DISTINCT module_id FROM relay_messages WHERE delivery_state = 'UNKNOWN')",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| format!("could not mark relay recovery state: {error}"))?;
+    }
+    Ok(())
 }
 
 fn validate(input: &InactiveModuleInput) -> Result<(), String> {
@@ -1035,6 +1128,7 @@ async fn handle_chatgpt_bridge_connection(
                         let adapter_version = message.get("adapterVersion").and_then(Value::as_str);
                         let adapter_error = message.get("adapterError").and_then(Value::as_str);
                         let adapter_diagnostic = message.get("adapterDiagnostic").and_then(Value::as_str);
+                        let relay = message.get("relay").and_then(Value::as_bool) == Some(true);
                         let valid_session = bridge.session.lock().ok().and_then(|session| session.clone()).is_some_and(|session| Some(session.session_id.as_str()) == session_id);
                         if !valid_session || reply.is_none() {
                             bridge.set_status(&app, ChatGptBridgeStatus {
@@ -1047,6 +1141,17 @@ async fn handle_chatgpt_bridge_connection(
                                 &app.state::<AppState>(),
                                 "收到未配对或不完整的 ChatGPT 回复。".into(),
                             );
+                            continue;
+                        }
+                        if relay {
+                            if let Err(error) = handle_relay_chatgpt_reply(app.clone(), reply.unwrap_or_default()) {
+                                bridge.set_status(&app, ChatGptBridgeStatus {
+                                    phase: "RELAY_BLOCKED".into(),
+                                    detail: format!("传话回复无法处理：{error}"),
+                                    tab_id: None,
+                                    protocol_state: None,
+                                });
+                            }
                             continue;
                         }
                         if structured_json_present == Some(false) {
@@ -1173,6 +1278,172 @@ fn get_chatgpt_pairing(state: State<'_, AppState>) -> ChatGptPairingInfo {
     }
 }
 
+fn validate_relay_module(input: &RelayModuleInput) -> Result<(), String> {
+    if input.name.trim().is_empty() || input.working_directory.trim().is_empty() {
+        return Err("请填写模块名称和 Codex 工作目录。".into());
+    }
+    if input.max_cycles <= 0 || input.max_runtime_minutes <= 0 {
+        return Err("最大循环次数和最长运行时间必须为正数。".into());
+    }
+    if input.retry_template.trim().is_empty() {
+        return Err("请填写 ChatGPT 协议重试模板。".into());
+    }
+    Ok(())
+}
+
+fn relay_row_to_module(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayModuleRecord> {
+    Ok(RelayModuleRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        working_directory: row.get(2)?,
+        max_cycles: row.get(3)?,
+        max_runtime_minutes: row.get(4)?,
+        retry_template: row.get(5)?,
+        phase: row.get(6)?,
+        codex_thread_id: row.get(7)?,
+        module_started_at: row.get(8)?,
+        stop_after_turn: row.get::<_, i64>(9)? != 0,
+        invalid_reply_count: row.get(10)?,
+        started_cycles: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+fn get_relay_module(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<RelayModuleRecord>, String> {
+    connection.query_row(
+        "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
+                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+         FROM relay_modules WHERE id = ?1",
+        [id],
+        relay_row_to_module,
+    ).optional().map_err(|error| format!("无法读取传话模块：{error}"))
+}
+
+fn next_relay_sequence(connection: &Connection, module_id: &str) -> Result<i64, String> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM relay_messages WHERE module_id = ?1",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法分配消息序号：{error}"))
+}
+
+fn relay_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayMessageRecord> {
+    Ok(RelayMessageRecord {
+        id: row.get(0)?,
+        module_id: row.get(1)?,
+        sequence_number: row.get(2)?,
+        direction: row.get(3)?,
+        kind: row.get(4)?,
+        text: row.get(5)?,
+        delivery_state: row.get(6)?,
+        created_at: row.get(7)?,
+        delivered_at: row.get(8)?,
+    })
+}
+
+fn append_relay_event(
+    connection: &Connection,
+    module_id: &str,
+    event_type: &str,
+    detail: &str,
+) -> Result<(), String> {
+    connection.execute(
+        "INSERT INTO relay_events (id, module_id, event_type, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![Uuid::new_v4().to_string(), module_id, event_type, detail, Utc::now().to_rfc3339()],
+    ).map_err(|error| format!("无法记录传话事件：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn create_relay_module(
+    state: State<'_, AppState>,
+    input: RelayModuleInput,
+) -> Result<RelayModuleRecord, String> {
+    validate_relay_module(&input)?;
+    if !Path::new(input.working_directory.trim()).is_dir() {
+        return Err("所选 Codex 工作目录不存在。".into());
+    }
+    let now = Utc::now().to_rfc3339();
+    let module = RelayModuleRecord {
+        id: Uuid::new_v4().to_string(),
+        name: input.name.trim().to_string(),
+        working_directory: input.working_directory.trim().to_string(),
+        max_cycles: input.max_cycles,
+        max_runtime_minutes: input.max_runtime_minutes,
+        retry_template: input.retry_template.trim().to_string(),
+        phase: "READY".into(),
+        codex_thread_id: None,
+        module_started_at: None,
+        stop_after_turn: false,
+        invalid_reply_count: 0,
+        started_cycles: 0,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    connection.execute(
+        "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 0, 0, 0, ?8, ?8)",
+        params![&module.id, &module.name, &module.working_directory, module.max_cycles, module.max_runtime_minutes, &module.retry_template, &module.phase, &module.created_at],
+    ).map_err(|error| format!("无法创建传话模块：{error}"))?;
+    append_relay_event(
+        &connection,
+        &module.id,
+        "CREATED",
+        "已创建传话模块，尚未开始自动化。",
+    )?;
+    Ok(module)
+}
+
+#[tauri::command]
+fn list_relay_modules(state: State<'_, AppState>) -> Result<Vec<RelayModuleRecord>, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    let mut statement = connection.prepare(
+        "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
+                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+         FROM relay_modules ORDER BY updated_at DESC",
+    ).map_err(|error| format!("无法查询传话模块：{error}"))?;
+    let modules = statement
+        .query_map([], relay_row_to_module)
+        .map_err(|error| format!("无法读取传话模块：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取传话模块：{error}"))?;
+    Ok(modules)
+}
+
+#[tauri::command]
+fn list_relay_messages(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<Vec<RelayMessageRecord>, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    let mut statement = connection.prepare(
+        "SELECT id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at
+         FROM relay_messages WHERE module_id = ?1 ORDER BY sequence_number ASC",
+    ).map_err(|error| format!("无法查询消息历史：{error}"))?;
+    let messages = statement
+        .query_map([module_id], relay_message_row)
+        .map_err(|error| format!("无法读取消息历史：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取消息历史：{error}"))?;
+    Ok(messages)
+}
+
 #[tauri::command]
 fn send_chatgpt_message(
     app: AppHandle,
@@ -1211,6 +1482,697 @@ fn send_chatgpt_message_internal(
         },
     );
     Ok(())
+}
+
+fn send_relay_chatgpt_message_internal(
+    app: &AppHandle,
+    bridge: &ChatGptBridge,
+    text: &str,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("传往 ChatGPT 的消息不能为空。".into());
+    }
+    let session = bridge
+        .session
+        .lock()
+        .map_err(|_| "ChatGPT 桥接锁已损坏。".to_string())?
+        .clone()
+        .ok_or_else(|| "尚未绑定 ChatGPT 标签页。".to_string())?;
+    bridge.send_to_extension(json!({
+        "type": "sendChatGptMessage",
+        "sessionId": session.session_id,
+        "text": text,
+        "relay": true
+    }))?;
+    bridge.set_status(
+        app,
+        ChatGptBridgeStatus {
+            phase: "RELAY_SENT".into(),
+            detail: "已将传话消息发送到 ChatGPT，正在等待回复。".into(),
+            tab_id: Some(session.tab_id),
+            protocol_state: None,
+        },
+    );
+    Ok(())
+}
+
+fn next_queued_relay_message(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<Option<RelayMessageRecord>, String> {
+    connection.query_row(
+        "SELECT id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at
+         FROM relay_messages WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
+         ORDER BY sequence_number ASC LIMIT 1",
+        [module_id], relay_message_row,
+    ).optional().map_err(|error| format!("无法读取待发送消息：{error}"))
+}
+
+fn dispatch_next_relay_message(
+    app: &AppHandle,
+    state: &AppState,
+    module_id: &str,
+) -> Result<(), String> {
+    let message = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        let already_in_flight: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+            [], |row| row.get(0),
+        ).map_err(|error| format!("无法检查消息队列：{error}"))?;
+        if already_in_flight > 0 {
+            return Ok(());
+        }
+        let Some(message) = next_queued_relay_message(&connection, module_id)? else {
+            return Ok(());
+        };
+        connection.execute(
+            "UPDATE relay_messages SET delivery_state = 'SENT' WHERE id = ?1 AND delivery_state = 'QUEUED'",
+            [&message.id],
+        ).map_err(|error| format!("无法标记待发送消息：{error}"))?;
+        append_relay_event(
+            &connection,
+            module_id,
+            "CHATGPT_SEND_STARTED",
+            "已发送队首消息，等待 ChatGPT 回复。",
+        )?;
+        message
+    };
+    if let Err(error) =
+        send_relay_chatgpt_message_internal(app, &state.chatgpt_bridge, &message.text)
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        connection
+            .execute(
+                "UPDATE relay_messages SET delivery_state = 'FAILED' WHERE id = ?1",
+                [&message.id],
+            )
+            .map_err(|database_error| format!("无法记录 ChatGPT 发送失败：{database_error}"))?;
+        append_relay_event(&connection, module_id, "CHATGPT_SEND_FAILED", &error)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn queue_relay_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+    kind: RelayMessageKind,
+    text: String,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("消息不能为空。".into());
+    }
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        let module = get_relay_module(&connection, &module_id)?
+            .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+            return Err("模块已经结束，不能再发送消息。".into());
+        }
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at)
+             VALUES (?1, ?2, ?3, 'TO_CHATGPT', ?4, ?5, 'QUEUED', ?6, NULL)",
+            params![Uuid::new_v4().to_string(), module_id, next_relay_sequence(&connection, &module_id)?, kind.as_db(), text.trim(), now],
+        ).map_err(|error| format!("无法将消息加入队列：{error}"))?;
+        append_relay_event(
+            &connection,
+            &module_id,
+            "CHATGPT_MESSAGE_QUEUED",
+            "已加入 ChatGPT 发送队列。",
+        )?;
+    }
+    dispatch_next_relay_message(&app, &state, &module_id)
+}
+
+fn append_relay_message(
+    connection: &Connection,
+    module_id: &str,
+    direction: &str,
+    kind: &str,
+    text: &str,
+    delivery_state: &str,
+) -> Result<(), String> {
+    connection.execute(
+        "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![Uuid::new_v4().to_string(), module_id, next_relay_sequence(connection, module_id)?, direction, kind, text, delivery_state, Utc::now().to_rfc3339()],
+    ).map_err(|error| format!("无法保存传话消息：{error}"))?;
+    Ok(())
+}
+
+fn set_relay_phase(connection: &Connection, module_id: &str, phase: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE relay_modules SET phase = ?2, updated_at = ?3 WHERE id = ?1",
+            params![module_id, phase, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法更新传话模块状态：{error}"))?;
+    Ok(())
+}
+
+fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (module_id, outgoing_kind, next_action) = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        let outgoing: (String, String, String) = connection
+            .query_row(
+                "SELECT id, module_id, kind FROM relay_messages
+             WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
+             ORDER BY created_at ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("无法匹配 ChatGPT 回复：{error}"))?
+            .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 回复。".to_string())?;
+        connection.execute(
+            "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
+            params![outgoing.0, Utc::now().to_rfc3339()],
+        ).map_err(|error| format!("无法确认 ChatGPT 消息送达：{error}"))?;
+        append_relay_message(
+            &connection,
+            &outgoing.1,
+            "FROM_CHATGPT",
+            &outgoing.2,
+            reply,
+            "DELIVERED",
+        )?;
+
+        if outgoing.2 == "MANUAL" {
+            append_relay_event(
+                &connection,
+                &outgoing.1,
+                "MANUAL_REPLY",
+                "已收到手动聊天回复；该回复不会触发自动化。",
+            )?;
+            (outgoing.1, outgoing.2, None)
+        } else {
+            let module = get_relay_module(&connection, &outgoing.1)?
+                .ok_or_else(|| "传话模块不存在。".to_string())?;
+            match relay_protocol::parse_terminal_control_block(reply, None) {
+                Ok(relay_protocol::ControlBlock::CodexPrompt(prompt)) => {
+                    connection.execute(
+                        "UPDATE relay_modules SET phase = 'CODEX_PROMPT_READY', invalid_reply_count = 0, updated_at = ?2 WHERE id = ?1",
+                        params![&module.id, Utc::now().to_rfc3339()],
+                    ).map_err(|error| format!("无法保存 Codex 提示词：{error}"))?;
+                    append_relay_message(
+                        &connection,
+                        &module.id,
+                        "TO_CODEX",
+                        "AUTOMATION",
+                        &prompt,
+                        "QUEUED",
+                    )?;
+                    append_relay_event(
+                        &connection,
+                        &module.id,
+                        "CODEX_PROMPT_RECEIVED",
+                        "已识别有效的 Codex 提示词，等待执行适配器接管。",
+                    )?;
+                    (
+                        outgoing.1,
+                        outgoing.2,
+                        Some(json!({ "type": "CODEX_PROMPT", "prompt": prompt })),
+                    )
+                }
+                Ok(relay_protocol::ControlBlock::ModuleDone) => {
+                    set_relay_phase(&connection, &module.id, "WAITING_FOR_ACCEPTANCE")?;
+                    append_relay_event(
+                        &connection,
+                        &module.id,
+                        "MODULE_DONE",
+                        "ChatGPT 请求人工验收。",
+                    )?;
+                    (
+                        outgoing.1,
+                        outgoing.2,
+                        Some(json!({ "type": "MODULE_DONE" })),
+                    )
+                }
+                Ok(relay_protocol::ControlBlock::Blocked(reason)) => {
+                    set_relay_phase(&connection, &module.id, "BLOCKED")?;
+                    append_relay_event(&connection, &module.id, "BLOCKED", &reason)?;
+                    (
+                        outgoing.1,
+                        outgoing.2,
+                        Some(json!({ "type": "BLOCKED", "reason": reason })),
+                    )
+                }
+                Ok(relay_protocol::ControlBlock::CodexInput(_)) => {
+                    set_relay_phase(&connection, &module.id, "BLOCKED")?;
+                    append_relay_event(
+                        &connection,
+                        &module.id,
+                        "INVALID_CODEX_INPUT",
+                        "当前没有待回答的 Codex 输入请求。",
+                    )?;
+                    (
+                        outgoing.1,
+                        outgoing.2,
+                        Some(
+                            json!({ "type": "ERROR", "reason": "当前没有待回答的 Codex 输入请求。" }),
+                        ),
+                    )
+                }
+                Err(error) => {
+                    let next_invalid_count = module.invalid_reply_count + 1;
+                    connection.execute(
+                        "UPDATE relay_modules SET invalid_reply_count = ?2, updated_at = ?3 WHERE id = ?1",
+                        params![&module.id, next_invalid_count, Utc::now().to_rfc3339()],
+                    ).map_err(|database_error| format!("无法记录协议错误：{database_error}"))?;
+                    if next_invalid_count == 1 {
+                        append_relay_message(
+                            &connection,
+                            &module.id,
+                            "TO_CHATGPT",
+                            "AUTOMATION",
+                            &module.retry_template,
+                            "QUEUED",
+                        )?;
+                        append_relay_event(
+                            &connection,
+                            &module.id,
+                            "CONTROL_RETRY",
+                            &format!("自动化回复无效，已排队一次重试：{error}"),
+                        )?;
+                        (
+                            outgoing.1,
+                            outgoing.2,
+                            Some(json!({ "type": "RETRY", "reason": error })),
+                        )
+                    } else {
+                        set_relay_phase(&connection, &module.id, "BLOCKED")?;
+                        append_relay_event(
+                            &connection,
+                            &module.id,
+                            "CONTROL_FAILED",
+                            &format!("第二次自动化回复无效：{error}"),
+                        )?;
+                        (
+                            outgoing.1,
+                            outgoing.2,
+                            Some(
+                                json!({ "type": "ERROR", "reason": format!("ChatGPT 连续两次未给出有效控制块：{error}") }),
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    };
+    if let Some(action) = &next_action {
+        let _ = app.emit("relay-control", action);
+    }
+    state.chatgpt_bridge.set_status(
+        &app,
+        ChatGptBridgeStatus {
+            phase: if outgoing_kind == "MANUAL" {
+                "RELAY_MANUAL_REPLY".into()
+            } else {
+                "RELAY_AUTOMATION_REPLY".into()
+            },
+            detail: if outgoing_kind == "MANUAL" {
+                "已收到手动 ChatGPT 回复。".into()
+            } else {
+                "已收到自动化 ChatGPT 回复。".into()
+            },
+            tab_id: state
+                .chatgpt_bridge
+                .session
+                .lock()
+                .ok()
+                .and_then(|session| session.clone())
+                .map(|session| session.tab_id),
+            protocol_state: None,
+        },
+    );
+    dispatch_next_relay_message(&app, &state, &module_id)?;
+    if let Some(action) = next_action {
+        if action.get("type").and_then(Value::as_str) == Some("CODEX_PROMPT") {
+            let prompt = action
+                .get("prompt")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Codex 提示词事件缺少正文。".to_string())?;
+            start_or_continue_relay_codex_turn(&app, &module_id, prompt)?;
+        }
+    }
+    Ok(())
+}
+
+fn start_or_continue_relay_codex_turn(
+    app: &AppHandle,
+    module_id: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let module = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        let module = get_relay_module(&connection, module_id)?
+            .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if module.started_cycles >= module.max_cycles {
+            set_relay_phase(&connection, module_id, "WAITING_FOR_ACCEPTANCE")?;
+            append_relay_event(
+                &connection,
+                module_id,
+                "CYCLE_BUDGET_REACHED",
+                "已达到最大自动化循环次数，等待人工验收。",
+            )?;
+            return Err("已达到最大自动化循环次数，不能启动新的 Codex 回合。".into());
+        }
+        if let Some(started) = module.module_started_at.as_deref() {
+            let started = DateTime::parse_from_rfc3339(started)
+                .map_err(|error| format!("模块开始时间无法读取：{error}"))?
+                .with_timezone(&Utc);
+            if Utc::now() - started >= Duration::minutes(module.max_runtime_minutes) {
+                set_relay_phase(&connection, module_id, "WAITING_FOR_ACCEPTANCE")?;
+                append_relay_event(
+                    &connection,
+                    module_id,
+                    "RUNTIME_BUDGET_REACHED",
+                    "已达到模块最长运行时间，等待人工验收。",
+                )?;
+                return Err("已达到模块最长运行时间，不能启动新的 Codex 回合。".into());
+            }
+        }
+        connection.execute(
+            "UPDATE relay_modules SET phase = 'CODEX_STARTING', started_cycles = started_cycles + 1,
+             module_started_at = COALESCE(module_started_at, ?2), updated_at = ?2 WHERE id = ?1",
+            params![module_id, Utc::now().to_rfc3339()],
+        ).map_err(|error| format!("无法启动 Codex 回合：{error}"))?;
+        module
+    };
+
+    let mut sessions = state
+        .relay_codex
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+    if let Some(session) = sessions.as_ref() {
+        if session.module_id != module_id {
+            return Err("另一个模块正在持有 Codex 对话；当前中间件一次只能运行一个模块。".into());
+        }
+        session
+            .commands
+            .send(RelayCodexCommand::StartTurn(prompt.to_string()))
+            .map_err(|_| "Codex 对话已经退出。".to_string())?;
+    } else {
+        if !Path::new(&module.working_directory).is_dir() {
+            return Err("所选 Codex 工作目录不存在。".into());
+        }
+        let (sender, receiver) = std_mpsc::channel();
+        let app_for_worker = app.clone();
+        let working_directory = module.working_directory.clone();
+        let module_id = module_id.to_string();
+        std::thread::spawn(move || {
+            relay_codex_worker(app_for_worker, module_id, working_directory, receiver)
+        });
+        sender
+            .send(RelayCodexCommand::StartTurn(prompt.to_string()))
+            .map_err(|_| "无法启动 Codex 对话。".to_string())?;
+        *sessions = Some(RelayCodexSession {
+            module_id: module.id,
+            commands: sender,
+        });
+    }
+    let _ = app.emit(
+        "relay-codex-status",
+        json!({ "phase": "CODEX_STARTING", "moduleId": module_id }),
+    );
+    Ok(())
+}
+
+fn relay_codex_worker(
+    app: AppHandle,
+    module_id: String,
+    working_directory: String,
+    commands: std_mpsc::Receiver<RelayCodexCommand>,
+) {
+    let command = codex_command();
+    let child = Command::new(&command)
+        .arg("app-server")
+        .current_dir(&working_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let Ok(mut child) = child else {
+        relay_codex_failed(&app, &module_id, "无法启动本地 Codex App Server。".into());
+        return;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        relay_codex_failed(&app, &module_id, "Codex App Server 没有可用输入流。".into());
+        return;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        relay_codex_failed(&app, &module_id, "Codex App Server 没有可用输出流。".into());
+        return;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        relay_codex_failed(&app, &module_id, "Codex App Server 没有可用错误流。".into());
+        return;
+    };
+    let (events_sender, events) = std_mpsc::channel::<Result<Value, String>>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let event = line
+                .map_err(|error| format!("无法读取 Codex 输出：{error}"))
+                .and_then(|line| {
+                    serde_json::from_str(&line)
+                        .map_err(|error| format!("Codex 输出不是 JSON：{error}"))
+                });
+            if events_sender.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
+    if let Err(error) = send_rpc(
+        &mut stdin,
+        json!({ "method": "initialize", "id": 1, "params": { "clientInfo": { "name": "chatgpt-codex-middleware", "title": "ChatGPT × Codex Middleware", "version": env!("CARGO_PKG_VERSION") } } }),
+    ) {
+        relay_codex_failed(&app, &module_id, error);
+        return;
+    }
+
+    let mut thread_id: Option<String> = None;
+    let mut pending_prompt: Option<String> = None;
+    let mut next_request_id = 3_i64;
+    let mut final_summary = String::new();
+    'worker: loop {
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                RelayCodexCommand::StartTurn(prompt) => {
+                    if let Some(thread) = thread_id.as_deref() {
+                        if let Err(error) = send_rpc(
+                            &mut stdin,
+                            json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
+                        ) {
+                            relay_codex_failed(&app, &module_id, error);
+                            break 'worker;
+                        }
+                        next_request_id += 1;
+                        final_summary.clear();
+                    } else {
+                        pending_prompt = Some(prompt);
+                    }
+                }
+            }
+        }
+        match events.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(Err(error)) => {
+                relay_codex_failed(&app, &module_id, error);
+                break;
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                relay_codex_failed(
+                    &app,
+                    &module_id,
+                    "Codex App Server 已在回合完成前退出。".into(),
+                );
+                break;
+            }
+            Ok(Ok(message)) => {
+                if let Some(error) = message
+                    .get("error")
+                    .and_then(|value| value.get("message"))
+                    .and_then(Value::as_str)
+                {
+                    relay_codex_failed(&app, &module_id, format!("Codex App Server 错误：{error}"));
+                    break;
+                }
+                match message.get("id").and_then(Value::as_i64) {
+                    Some(1) => {
+                        if send_rpc(&mut stdin, json!({ "method": "initialized", "params": {} }))
+                            .and_then(|_| {
+                                send_rpc(
+                                    &mut stdin,
+                                    json!({ "method": "thread/start", "id": 2, "params": {} }),
+                                )
+                            })
+                            .is_err()
+                        {
+                            relay_codex_failed(&app, &module_id, "无法初始化 Codex 对话。".into());
+                            break;
+                        }
+                    }
+                    Some(2) => {
+                        thread_id = message
+                            .pointer("/result/thread/id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned);
+                        let Some(thread) = thread_id.as_deref() else {
+                            relay_codex_failed(&app, &module_id, "Codex 未返回对话 ID。".into());
+                            break;
+                        };
+                        relay_codex_thread_ready(&app, &module_id, thread);
+                        if let Some(prompt) = pending_prompt.take() {
+                            if let Err(error) = send_rpc(
+                                &mut stdin,
+                                json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
+                            ) {
+                                relay_codex_failed(&app, &module_id, error);
+                                break;
+                            }
+                            next_request_id += 1;
+                        }
+                    }
+                    Some(_) => {}
+                    None => {}
+                }
+                if message.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
+                {
+                    if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
+                        final_summary.push_str(delta);
+                    }
+                }
+                if message.get("method").and_then(Value::as_str) == Some("item/completed")
+                    && message.pointer("/params/item/type").and_then(Value::as_str)
+                        == Some("agentMessage")
+                {
+                    if let Some(text) = message.pointer("/params/item/text").and_then(Value::as_str)
+                    {
+                        final_summary = text.to_string();
+                    }
+                }
+                if message.get("method").and_then(Value::as_str) == Some("turn/completed") {
+                    let status = message
+                        .pointer("/params/turn/status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    if status == "completed" {
+                        relay_codex_turn_completed(&app, &module_id, final_summary.trim());
+                    } else {
+                        relay_codex_failed(
+                            &app,
+                            &module_id,
+                            format!("Codex 回合以 `{status}` 结束。"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn relay_codex_thread_ready(app: &AppHandle, module_id: &str, thread_id: &str) {
+    let state = app.state::<AppState>();
+    if let Ok(connection) = state.connection.lock() {
+        let _ = connection.execute("UPDATE relay_modules SET codex_thread_id = ?2, phase = 'CODEX_RUNNING', updated_at = ?3 WHERE id = ?1", params![module_id, thread_id, Utc::now().to_rfc3339()]);
+        let _ = append_relay_event(
+            &connection,
+            module_id,
+            "CODEX_THREAD_STARTED",
+            "已创建中间件持有的 Codex 对话。",
+        );
+    }
+    let _ = app.emit(
+        "relay-codex-status",
+        json!({ "phase": "CODEX_RUNNING", "moduleId": module_id, "threadId": thread_id }),
+    );
+}
+
+fn relay_codex_turn_completed(app: &AppHandle, module_id: &str, summary: &str) {
+    let state = app.state::<AppState>();
+    let result = (|| -> Result<(), String> {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        let summary = if summary.is_empty() {
+            "Codex 回合已完成，但没有返回文字。"
+        } else {
+            summary
+        };
+        append_relay_message(
+            &connection,
+            module_id,
+            "FROM_CODEX",
+            "AUTOMATION",
+            summary,
+            "DELIVERED",
+        )?;
+        append_relay_message(
+            &connection,
+            module_id,
+            "TO_CHATGPT",
+            "AUTOMATION",
+            summary,
+            "QUEUED",
+        )?;
+        set_relay_phase(&connection, module_id, "READY")?;
+        append_relay_event(
+            &connection,
+            module_id,
+            "CODEX_TURN_COMPLETED",
+            "Codex 结果已入 ChatGPT 队列。",
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            let _ = app.emit(
+                "relay-codex-status",
+                json!({ "phase": "CODEX_COMPLETED", "moduleId": module_id }),
+            );
+            let _ = dispatch_next_relay_message(app, &state, module_id);
+        }
+        Err(error) => relay_codex_failed(app, module_id, error),
+    }
+}
+
+fn relay_codex_failed(app: &AppHandle, module_id: &str, reason: String) {
+    let state = app.state::<AppState>();
+    if let Ok(connection) = state.connection.lock() {
+        let _ = set_relay_phase(&connection, module_id, "BLOCKED");
+        let _ = append_relay_event(&connection, module_id, "CODEX_FAILED", &reason);
+    }
+    if let Ok(mut session) = state.relay_codex.lock() {
+        *session = None;
+    }
+    let _ = app.emit(
+        "relay-control",
+        json!({ "type": "ERROR", "reason": reason }),
+    );
 }
 
 fn module_planning_message(module: &ModuleRecord) -> String {
@@ -2228,12 +3190,14 @@ pub fn run() {
         .setup(|app| {
             let connection = create_connection(app.handle())?;
             pause_unfinished_orchestrations(&connection)?;
+            mark_uncertain_relay_deliveries(&connection)?;
             let chatgpt_bridge = Arc::new(ChatGptBridge::new());
             start_chatgpt_bridge(app.handle().clone(), chatgpt_bridge.clone())?;
             app.manage(AppState {
                 connection: Mutex::new(connection),
                 chatgpt_bridge,
                 orchestrator: Mutex::new(None),
+                relay_codex: Mutex::new(None),
                 application_started_at: Utc::now(),
             });
             Ok(())
@@ -2246,6 +3210,10 @@ pub fn run() {
             execute_controlled_codex_turn,
             get_chatgpt_pairing,
             send_chatgpt_message,
+            create_relay_module,
+            list_relay_modules,
+            list_relay_messages,
+            queue_relay_message,
             start_module_orchestration,
             get_orchestration_snapshot,
             apply_acceptance_action

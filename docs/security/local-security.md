@@ -1,5 +1,7 @@
 # Local security model
 
+> Historical V1 security model. The active permissions and input-handling decisions are [Decision 004 — Conversation relay V2](../decisions/004-conversation-relay-v2.md); it supersedes this document where they conflict.
+
 ## Assets
 
 - The user’s authenticated ChatGPT browser session.

@@ -1,5 +1,7 @@
 # ChatGPT orchestration protocol
 
+> Historical V1 JSON protocol. The active plain-text control-block protocol is [Decision 004 — Conversation relay V2](../decisions/004-conversation-relay-v2.md); it supersedes this document where they conflict.
+
 ## Purpose
 
 ChatGPT writes natural-language planning and review for the user, then finishes every automation reply with one JSON code block. The middleware acts only on that JSON block.

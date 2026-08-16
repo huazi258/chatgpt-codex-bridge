@@ -1,5 +1,7 @@
 # ChatGPT × Codex 工作流中间件 MVP
 
+> Historical V1 contract. The active product contract is [Decision 004 — Conversation relay V2](../decisions/004-conversation-relay-v2.md); it supersedes this document where they conflict.
+
 ## 1. 目标
 
 消除人工在 ChatGPT 与 Codex 之间复制、粘贴、等待和转述的工作。系统在本机运行，自动编排一个受控的闭环：ChatGPT 负责规划、Review 和决策；Codex 负责在仓库中执行；中间件负责传递上下文、追踪状态、执行预算和在必要时暂停。

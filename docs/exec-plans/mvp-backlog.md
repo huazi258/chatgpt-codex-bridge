@@ -1,5 +1,7 @@
 # MVP implementation backlog
 
+> Historical V1 execution plan. V2 implementation must be planned from [Decision 004 — Conversation relay V2](../decisions/004-conversation-relay-v2.md); it supersedes this backlog where they conflict.
+
 Tasks must be completed in order unless their dependencies have already been demonstrated. Each task should produce one focused commit and update its related documentation if its contract changes.
 
 ## Task 1 — Integration spike

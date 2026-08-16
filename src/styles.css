@@ -62,3 +62,24 @@ nav { display: grid; gap: 9px; }
 .acceptance-controls label { grid-column: 1 / -1; margin: 8px 0 0; }
 .execution-phase.paused_for_acceptance { color: #8a5b00; background: #fff3d4; }
 .execution-phase.stopped, .execution-phase.blocked { color: #a82f39; background: #ffeef0; }
+
+.bridge-state { margin: -10px 0 0; padding: 9px 11px; border-radius: 8px; font-size: 13px; font-weight: 800; }
+.bridge-state.online { color: #dff9e8; background: rgba(59, 155, 94, .28); }
+.bridge-state.offline { color: #ffe2e5; background: rgba(174, 52, 69, .28); }
+.connection-card { display: grid; gap: 15px; }
+.relay-summary { display: grid; gap: 10px; }
+.relay-summary h3, .conversation h3 { margin-bottom: 7px; }
+.conversation { display: grid; gap: 16px; }
+.message-history { display: grid; gap: 12px; min-height: 250px; max-height: 540px; overflow: auto; padding: 4px; }
+.message { padding: 14px; border: 1px solid #d9e1ec; border-radius: 10px; background: #f8fbff; }
+.message.from_chatgpt { border-color: #cae7d4; background: #f5fcf7; }
+.message.to_codex { border-color: #e8d7a8; background: #fffaf0; }
+.message header { display: flex; justify-content: space-between; margin-bottom: 8px; color: #52637d; font-size: 12px; }
+.message header strong { color: #273c5d; }
+.message header span { color: #74839a; }
+.message pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.55 Inter, "Microsoft YaHei UI", system-ui, sans-serif; color: #273c5d; }
+.light { color: #71819a; }
+.composer { display: grid; gap: 12px; }
+.mode-switch { display: flex; gap: 8px; }
+.mode-switch button { padding: 8px 10px; border: 1px solid #cbd5e3; border-radius: 7px; color: #52637d; background: #fff; font-weight: 800; font-size: 13px; }
+.mode-switch button.selected { border-color: #5379c7; color: #284e9f; background: #edf3ff; }
