@@ -12,7 +12,10 @@ The adapter converts `turn/started`, `item/started`, `item/completed`, and `turn
 
 `CODEX_APP_SERVER_COMMAND` can override the executable name. The default is `codex`, which must be discoverable through `PATH` in the desktop application's environment.
 
+## Windows launcher repair
+
+During the Task 7 pilot, the desktop process blocked immediately while its Node-based App Server smoke test succeeded. The npm installation exposes both an extensionless `codex` shim and `codex.cmd`; the smoke test invokes the latter. On Windows the desktop adapter now defaults to `codex.cmd`, avoiding ambiguity in `std::process::Command` launcher resolution. `CODEX_APP_SERVER_COMMAND` remains the explicit override for a custom installation; non-Windows defaults remain `codex`.
+
 ## Rationale
 
 Stdio is the default App Server transport and uses newline-delimited JSON. The official lifecycle requires the initialization handshake before thread and turn creation, and identifies `turn/completed` as the terminal turn notification. [Official Codex App Server documentation](https://learn.chatgpt.com/docs/app-server)
-

@@ -1295,8 +1295,17 @@ fn start_module_orchestration(
     Ok(())
 }
 
+fn default_codex_command() -> &'static str {
+    if cfg!(windows) {
+        "codex.cmd"
+    } else {
+        "codex"
+    }
+}
+
 fn codex_command() -> String {
-    std::env::var("CODEX_APP_SERVER_COMMAND").unwrap_or_else(|_| "codex".to_string())
+    std::env::var("CODEX_APP_SERVER_COMMAND")
+        .unwrap_or_else(|_| default_codex_command().to_string())
 }
 
 fn wrap_codex_task(module: &ModuleRecord, task: &str) -> String {
@@ -2113,6 +2122,15 @@ mod tests {
         assert!(
             wrapped.contains("do not run commands, inspect files, modify files, commit, or push")
         );
+    }
+
+    #[test]
+    fn default_codex_command_uses_the_windows_cmd_launcher() {
+        #[cfg(windows)]
+        assert_eq!(default_codex_command(), "codex.cmd");
+
+        #[cfg(not(windows))]
+        assert_eq!(default_codex_command(), "codex");
     }
 
     #[test]
