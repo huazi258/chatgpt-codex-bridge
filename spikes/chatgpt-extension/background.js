@@ -1,5 +1,5 @@
 const bridgeUrl = 'ws://127.0.0.1:8765';
-const contentAdapterVersion = '1.2.0';
+const contentAdapterVersion = '1.3.0';
 let socket = null;
 let sessionId = null;
 let pairedTabId = null;
@@ -24,7 +24,7 @@ async function sendToChatGPTTab(tabId, message) {
 async function ensureLatestContentAdapter(tabId) {
   let status;
   try {
-    status = await chrome.tabs.sendMessage(tabId, { type: 'adapterStatusV2' });
+    status = await chrome.tabs.sendMessage(tabId, { type: 'adapterStatusV3' });
   } catch (error) {
     if (!hasNoReceiver(error)) throw error;
   }
@@ -35,7 +35,7 @@ async function ensureLatestContentAdapter(tabId) {
     target: { tabId },
     files: ['protocol-text.js', 'content.js']
   });
-  status = await chrome.tabs.sendMessage(tabId, { type: 'adapterStatusV2' });
+  status = await chrome.tabs.sendMessage(tabId, { type: 'adapterStatusV3' });
   if (!status?.ok || status.adapterVersion !== contentAdapterVersion) {
     throw new Error('The current ChatGPT tab did not load the required protocol adapter version.');
   }
@@ -43,7 +43,7 @@ async function ensureLatestContentAdapter(tabId) {
 
 async function inspectProtocolAdapter(tabId) {
   await ensureLatestContentAdapter(tabId);
-  const probe = await chrome.tabs.sendMessage(tabId, { type: 'adapterProbeV3' });
+  const probe = await chrome.tabs.sendMessage(tabId, { type: 'adapterProbeV4' });
   if (!probe?.ok || probe.adapterVersion !== contentAdapterVersion) {
     throw new Error('The ChatGPT tab did not return a valid adapter inspection result.');
   }
@@ -108,8 +108,9 @@ async function connect(secret, tabId) {
       try {
         await ensureLatestContentAdapter(pairedTabId);
         const response = await chrome.tabs.sendMessage(pairedTabId, {
-          type: message.relay ? 'sendMiddlewareMessage' : 'sendMiddlewareMessageV2',
-          text: message.text
+          type: 'sendMiddlewareMessageV3',
+          text: message.text,
+          includeProtocolJson: !message.relay
         });
         if (!response?.ok) {
           const error = new Error(response?.error || 'ChatGPT tab did not return a reply.');

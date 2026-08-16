@@ -1,5 +1,13 @@
 (() => {
-const contentAdapterVersion = '1.2.0';
+const contentAdapterVersion = '1.3.0';
+const contentAdapterInstanceKey = '__chatgptCodexContentAdapterInstanceV3__';
+const previousAdapterInstance = globalThis[contentAdapterInstanceKey];
+
+if (previousAdapterInstance?.version === contentAdapterVersion && previousAdapterInstance.active) return;
+if (previousAdapterInstance) previousAdapterInstance.active = false;
+const contentAdapterInstance = { version: contentAdapterVersion, active: true };
+globalThis[contentAdapterInstanceKey] = contentAdapterInstance;
+
 const assistantMessageSelector = '[data-message-author-role="assistant"]';
 const composerSelector = '#prompt-textarea';
 const sendButtonSelectors = [
@@ -246,12 +254,14 @@ async function sendAndWait(text, includeProtocolJson = false) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === 'adapterStatusV2') {
+  if (!contentAdapterInstance.active) return;
+
+  if (message?.type === 'adapterStatusV3') {
     sendResponse({ ok: true, adapterVersion: contentAdapterVersion });
     return;
   }
 
-  if (message?.type === 'adapterProbeV3') {
+  if (message?.type === 'adapterProbeV4') {
     const reply = protocolReplySince(0) ?? latestAssistantReply();
     sendResponse({
       ok: true,
@@ -284,8 +294,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === 'sendMiddlewareMessage' || message?.type === 'sendMiddlewareMessageV2') {
-    sendAndWait(message.text, message.type === 'sendMiddlewareMessageV2')
+  if (message?.type === 'sendMiddlewareMessageV3') {
+    sendAndWait(message.text, message.includeProtocolJson === true)
       .then((response) => sendResponse(typeof response === 'string'
         ? { ok: true, response }
         : {

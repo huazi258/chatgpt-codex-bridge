@@ -1144,6 +1144,21 @@ async fn handle_chatgpt_bridge_connection(
                             continue;
                         }
                         if relay {
+                            if let Some(adapter_error) = adapter_error {
+                                if let Err(error) = handle_relay_chatgpt_adapter_failure(
+                                    app.clone(),
+                                    adapter_error,
+                                    adapter_diagnostic,
+                                ) {
+                                    bridge.set_status(&app, ChatGptBridgeStatus {
+                                        phase: "RELAY_BLOCKED".into(),
+                                        detail: format!("无法保存 ChatGPT 适配器错误：{error}"),
+                                        tab_id: None,
+                                        protocol_state: None,
+                                    });
+                                }
+                                continue;
+                            }
                             if let Err(error) = handle_relay_chatgpt_reply(app.clone(), reply.unwrap_or_default()) {
                                 bridge.set_status(&app, ChatGptBridgeStatus {
                                     phase: "RELAY_BLOCKED".into(),
@@ -1539,7 +1554,7 @@ fn dispatch_next_relay_message(
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
         let already_in_flight: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+            "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state IN ('SENT', 'UNKNOWN')",
             [], |row| row.get(0),
         ).map_err(|error| format!("无法检查消息队列：{error}"))?;
         if already_in_flight > 0 {
@@ -1567,13 +1582,27 @@ fn dispatch_next_relay_message(
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        connection
-            .execute(
-                "UPDATE relay_messages SET delivery_state = 'FAILED' WHERE id = ?1",
-                [&message.id],
-            )
-            .map_err(|database_error| format!("无法记录 ChatGPT 发送失败：{database_error}"))?;
-        append_relay_event(&connection, module_id, "CHATGPT_SEND_FAILED", &error)?;
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            &message.id,
+            "CHATGPT_TRANSPORT_FAILURE",
+            &format!("ChatGPT 连接/传输失败，消息送达结果不确定，未自动重发：{error}"),
+        )?;
+        state.chatgpt_bridge.set_status(
+            app,
+            ChatGptBridgeStatus {
+                phase: "RELAY_RECOVERY_REQUIRED".into(),
+                detail: format!("ChatGPT 连接/传输失败，消息送达结果不确定，未自动重发。请检查已绑定标签页和扩展后，再明确决定是否重发：{error}"),
+                tab_id: state
+                    .chatgpt_bridge
+                    .session
+                    .lock()
+                    .ok()
+                    .and_then(|session| session.clone())
+                    .map(|session| session.tab_id),
+                protocol_state: None,
+            },
+        );
         return Err(error);
     }
     Ok(())
@@ -1639,6 +1668,85 @@ fn set_relay_phase(connection: &Connection, module_id: &str, phase: &str) -> Res
             params![module_id, phase, Utc::now().to_rfc3339()],
         )
         .map_err(|error| format!("无法更新传话模块状态：{error}"))?;
+    Ok(())
+}
+
+fn pause_relay_for_uncertain_delivery(
+    connection: &Connection,
+    message_id: &str,
+    event_type: &str,
+    detail: &str,
+) -> Result<String, String> {
+    let module_id: String = connection
+        .query_row(
+            "SELECT module_id FROM relay_messages WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+            [message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取待确认的 ChatGPT 消息：{error}"))?
+        .ok_or_else(|| "没有待确认的 ChatGPT 消息可标记为不确定。".to_string())?;
+    connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'UNKNOWN' WHERE id = ?1",
+            [message_id],
+        )
+        .map_err(|error| format!("无法保存 ChatGPT 不确定送达状态：{error}"))?;
+    set_relay_phase(connection, &module_id, "RECOVERY_REQUIRED")?;
+    append_relay_event(connection, &module_id, event_type, detail)?;
+    Ok(module_id)
+}
+
+fn handle_relay_chatgpt_adapter_failure(
+    app: AppHandle,
+    adapter_error: &str,
+    adapter_diagnostic: Option<&str>,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        let message_id: String = connection
+            .query_row(
+                "SELECT id FROM relay_messages
+                 WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
+                 ORDER BY created_at ASC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法匹配 ChatGPT 适配器错误：{error}"))?
+            .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 适配器错误。".to_string())?;
+        let diagnostic = adapter_diagnostic
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!(" 诊断：{value}"))
+            .unwrap_or_default();
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            &message_id,
+            "CHATGPT_ADAPTER_FAILURE",
+            &format!("ChatGPT 适配器失败，消息送达结果不确定，未自动重发：{adapter_error}{diagnostic}"),
+        )?;
+    }
+    let reason = format!("ChatGPT 浏览器适配器失败，消息送达结果不确定，未自动重发。请检查已绑定标签页和扩展后，再明确决定是否重发：{adapter_error}");
+    let _ = app.emit("relay-control", json!({ "type": "ADAPTER_FAILURE", "reason": reason }));
+    state.chatgpt_bridge.set_status(
+        &app,
+        ChatGptBridgeStatus {
+            phase: "RELAY_RECOVERY_REQUIRED".into(),
+            detail: reason,
+            tab_id: state
+                .chatgpt_bridge
+                .session
+                .lock()
+                .ok()
+                .and_then(|session| session.clone())
+                .map(|session| session.tab_id),
+            protocol_state: None,
+        },
+    );
     Ok(())
 }
 
@@ -2952,6 +3060,56 @@ mod tests {
             module_timeout_minutes: 120,
             global_timeout_minutes: 240,
         }
+    }
+
+    #[test]
+    fn adapter_failure_marks_relay_delivery_unknown_without_parsing_or_retrying() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(CONVERSATION_RELAY_SCHEMA)
+            .expect("relay schema");
+        let now = "2026-08-17T00:00:00Z";
+        connection.execute(
+            "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
+             VALUES ('relay-1', 'Relay', 'G:\\workspace', 12, 240, 'retry', 'READY', 0, 0, ?1, ?1)",
+            [now],
+        ).expect("relay module");
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at)
+             VALUES ('outgoing-1', 'relay-1', 1, 'TO_CHATGPT', 'AUTOMATION', 'request', 'SENT', ?1)",
+            [now],
+        ).expect("outgoing relay message");
+
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            "outgoing-1",
+            "CHATGPT_ADAPTER_FAILURE",
+            "adapter failed after the send may have started",
+        ).expect("adapter failure is recorded");
+
+        let (delivery_state, phase, invalid_reply_count): (String, String, i64) = connection.query_row(
+            "SELECT message.delivery_state, module.phase, module.invalid_reply_count
+             FROM relay_messages AS message JOIN relay_modules AS module ON module.id = message.module_id
+             WHERE message.id = 'outgoing-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).expect("relay state");
+        assert_eq!(delivery_state, "UNKNOWN");
+        assert_eq!(phase, "RECOVERY_REQUIRED");
+        assert_eq!(invalid_reply_count, 0);
+
+        let incoming_replies: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'relay-1' AND direction = 'FROM_CHATGPT'",
+            [],
+            |row| row.get(0),
+        ).expect("incoming reply count");
+        let queued_retries: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'relay-1' AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'",
+            [],
+            |row| row.get(0),
+        ).expect("retry count");
+        assert_eq!(incoming_replies, 0);
+        assert_eq!(queued_retries, 0);
     }
 
     #[test]
