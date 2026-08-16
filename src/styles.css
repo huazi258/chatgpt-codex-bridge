@@ -80,6 +80,8 @@ nav { display: grid; gap: 9px; }
 .message header strong { color: #273c5d; }
 .message header span { color: #74839a; }
 .message pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.55 Inter, "Microsoft YaHei UI", system-ui, sans-serif; color: #273c5d; }
+.uncertain-delivery { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #d9e1ec; }
+.uncertain-delivery p { margin: 0; color: #7a5b12; font-size: 12px; line-height: 1.45; }
 .light { color: #71819a; }
 .composer { display: grid; gap: 12px; }
 .mode-switch { display: flex; gap: 8px; }

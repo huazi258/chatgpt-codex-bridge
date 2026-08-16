@@ -129,7 +129,7 @@ The desktop UI is Chinese by default. Every action immediately enters a visible 
 
 ## Implementation status
 
-The first V2 implementation slice is in progress. It replaces the desktop view with a Chinese relay workspace, persists relay modules and full text-message history separately from the historical V1 tables, serializes ChatGPT sends, and distinguishes manual replies from automation replies. A restart changes an unresolved outgoing send to `UNKNOWN` and requires later explicit recovery rather than silently resending it.
+The first V2 implementation slice is in progress. It replaces the desktop view with a Chinese relay workspace, persists relay modules and full text-message history separately from the historical V1 tables, serializes ChatGPT sends, and distinguishes manual replies from automation replies. A restart changes an unresolved outgoing send to `UNKNOWN` and requires later explicit recovery rather than silently resending it. The relay history exposes an explicit user action to resend one `UNKNOWN` outgoing message; it is never resent automatically.
 
 Plain-text terminal control-block parsing, one configured retry, `MODULE_DONE`, and `BLOCKED` are wired into the relay persistence layer. A valid `CODEX_PROMPT` now starts or continues one middleware-owned local App Server process and keeps its created thread alive for later prompts; Codex final text is appended to the same FIFO ChatGPT queue without modification.
 

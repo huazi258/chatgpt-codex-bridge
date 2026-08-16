@@ -7,6 +7,10 @@ let pairingSecret = null;
 let reconnectTimer = null;
 let heartbeatTimer = null;
 
+function relayTrace(requestId, stage, detail = undefined) {
+  console.info('[relay-trace]', { requestId, stage, ...(detail ? { detail } : {}) });
+}
+
 function hasNoReceiver(error) {
   return /Receiving end does not exist/i.test(error?.message ?? '');
 }
@@ -105,39 +109,51 @@ async function connect(secret, tabId) {
       return;
     }
     if (message.type === 'sendChatGptMessage' && message.sessionId === sessionId) {
+      const requestId = typeof message.requestId === 'string' ? message.requestId : 'unknown';
+      relayTrace(requestId, 'BACKGROUND_RECEIVED');
       try {
         await ensureLatestContentAdapter(pairedTabId);
+        relayTrace(requestId, 'TAB_DISPATCH', { pairedTabId });
         const response = await chrome.tabs.sendMessage(pairedTabId, {
           type: 'sendMiddlewareMessageV3',
           text: message.text,
-          includeProtocolJson: !message.relay
+          includeProtocolJson: !message.relay,
+          requestId
         });
         if (!response?.ok) {
           const error = new Error(response?.error || 'ChatGPT tab did not return a reply.');
           error.adapterDiagnostic = response?.adapterDiagnostic ?? null;
           throw error;
         }
-        socket?.send(JSON.stringify({
+        const reply = {
           type: 'chatgptReply',
           sessionId,
+          requestId,
           text: response.response,
           protocolJson: typeof response.protocolJson === 'string' ? response.protocolJson : undefined,
           protocolJsonPresent: Boolean(response.protocolJsonPresent),
           adapterVersion: response.adapterVersion ?? contentAdapterVersion,
           relay: Boolean(message.relay)
-        }));
+        };
+        relayTrace(requestId, 'CHATGPT_REPLY_SENT');
+        socket?.send(JSON.stringify(reply));
       } catch (error) {
-        socket?.send(JSON.stringify({
+        const reply = {
           type: 'chatgptReply',
           sessionId,
+          requestId,
           text: `Protocol adapter failed before a reply was received: ${error.message}`,
           protocolJsonPresent: false,
           adapterVersion: contentAdapterVersion,
           adapterError: error.message,
           adapterDiagnostic: error.adapterDiagnostic ?? null,
           relay: Boolean(message.relay)
-        }));
+        };
+        relayTrace(requestId, 'CHATGPT_REPLY_SENT', { adapterError: true });
+        socket?.send(JSON.stringify(reply));
       }
+    } else if (message.type === 'sendChatGptMessage') {
+      relayTrace(typeof message.requestId === 'string' ? message.requestId : 'unknown', 'SESSION_MISMATCH');
     }
   });
   nextSocket.addEventListener('close', () => {

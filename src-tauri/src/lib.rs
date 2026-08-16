@@ -1128,6 +1128,7 @@ async fn handle_chatgpt_bridge_connection(
                         let adapter_version = message.get("adapterVersion").and_then(Value::as_str);
                         let adapter_error = message.get("adapterError").and_then(Value::as_str);
                         let adapter_diagnostic = message.get("adapterDiagnostic").and_then(Value::as_str);
+                        let request_id = message.get("requestId").and_then(Value::as_str);
                         let relay = message.get("relay").and_then(Value::as_bool) == Some(true);
                         let valid_session = bridge.session.lock().ok().and_then(|session| session.clone()).is_some_and(|session| Some(session.session_id.as_str()) == session_id);
                         if !valid_session || reply.is_none() {
@@ -1159,7 +1160,7 @@ async fn handle_chatgpt_bridge_connection(
                                 }
                                 continue;
                             }
-                            if let Err(error) = handle_relay_chatgpt_reply(app.clone(), reply.unwrap_or_default()) {
+                            if let Err(error) = handle_relay_chatgpt_reply(app.clone(), request_id, reply.unwrap_or_default()) {
                                 bridge.set_status(&app, ChatGptBridgeStatus {
                                     phase: "RELAY_BLOCKED".into(),
                                     detail: format!("传话回复无法处理：{error}"),
@@ -1502,6 +1503,7 @@ fn send_chatgpt_message_internal(
 fn send_relay_chatgpt_message_internal(
     app: &AppHandle,
     bridge: &ChatGptBridge,
+    request_id: &str,
     text: &str,
 ) -> Result<(), String> {
     if text.trim().is_empty() {
@@ -1516,6 +1518,7 @@ fn send_relay_chatgpt_message_internal(
     bridge.send_to_extension(json!({
         "type": "sendChatGptMessage",
         "sessionId": session.session_id,
+        "requestId": request_id,
         "text": text,
         "relay": true
     }))?;
@@ -1571,12 +1574,12 @@ fn dispatch_next_relay_message(
             &connection,
             module_id,
             "CHATGPT_SEND_STARTED",
-            "已发送队首消息，等待 ChatGPT 回复。",
+            &format!("requestId={}; 已从队列选择消息，等待 ChatGPT 回复。", message.id),
         )?;
         message
     };
     if let Err(error) =
-        send_relay_chatgpt_message_internal(app, &state.chatgpt_bridge, &message.text)
+        send_relay_chatgpt_message_internal(app, &state.chatgpt_bridge, &message.id, &message.text)
     {
         let connection = state
             .connection
@@ -1604,6 +1607,18 @@ fn dispatch_next_relay_message(
             },
         );
         return Err(error);
+    }
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        append_relay_event(
+            &connection,
+            module_id,
+            "CHATGPT_SEND_DISPATCHED",
+            &format!("requestId={}; 已向本机 WebSocket 发出 sendChatGptMessage。", message.id),
+        )?;
     }
     Ok(())
 }
@@ -1697,6 +1712,51 @@ fn pause_relay_for_uncertain_delivery(
     Ok(module_id)
 }
 
+fn requeue_unknown_relay_message(
+    connection: &Connection,
+    message_id: &str,
+) -> Result<String, String> {
+    let module_id: String = connection
+        .query_row(
+            "SELECT module_id FROM relay_messages WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取待恢复的 ChatGPT 消息：{error}"))?
+        .ok_or_else(|| "该消息不是可明确重发的不确定传话消息。".to_string())?;
+    connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'QUEUED', delivered_at = NULL WHERE id = ?1",
+            [message_id],
+        )
+        .map_err(|error| format!("无法重新排队 ChatGPT 消息：{error}"))?;
+    set_relay_phase(connection, &module_id, "READY")?;
+    append_relay_event(
+        connection,
+        &module_id,
+        "CHATGPT_EXPLICIT_RESEND",
+        &format!("requestId={message_id}; 用户已明确要求重发此前结果不确定的消息。"),
+    )?;
+    Ok(module_id)
+}
+
+#[tauri::command]
+fn retry_unknown_relay_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<(), String> {
+    let module_id = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        requeue_unknown_relay_message(&connection, &message_id)?
+    };
+    dispatch_next_relay_message(&app, &state, &module_id)
+}
+
 fn handle_relay_chatgpt_adapter_failure(
     app: AppHandle,
     adapter_error: &str,
@@ -1750,24 +1810,46 @@ fn handle_relay_chatgpt_adapter_failure(
     Ok(())
 }
 
-fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String> {
+fn handle_relay_chatgpt_reply(
+    app: AppHandle,
+    request_id: Option<&str>,
+    reply: &str,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let (module_id, outgoing_kind, next_action) = {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let outgoing: (String, String, String) = connection
-            .query_row(
-                "SELECT id, module_id, kind FROM relay_messages
-             WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
-             ORDER BY created_at ASC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|error| format!("无法匹配 ChatGPT 回复：{error}"))?
-            .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 回复。".to_string())?;
+        let outgoing: (String, String, String) = if let Some(request_id) = request_id {
+            connection
+                .query_row(
+                    "SELECT id, module_id, kind FROM relay_messages
+                     WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+                    [request_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| format!("无法匹配 ChatGPT 回复 requestId：{error}"))?
+        } else {
+            connection
+                .query_row(
+                    "SELECT id, module_id, kind FROM relay_messages
+                     WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
+                     ORDER BY created_at ASC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| format!("无法匹配 ChatGPT 回复：{error}"))?
+        }
+        .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 回复。".to_string())?;
+        append_relay_event(
+            &connection,
+            &outgoing.1,
+            "CHATGPT_REPLY_RECEIVED",
+            &format!("requestId={}; Rust 已收到 chatgptReply。", outgoing.0),
+        )?;
         connection.execute(
             "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
             params![outgoing.0, Utc::now().to_rfc3339()],
@@ -1779,6 +1861,12 @@ fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String>
             &outgoing.2,
             reply,
             "DELIVERED",
+        )?;
+        append_relay_event(
+            &connection,
+            &outgoing.1,
+            "CHATGPT_REPLY_PERSISTED",
+            &format!("requestId={}; 已持久化 FROM_CHATGPT。", outgoing.0),
         )?;
 
         if outgoing.2 == "MANUAL" {
@@ -3113,6 +3201,72 @@ mod tests {
     }
 
     #[test]
+    fn unknown_relay_delivery_only_requeues_after_an_explicit_user_action() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(CONVERSATION_RELAY_SCHEMA)
+            .expect("relay schema");
+        let now = "2026-08-17T00:00:00Z";
+        connection.execute(
+            "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
+             VALUES ('relay-1', 'Relay', 'G:\\workspace', 12, 240, 'retry', 'RECOVERY_REQUIRED', 0, 0, ?1, ?1)",
+            [now],
+        ).expect("relay module");
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at)
+             VALUES ('outgoing-1', 'relay-1', 1, 'TO_CHATGPT', 'AUTOMATION', 'request', 'UNKNOWN', ?1)",
+            [now],
+        ).expect("unknown relay message");
+
+        requeue_unknown_relay_message(&connection, "outgoing-1")
+            .expect("explicit resend requeues the message");
+
+        let (delivery_state, phase): (String, String) = connection.query_row(
+            "SELECT message.delivery_state, module.phase
+             FROM relay_messages AS message JOIN relay_modules AS module ON module.id = message.module_id
+             WHERE message.id = 'outgoing-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("requeued relay state");
+        assert_eq!(delivery_state, "QUEUED");
+        assert_eq!(phase, "READY");
+    }
+
+    #[test]
+    fn restart_marks_sent_relay_messages_unknown_without_requeueing_them() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(CONVERSATION_RELAY_SCHEMA)
+            .expect("relay schema");
+        let now = "2026-08-17T00:00:00Z";
+        connection.execute(
+            "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
+             VALUES ('relay-1', 'Relay', 'G:\\workspace', 12, 240, 'retry', 'READY', 0, 0, ?1, ?1)",
+            [now],
+        ).expect("relay module");
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at)
+             VALUES ('outgoing-1', 'relay-1', 1, 'TO_CHATGPT', 'AUTOMATION', 'request', 'SENT', ?1)",
+            [now],
+        ).expect("sent relay message");
+
+        mark_uncertain_relay_deliveries(&connection).expect("restart recovery");
+
+        let delivery_state: String = connection.query_row(
+            "SELECT delivery_state FROM relay_messages WHERE id = 'outgoing-1'",
+            [],
+            |row| row.get(0),
+        ).expect("recovered delivery state");
+        let queued_messages: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE delivery_state = 'QUEUED'",
+            [],
+            |row| row.get(0),
+        ).expect("queued message count");
+        assert_eq!(delivery_state, "UNKNOWN");
+        assert_eq!(queued_messages, 0);
+    }
+
+    #[test]
     fn inactive_module_can_be_saved_reopened_updated_and_deleted() {
         let mut connection = Connection::open_in_memory().expect("in-memory database");
         connection
@@ -3372,6 +3526,7 @@ pub fn run() {
             list_relay_modules,
             list_relay_messages,
             queue_relay_message,
+            retry_unknown_relay_message,
             start_module_orchestration,
             get_orchestration_snapshot,
             apply_acceptance_action

@@ -16,6 +16,8 @@ assert.match(content, /adapterProbeV4/, 'content script must report whether the 
 assert.match(background, /inspectProtocolAdapter/, 'popup must be able to verify the bound ChatGPT tab before protocol dispatch');
 assert.match(background, /ensureLatestContentAdapter\(message\.tabId\)/, 'pairing must verify the adapter instead of merely opening a WebSocket');
 assert.match(content, /waitForCompletedAssistantReply\(previousCount, baselineAssistantText, requireProtocolJson/, 'protocol dispatch must wait for a complete structured JSON reply');
+assert.match(content, /runSmokeTest'[\s\S]*sendAndWait/, 'popup smoke must use the same content adapter send-and-wait path');
+assert.match(content, /sendMiddlewareMessageV3'[\s\S]*sendAndWait/, 'formal relay must use the same content adapter send-and-wait path');
 assert.match(content, /requireProtocolJson && !protocolReply/, 'protocol dispatch must reject an unfinished reply even when stop-button detection fails');
 assert.match(content, /protocolReplySince\(previousCount\)/, 'protocol dispatch must search every assistant node added during the task');
 assert.match(content, /assistantDiagnosticsSummary\(previousCount, baselineAssistantText, changedAssistantMessages\)/, 'protocol timeout must identify which assistant nodes were actually observed');

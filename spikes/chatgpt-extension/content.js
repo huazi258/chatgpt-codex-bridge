@@ -207,7 +207,7 @@ function setComposerText(composer, text) {
   throw new Error(`Unsupported composer element: <${composer.tagName.toLowerCase()}>`);
 }
 
-async function sendAndWait(text, includeProtocolJson = false) {
+async function sendAndWait(text, includeProtocolJson = false, onTrace = () => undefined) {
   let stage = 'locating composer';
   try {
     const composer = document.querySelector(composerSelector);
@@ -237,6 +237,7 @@ async function sendAndWait(text, includeProtocolJson = false) {
     }
     stage = 'clicking send button';
     sendButton.click();
+    onTrace('CHATGPT_SEND_CLICKED');
 
     stage = 'waiting for completed reply';
     const reply = await waitForCompletedAssistantReply(
@@ -246,6 +247,7 @@ async function sendAndWait(text, includeProtocolJson = false) {
       90_000,
       baselineProtocolJson
     );
+    onTrace('CHATGPT_REPLY_COMPLETED');
     return includeProtocolJson ? reply : reply.text;
   } catch (error) {
     error.message = `${stage}: ${error.message}`;
@@ -295,7 +297,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === 'sendMiddlewareMessageV3') {
-    sendAndWait(message.text, message.includeProtocolJson === true)
+    const requestId = typeof message.requestId === 'string' ? message.requestId : 'unknown';
+    console.info('[relay-trace]', { requestId, stage: 'CONTENT_RECEIVED' });
+    sendAndWait(message.text, message.includeProtocolJson === true, (stage) => {
+      console.info('[relay-trace]', { requestId, stage });
+    })
       .then((response) => sendResponse(typeof response === 'string'
         ? { ok: true, response }
         : {
