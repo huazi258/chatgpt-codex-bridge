@@ -11,7 +11,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{mpsc as std_mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc, Arc, Mutex,
+    },
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{net::TcpListener, sync::mpsc};
@@ -143,10 +146,73 @@ impl Drop for ManagedAppServer {
 struct RelayCodexSession {
     module_id: String,
     commands: std_mpsc::Sender<RelayCodexCommand>,
+    turn_active: Arc<AtomicBool>,
 }
 
 enum RelayCodexCommand {
     StartTurn { cycle_id: String, prompt: String },
+    Release {
+        acknowledgement: std_mpsc::Sender<Result<(), String>>,
+    },
+}
+
+fn release_relay_codex_session(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    module_id: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let commands = {
+        let sessions = sessions
+            .lock()
+            .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+        let Some(session) = sessions.as_ref() else {
+            return Ok(());
+        };
+        if session.module_id != module_id {
+            return Ok(());
+        }
+        if session.turn_active.load(Ordering::SeqCst) {
+            return Err("当前 Codex 回合仍在运行，不能释放 Codex 对话。".into());
+        }
+        session.commands.clone()
+    };
+
+    let (acknowledgement_sender, acknowledgement_receiver) = std_mpsc::channel();
+    commands
+        .send(RelayCodexCommand::Release {
+            acknowledgement: acknowledgement_sender,
+        })
+        .map_err(|_| "Codex 对话已经退出，无法确认释放。".to_string())?;
+    acknowledgement_receiver
+        .recv_timeout(timeout)
+        .map_err(|error| format!("等待 Codex 对话释放确认超时：{error}"))?
+}
+
+fn clear_relay_codex_session_if_matches(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    module_id: &str,
+) -> bool {
+    let Ok(mut sessions) = sessions.lock() else {
+        return false;
+    };
+    if sessions
+        .as_ref()
+        .is_some_and(|session| session.module_id == module_id)
+    {
+        *sessions = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn release_relay_codex_runtime(app: &AppHandle, module_id: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    release_relay_codex_session(
+        &state.relay_codex,
+        module_id,
+        std::time::Duration::from_secs(5),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -3059,6 +3125,7 @@ fn start_or_continue_relay_codex_turn(
             relay_codex_failed(app, module_id, Some(cycle_id), reason.into());
             return Err(reason.into());
         }
+        session.turn_active.store(true, Ordering::SeqCst);
         let send_result = session.commands.send(RelayCodexCommand::StartTurn {
             cycle_id: cycle_id.to_string(),
             prompt: prompt.to_string(),
@@ -3077,10 +3144,12 @@ fn start_or_continue_relay_codex_turn(
             return Err(reason);
         }
         let (sender, receiver) = std_mpsc::channel();
+        let turn_active = Arc::new(AtomicBool::new(true));
         let app_for_worker = app.clone();
         let working_directory = module.working_directory.clone();
         let worker_module_id = module_id.to_string();
         let initial_cycle_id = cycle_id.to_string();
+        let worker_turn_active = turn_active.clone();
         std::thread::spawn(move || {
             relay_codex_worker(
                 app_for_worker,
@@ -3088,6 +3157,7 @@ fn start_or_continue_relay_codex_turn(
                 working_directory,
                 initial_cycle_id,
                 receiver,
+                worker_turn_active,
             )
         });
         let send_result = sender.send(RelayCodexCommand::StartTurn {
@@ -3103,6 +3173,7 @@ fn start_or_continue_relay_codex_turn(
         *sessions = Some(RelayCodexSession {
             module_id: module.id,
             commands: sender,
+            turn_active,
         });
     }
     let _ = app.emit(
@@ -3118,6 +3189,7 @@ fn relay_codex_worker(
     working_directory: String,
     initial_cycle_id: String,
     commands: std_mpsc::Receiver<RelayCodexCommand>,
+    turn_active: Arc<AtomicBool>,
 ) {
     let command = codex_command();
     let child = Command::new(&command)
@@ -3191,10 +3263,12 @@ fn relay_codex_worker(
     let mut active_cycle_id = Some(initial_cycle_id);
     let mut next_request_id = 3_i64;
     let mut final_summary = String::new();
+    let mut release_acknowledgement: Option<std_mpsc::Sender<Result<(), String>>> = None;
     'worker: loop {
         while let Ok(command) = commands.try_recv() {
             match command {
                 RelayCodexCommand::StartTurn { cycle_id, prompt } => {
+                    turn_active.store(true, Ordering::SeqCst);
                     if active_cycle_id.is_some() && pending_turn.is_none() && thread_id.is_some() {
                         relay_codex_failed(
                             &app,
@@ -3227,6 +3301,16 @@ fn relay_codex_worker(
                         final_summary.clear();
                     } else {
                         pending_turn = Some((cycle_id, prompt));
+                    }
+                }
+                RelayCodexCommand::Release { acknowledgement } => {
+                    if active_cycle_id.is_some() || pending_turn.is_some() {
+                        let _ = acknowledgement.send(Err(
+                            "当前 Codex 回合仍在运行，不能释放 Codex 对话。".into(),
+                        ));
+                    } else {
+                        release_acknowledgement = Some(acknowledgement);
+                        break 'worker;
                     }
                 }
             }
@@ -3352,6 +3436,7 @@ fn relay_codex_worker(
                         .unwrap_or("unknown");
                     if status == "completed" {
                         if let Some(cycle_id) = active_cycle_id.take() {
+                            turn_active.store(false, Ordering::SeqCst);
                             relay_codex_turn_completed(
                                 &app,
                                 &module_id,
@@ -3367,6 +3452,7 @@ fn relay_codex_worker(
                             );
                         }
                     } else {
+                        turn_active.store(false, Ordering::SeqCst);
                         relay_codex_failed(
                             &app,
                             &module_id,
@@ -3379,8 +3465,18 @@ fn relay_codex_worker(
             }
         }
     }
+    turn_active.store(false, Ordering::SeqCst);
+    drop(stdin);
     let _ = child.kill();
-    let _ = child.wait();
+    let release_result = child
+        .wait()
+        .map(|_| ())
+        .map_err(|error| format!("无法结束 Codex 对话：{error}"));
+    let state = app.state::<AppState>();
+    clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
+    if let Some(acknowledgement) = release_acknowledgement {
+        let _ = acknowledgement.send(release_result);
+    }
 }
 
 fn relay_codex_thread_ready(app: &AppHandle, module_id: &str, thread_id: &str) {
@@ -3489,9 +3585,7 @@ fn relay_codex_failed(app: &AppHandle, module_id: &str, cycle_id: Option<&str>, 
         let _ = set_relay_phase(&connection, module_id, "BLOCKED");
         let _ = append_relay_event(&connection, module_id, "CODEX_FAILED", &reason);
     }
-    if let Ok(mut session) = state.relay_codex.lock() {
-        *session = None;
-    }
+    clear_relay_codex_session_if_matches(&state.relay_codex, module_id);
     let _ = app.emit(
         "relay-control",
         json!({ "type": "ERROR", "reason": reason }),
@@ -4331,6 +4425,95 @@ mod tests {
                 "2026-08-17T00:00:00Z"
             ],
         )
+    }
+
+    #[test]
+    fn relay_codex_release_acknowledges_and_only_clears_the_matching_session() {
+        let (sender, receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }));
+        let worker = std::thread::spawn(move || match receiver.recv().expect("release command") {
+            RelayCodexCommand::Release { acknowledgement } => acknowledgement
+                .send(Ok(()))
+                .expect("acknowledge idle release"),
+            RelayCodexCommand::StartTurn { .. } => panic!("release must not start a turn"),
+        });
+
+        release_relay_codex_session(
+            &sessions,
+            "module-a",
+            std::time::Duration::from_millis(100),
+        )
+        .expect("idle release is acknowledged");
+        worker.join().expect("worker exits");
+        assert!(clear_relay_codex_session_if_matches(&sessions, "module-a"));
+        assert!(sessions.lock().expect("session lock").is_none());
+
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("persist thread id");
+        let thread_id: Option<String> = connection
+            .query_row(
+                "SELECT codex_thread_id FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read thread id");
+        assert_eq!(thread_id.as_deref(), Some("thread-a"));
+
+        release_relay_codex_session(
+            &sessions,
+            "module-a",
+            std::time::Duration::from_millis(100),
+        )
+        .expect("repeat release without a session is a no-op");
+
+        let (next_sender, _next_receiver) = std_mpsc::channel();
+        *sessions.lock().expect("session lock") = Some(RelayCodexSession {
+            module_id: "module-b".into(),
+            commands: next_sender,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        assert!(!clear_relay_codex_session_if_matches(&sessions, "module-a"));
+        assert_eq!(
+            sessions
+                .lock()
+                .expect("session lock")
+                .as_ref()
+                .map(|session| session.module_id.as_str()),
+            Some("module-b")
+        );
+    }
+
+    #[test]
+    fn relay_codex_release_does_not_send_release_to_a_running_turn() {
+        let (sender, receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+
+        let error = release_relay_codex_session(
+            &sessions,
+            "module-a",
+            std::time::Duration::from_millis(20),
+        )
+        .expect_err("a running turn must not be released");
+
+        assert!(error.contains("仍在运行"));
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
     }
 
     #[test]
