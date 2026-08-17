@@ -3364,6 +3364,89 @@ fn handle_relay_chatgpt_adapter_failure(
     Ok(())
 }
 
+struct RelayChatGptReplyOutcome {
+    outgoing: (String, String, String),
+    module: RelayModuleRecord,
+    terminal_ignored: bool,
+}
+
+fn process_relay_chatgpt_reply_in(
+    connection: &Connection,
+    request_id: Option<&str>,
+    reply: &str,
+) -> Result<RelayChatGptReplyOutcome, String> {
+    let outgoing: (String, String, String) = if let Some(request_id) = request_id {
+        connection
+            .query_row(
+                "SELECT id, module_id, kind FROM relay_messages
+                 WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("无法匹配 ChatGPT 回复 requestId：{error}"))?
+    } else {
+        connection
+            .query_row(
+                "SELECT id, module_id, kind FROM relay_messages
+                 WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
+                 ORDER BY created_at ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("无法匹配 ChatGPT 回复：{error}"))?
+    }
+    .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 回复。".to_string())?;
+    append_relay_event(
+        connection,
+        &outgoing.1,
+        "CHATGPT_REPLY_RECEIVED",
+        &format!("requestId={}; Rust 已收到 chatgptReply。", outgoing.0),
+    )?;
+    connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
+            params![outgoing.0, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法确认 ChatGPT 消息送达：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, &outgoing.0, "DELIVERED", None)?;
+    append_relay_message(
+        connection,
+        &outgoing.1,
+        "FROM_CHATGPT",
+        &outgoing.2,
+        reply,
+        "DELIVERED",
+    )?;
+    append_relay_event(
+        connection,
+        &outgoing.1,
+        "CHATGPT_REPLY_PERSISTED",
+        &format!("requestId={}; 已持久化 FROM_CHATGPT。", outgoing.0),
+    )?;
+
+    let module =
+        get_relay_module(connection, &outgoing.1)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    let terminal_ignored = matches!(module.phase.as_str(), "STOPPED" | "COMPLETED");
+    if terminal_ignored {
+        append_relay_event(
+            connection,
+            &module.id,
+            "LATE_CHATGPT_REPLY_IGNORED",
+            &format!(
+                "requestId={}; 模块已结束，已保存迟到 ChatGPT 回复但不会继续自动化。",
+                outgoing.0
+            ),
+        )?;
+    }
+    Ok(RelayChatGptReplyOutcome {
+        outgoing,
+        module,
+        terminal_ignored,
+    })
+}
+
 fn handle_relay_chatgpt_reply(
     app: AppHandle,
     request_id: Option<&str>,
@@ -3375,56 +3458,11 @@ fn handle_relay_chatgpt_reply(
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let outgoing: (String, String, String) = if let Some(request_id) = request_id {
-            connection
-                .query_row(
-                    "SELECT id, module_id, kind FROM relay_messages
-                     WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
-                    [request_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()
-                .map_err(|error| format!("无法匹配 ChatGPT 回复 requestId：{error}"))?
-        } else {
-            connection
-                .query_row(
-                    "SELECT id, module_id, kind FROM relay_messages
-                     WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
-                     ORDER BY created_at ASC LIMIT 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()
-                .map_err(|error| format!("无法匹配 ChatGPT 回复：{error}"))?
-        }
-        .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 回复。".to_string())?;
-        append_relay_event(
-            &connection,
-            &outgoing.1,
-            "CHATGPT_REPLY_RECEIVED",
-            &format!("requestId={}; Rust 已收到 chatgptReply。", outgoing.0),
-        )?;
-        connection.execute(
-            "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
-            params![outgoing.0, Utc::now().to_rfc3339()],
-        ).map_err(|error| format!("无法确认 ChatGPT 消息送达：{error}"))?;
-        sync_codex_cycle_for_chatgpt_message_state(&connection, &outgoing.0, "DELIVERED", None)?;
-        append_relay_message(
-            &connection,
-            &outgoing.1,
-            "FROM_CHATGPT",
-            &outgoing.2,
-            reply,
-            "DELIVERED",
-        )?;
-        append_relay_event(
-            &connection,
-            &outgoing.1,
-            "CHATGPT_REPLY_PERSISTED",
-            &format!("requestId={}; 已持久化 FROM_CHATGPT。", outgoing.0),
-        )?;
-
-        if outgoing.2 == "MANUAL" {
+        let reply_outcome = process_relay_chatgpt_reply_in(&connection, request_id, reply)?;
+        let outgoing = reply_outcome.outgoing;
+        if reply_outcome.terminal_ignored {
+            (outgoing.1, outgoing.2, None)
+        } else if outgoing.2 == "MANUAL" {
             append_relay_event(
                 &connection,
                 &outgoing.1,
@@ -3433,8 +3471,7 @@ fn handle_relay_chatgpt_reply(
             )?;
             (outgoing.1, outgoing.2, None)
         } else {
-            let module = get_relay_module(&connection, &outgoing.1)?
-                .ok_or_else(|| "传话模块不存在。".to_string())?;
+            let module = reply_outcome.module;
             match relay_protocol::parse_terminal_control_block(reply, None) {
                 Ok(relay_protocol::ControlBlock::CodexPrompt(prompt)) => {
                     connection.execute(
@@ -5092,6 +5129,159 @@ mod tests {
                 "2026-08-17T00:00:00Z"
             ],
         )
+    }
+
+    #[test]
+    fn terminal_relay_chatgpt_reply_persists_delivery_without_restarting_automation() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-stopped", 1, "已完成的 Codex 工作")
+                .expect("create Codex cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("record Codex turn");
+        mark_relay_codex_result_received(&connection, &cycle.id, "Codex final text")
+            .expect("record Codex result");
+        let automation_request_id = queue_relay_codex_result_to_chatgpt(&connection, &cycle.id)
+            .expect("queue Codex result");
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim automation message")
+        {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.id, automation_request_id),
+            _ => panic!("automation message must be in flight"),
+        }
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("stop module");
+
+        let prompt_reply = "@@@CODEX_PROMPT@@@\n不得启动新的 Codex 回合\n@@@END_CODEX_PROMPT@@@";
+        let stopped_outcome =
+            process_relay_chatgpt_reply_in(&connection, Some(&automation_request_id), prompt_reply)
+                .expect("persist stopped automation reply");
+        assert!(stopped_outcome.terminal_ignored);
+
+        let linked_cycle = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read linked cycle")
+            .expect("linked cycle exists");
+        assert_eq!(linked_cycle.status, "DELIVERED_TO_CHATGPT");
+        let automation_delivery: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [&automation_request_id],
+                |row| row.get(0),
+            )
+            .expect("automation delivery");
+        assert_eq!(automation_delivery, "DELIVERED");
+
+        queue_relay_message_in(
+            &connection,
+            "module-completed",
+            RelayMessageKind::Manual,
+            "手动消息",
+        )
+        .expect("queue manual message");
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim manual message") {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.kind, "MANUAL"),
+            _ => panic!("manual message must be in flight"),
+        };
+        let manual_request_id: String = connection
+            .query_row(
+                "SELECT id FROM relay_messages
+                 WHERE module_id = 'module-completed' AND direction = 'TO_CHATGPT'
+                   AND delivery_state = 'SENT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("manual request id");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("complete module");
+        let completed_outcome =
+            process_relay_chatgpt_reply_in(&connection, Some(&manual_request_id), prompt_reply)
+                .expect("persist completed manual reply");
+        assert!(completed_outcome.terminal_ignored);
+
+        for (module_id, request_id, expected_phase) in [
+            ("module-stopped", automation_request_id.as_str(), "STOPPED"),
+            ("module-completed", manual_request_id.as_str(), "COMPLETED"),
+        ] {
+            let phase: String = connection
+                .query_row(
+                    "SELECT phase FROM relay_modules WHERE id = ?1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("terminal phase");
+            assert_eq!(phase, expected_phase);
+            let invalid_reply_count: i64 = connection
+                .query_row(
+                    "SELECT invalid_reply_count FROM relay_modules WHERE id = ?1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("invalid reply count");
+            assert_eq!(invalid_reply_count, 0);
+            let persisted_reply: String = connection
+                .query_row(
+                    "SELECT text FROM relay_messages
+                     WHERE module_id = ?1 AND direction = 'FROM_CHATGPT'
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("persisted ChatGPT reply");
+            assert_eq!(persisted_reply, prompt_reply);
+            let delivery: String = connection
+                .query_row(
+                    "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                    [request_id],
+                    |row| row.get(0),
+                )
+                .expect("outbound delivery");
+            assert_eq!(delivery, "DELIVERED");
+            let late_events: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'LATE_CHATGPT_REPLY_IGNORED'",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("late reply audit event");
+            assert_eq!(late_events, 1);
+            let retries: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'CONTROL_RETRY'",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("retry count");
+            assert_eq!(retries, 0);
+        }
+        let stopped_cycles: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = 'module-stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stopped cycle count");
+        let stopped_turns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = 'module-stopped' AND direction = 'TO_CODEX'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stopped turn count");
+        assert_eq!(stopped_cycles, 1);
+        assert_eq!(stopped_turns, 0);
     }
 
     #[test]
