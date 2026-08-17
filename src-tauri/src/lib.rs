@@ -2335,6 +2335,76 @@ fn accept_relay_module_in(
     Ok(RelayModuleAcceptance::Accepted)
 }
 
+fn submit_relay_acceptance_feedback_in(
+    connection: &Connection,
+    module_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    let feedback = text.trim();
+    if feedback.is_empty() {
+        return Err("验收反馈不能为空。".into());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始验收反馈事务：{error}"))?;
+    let module = transaction
+        .query_row(
+            "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+             FROM relay_modules WHERE id = ?1",
+            [module_id],
+            relay_row_to_module,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取传话模块：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.phase != "WAITING_FOR_ACCEPTANCE" {
+        return Err("模块当前未等待人工验收，不能提交验收反馈。".into());
+    }
+    if module.stop_after_turn {
+        return Err("模块正在终止，不能提交验收反馈。".into());
+    }
+
+    let sequence_number: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM relay_messages WHERE module_id = ?1",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法计算传话消息序号：{error}"))?;
+    let message_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at)
+             VALUES (?1, ?2, ?3, 'TO_CHATGPT', 'AUTOMATION', ?4, 'QUEUED', ?5, NULL)",
+            params![&message_id, module_id, sequence_number, feedback, &now],
+        )
+        .map_err(|error| format!("无法将验收反馈加入队列：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE relay_modules SET phase = 'WAITING_FOR_CHATGPT', updated_at = ?2 WHERE id = ?1",
+            params![module_id, &now],
+        )
+        .map_err(|error| format!("无法更新验收反馈状态：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        module_id,
+        "CHATGPT_MESSAGE_QUEUED",
+        "已加入 ChatGPT 发送队列。",
+    )?;
+    append_relay_event_in_transaction(
+        &transaction,
+        module_id,
+        "ACCEPTANCE_FEEDBACK_QUEUED",
+        &format!("requestId={message_id}; 已将人工验收反馈加入自动化发送队列。"),
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交验收反馈事务：{error}"))?;
+    Ok(message_id)
+}
+
 fn relay_codex_turn_is_active_for_module(state: &AppState, module_id: &str) -> Result<bool, String> {
     let sessions = state
         .relay_codex
@@ -2403,6 +2473,31 @@ fn accept_relay_module(
     );
     emit_relay_codex_changed(&app, &module_id, "", "COMPLETED");
     Ok(())
+}
+
+#[tauri::command]
+fn submit_relay_acceptance_feedback(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+    text: String,
+) -> Result<(), String> {
+    let message_id = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        submit_relay_acceptance_feedback_in(&connection, &module_id, &text)?
+    };
+    let _ = app.emit(
+        "relay-control",
+        json!({
+            "type": "ACCEPTANCE_FEEDBACK_QUEUED",
+            "moduleId": module_id,
+            "requestId": message_id,
+        }),
+    );
+    dispatch_next_relay_message(&app, &state)
 }
 
 #[tauri::command]
@@ -3242,6 +3337,33 @@ fn handle_relay_chatgpt_reply(
     Ok(())
 }
 
+fn mark_relay_codex_turn_starting_in(connection: &Connection, module_id: &str) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "UPDATE relay_modules SET phase = 'CODEX_STARTING', started_cycles = started_cycles + 1,
+             module_started_at = COALESCE(module_started_at, ?2), updated_at = ?2 WHERE id = ?1",
+            params![module_id, now],
+        )
+        .map_err(|error| format!("无法启动 Codex 回合：{error}"))?;
+    Ok(())
+}
+
+fn send_relay_codex_start_turn(
+    session: &RelayCodexSession,
+    cycle_id: &str,
+    prompt: &str,
+) -> Result<(), ()> {
+    session.turn_active.store(true, Ordering::SeqCst);
+    session
+        .commands
+        .send(RelayCodexCommand::StartTurn {
+            cycle_id: cycle_id.to_string(),
+            prompt: prompt.to_string(),
+        })
+        .map_err(|_| ())
+}
+
 fn start_or_continue_relay_codex_turn(
     app: &AppHandle,
     module_id: &str,
@@ -3287,11 +3409,7 @@ fn start_or_continue_relay_codex_turn(
                 return Err(reason.into());
             }
         }
-        connection.execute(
-            "UPDATE relay_modules SET phase = 'CODEX_STARTING', started_cycles = started_cycles + 1,
-             module_started_at = COALESCE(module_started_at, ?2), updated_at = ?2 WHERE id = ?1",
-            params![module_id, Utc::now().to_rfc3339()],
-        ).map_err(|error| format!("无法启动 Codex 回合：{error}"))?;
+        mark_relay_codex_turn_starting_in(&connection, module_id)?;
         module
     };
 
@@ -3306,12 +3424,7 @@ fn start_or_continue_relay_codex_turn(
             relay_codex_failed(app, module_id, Some(cycle_id), reason.into());
             return Err(reason.into());
         }
-        session.turn_active.store(true, Ordering::SeqCst);
-        let send_result = session.commands.send(RelayCodexCommand::StartTurn {
-            cycle_id: cycle_id.to_string(),
-            prompt: prompt.to_string(),
-        });
-        if send_result.is_err() {
+        if send_relay_codex_start_turn(session, cycle_id, prompt).is_err() {
             let reason = "Codex 对话已经退出。".to_string();
             drop(sessions);
             relay_codex_failed(app, module_id, Some(cycle_id), reason.clone());
@@ -5012,6 +5125,200 @@ mod tests {
     }
 
     #[test]
+    fn relay_acceptance_feedback_requires_waiting_phase_and_nonempty_text() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+
+        let phase_error = submit_relay_acceptance_feedback_in(
+            &connection,
+            "module-a",
+            "请继续处理验收反馈。",
+        )
+        .expect_err("only modules waiting for acceptance may submit feedback");
+        assert!(phase_error.contains("等待人工验收"));
+
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'WAITING_FOR_ACCEPTANCE' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+        let empty_error = submit_relay_acceptance_feedback_in(&connection, "module-a", "  ")
+            .expect_err("blank feedback must be rejected");
+        assert!(empty_error.contains("不能为空"));
+    }
+
+    #[test]
+    fn relay_acceptance_feedback_queues_once_and_waits_for_chatgpt() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'WAITING_FOR_ACCEPTANCE', codex_thread_id = 'thread-a', started_cycles = 1
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+
+        let message_id = submit_relay_acceptance_feedback_in(
+            &connection,
+            "module-a",
+            "  请根据验收反馈继续。  ",
+        )
+        .expect("queue acceptance feedback");
+        let message: (String, String, String, i64) = connection
+            .query_row(
+                "SELECT kind, text, delivery_state, sequence_number
+                 FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("queued feedback message");
+        assert_eq!(message, ("AUTOMATION".into(), "请根据验收反馈继续。".into(), "QUEUED".into(), 1));
+        let module: (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT phase, codex_thread_id, started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after feedback");
+        assert_eq!(module.0, "WAITING_FOR_CHATGPT");
+        assert_eq!(module.1.as_deref(), Some("thread-a"));
+        assert_eq!(module.2, 1);
+        for event_type in ["CHATGPT_MESSAGE_QUEUED", "ACCEPTANCE_FEEDBACK_QUEUED"] {
+            let event_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = ?1",
+                    [event_type],
+                    |row| row.get(0),
+                )
+                .expect("feedback audit event");
+            assert_eq!(event_count, 1, "{event_type} must be recorded once");
+        }
+
+        let duplicate = submit_relay_acceptance_feedback_in(
+            &connection,
+            "module-a",
+            "不应加入第二条反馈。",
+        )
+        .expect_err("feedback may only be submitted once per acceptance pause");
+        assert!(duplicate.contains("等待人工验收"));
+        let message_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'module-a' AND direction = 'TO_CHATGPT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("feedback message count");
+        assert_eq!(message_count, 1);
+    }
+
+    #[test]
+    fn relay_acceptance_feedback_can_queue_behind_global_unknown_without_bypassing_it() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'WAITING_FOR_ACCEPTANCE' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+        insert_relay_message(
+            &connection,
+            "unknown-a",
+            "module-a",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:00Z",
+        );
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:01Z",
+        );
+
+        let message_id = submit_relay_acceptance_feedback_in(
+            &connection,
+            "module-a",
+            "请继续处理。",
+        )
+        .expect("feedback is safe to queue while recovery is pending");
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection).expect("claim state"),
+            RelayDispatchClaim::RecoveryBlocked(2)
+        ));
+        let state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .expect("feedback remains queued");
+        assert_eq!(state, "QUEUED");
+    }
+
+    #[test]
+    fn relay_acceptance_feedback_follow_up_prompt_reuses_worker_and_increments_cycles() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'WAITING_FOR_ACCEPTANCE', codex_thread_id = 'thread-a', started_cycles = 1
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+        submit_relay_acceptance_feedback_in(&connection, "module-a", "请继续修复验收发现的问题。")
+            .expect("queue feedback");
+
+        let control = relay_protocol::parse_terminal_control_block(
+            "已收到验收反馈。\n\n@@@CODEX_PROMPT@@@\n继续处理验收反馈。\n@@@END_CODEX_PROMPT@@@",
+            None,
+        )
+        .expect("valid follow-up CODEX_PROMPT");
+        let relay_protocol::ControlBlock::CodexPrompt(prompt) = control else {
+            panic!("expected a CODEX_PROMPT");
+        };
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 2, &prompt)
+            .expect("create follow-up cycle");
+        mark_relay_codex_turn_starting_in(&connection, "module-a")
+            .expect("start follow-up Codex turn");
+
+        let (sender, receiver) = std_mpsc::channel();
+        let session = RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(AtomicBool::new(false)),
+        };
+        send_relay_codex_start_turn(&session, &cycle.id, &prompt)
+            .expect("the existing module worker accepts the follow-up turn");
+        match receiver.recv().expect("follow-up worker command") {
+            RelayCodexCommand::StartTurn { cycle_id, prompt: received_prompt } => {
+                assert_eq!(cycle_id, cycle.id);
+                assert_eq!(received_prompt, prompt);
+            }
+            RelayCodexCommand::Release { .. } => panic!("follow-up feedback must not release worker"),
+        }
+        assert!(session.turn_active.load(Ordering::SeqCst));
+        let module: (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT phase, codex_thread_id, started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after follow-up prompt");
+        assert_eq!(module.0, "CODEX_STARTING");
+        assert_eq!(module.1.as_deref(), Some("thread-a"));
+        assert_eq!(module.2, 2);
+    }
+
+    #[test]
     fn relay_codex_cycle_enforces_one_cycle_number_per_module() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-a", "模块 A");
@@ -6032,6 +6339,7 @@ pub fn run() {
             send_chatgpt_message,
             create_relay_module,
             accept_relay_module,
+            submit_relay_acceptance_feedback,
             list_relay_modules,
             list_relay_messages,
             list_relay_codex_cycles,
