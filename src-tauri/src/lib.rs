@@ -2224,6 +2224,187 @@ fn create_relay_module(
     Ok(module)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayModuleAcceptance {
+    Accepted,
+    AlreadyCompleted,
+}
+
+fn accept_relay_module_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<RelayModuleAcceptance, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始模块验收事务：{error}"))?;
+    let module = transaction
+        .query_row(
+            "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+             FROM relay_modules WHERE id = ?1",
+            [module_id],
+            relay_row_to_module,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取传话模块：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.phase == "COMPLETED" {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交模块验收事务：{error}"))?;
+        return Ok(RelayModuleAcceptance::AlreadyCompleted);
+    }
+    if module.phase == "STOPPED" {
+        return Err("模块已终止，不能验收完成。".into());
+    }
+    if module.phase != "WAITING_FOR_ACCEPTANCE" {
+        return Err("模块当前未等待人工验收，不能验收完成。".into());
+    }
+    if module.stop_after_turn {
+        return Err("模块正在终止，不能验收完成。".into());
+    }
+
+    let unknown_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages
+             WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查不确定送达消息：{error}"))?;
+    if unknown_count > 0 {
+        return Err("请先处理本模块的不确定送达消息。".into());
+    }
+    let running_cycle_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_codex_cycles
+             WHERE module_id = ?1 AND status = 'CODEX_RUNNING'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查 Codex 回合状态：{error}"))?;
+    if running_cycle_count > 0 {
+        return Err("当前 Codex 回合仍在运行，不能验收完成。".into());
+    }
+
+    let queued_message_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id FROM relay_messages
+                 WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?;
+        let message_ids = statement
+            .query_map([module_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?;
+        message_ids
+    };
+    for message_id in &queued_message_ids {
+        transaction
+            .execute(
+                "UPDATE relay_messages SET delivery_state = 'FAILED'
+                 WHERE id = ?1 AND delivery_state = 'QUEUED'",
+                [message_id],
+            )
+            .map_err(|error| format!("无法取消待发送消息：{error}"))?;
+        append_relay_event_in_transaction(
+            &transaction,
+            module_id,
+            "CHATGPT_QUEUED_MESSAGE_CANCELLED",
+            &format!("requestId={message_id}; 模块已验收完成，消息未发送。"),
+        )?;
+    }
+    transaction
+        .execute(
+            "UPDATE relay_modules SET phase = 'COMPLETED', updated_at = ?2 WHERE id = ?1",
+            params![module_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法完成传话模块：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        module_id,
+        "MODULE_ACCEPTED",
+        "用户已验收完成模块。",
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交模块验收事务：{error}"))?;
+    Ok(RelayModuleAcceptance::Accepted)
+}
+
+fn relay_codex_turn_is_active_for_module(state: &AppState, module_id: &str) -> Result<bool, String> {
+    let sessions = state
+        .relay_codex
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+    Ok(sessions.as_ref().is_some_and(|session| {
+        session.module_id == module_id && session.turn_active.load(Ordering::SeqCst)
+    }))
+}
+
+#[tauri::command]
+fn accept_relay_module(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<(), String> {
+    if relay_codex_turn_is_active_for_module(&state, &module_id)? {
+        return Err("当前 Codex 回合仍在运行，不能验收完成。".into());
+    }
+    let outcome = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        accept_relay_module_in(&connection, &module_id)?
+    };
+    if outcome == RelayModuleAcceptance::AlreadyCompleted {
+        return Ok(());
+    }
+
+    match release_relay_codex_runtime(&app, &module_id) {
+        Ok(()) => {
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            append_relay_event(
+                &connection,
+                &module_id,
+                "CODEX_THREAD_RELEASED",
+                "模块已验收完成，Codex 对话已释放。",
+            )?;
+        }
+        Err(error) => {
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            append_relay_event(
+                &connection,
+                &module_id,
+                "CODEX_THREAD_RELEASE_FAILED",
+                &format!("模块已验收完成，但 Codex 对话释放失败：{error}"),
+            )?;
+            let _ = app.emit(
+                "relay-control",
+                json!({ "type": "MODULE_ACCEPTED", "moduleId": module_id }),
+            );
+            emit_relay_codex_changed(&app, &module_id, "", "COMPLETED");
+            return Err(format!("模块已验收完成，但无法释放 Codex 对话：{error}"));
+        }
+    }
+    let _ = app.emit(
+        "relay-control",
+        json!({ "type": "MODULE_ACCEPTED", "moduleId": module_id }),
+    );
+    emit_relay_codex_changed(&app, &module_id, "", "COMPLETED");
+    Ok(())
+}
+
 #[tauri::command]
 fn list_relay_modules(state: State<'_, AppState>) -> Result<Vec<RelayModuleRecord>, String> {
     let connection = state
@@ -4658,6 +4839,179 @@ mod tests {
     }
 
     #[test]
+    fn accept_relay_module_requires_waiting_for_acceptance_without_local_blockers() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+
+        let not_waiting = accept_relay_module_in(&connection, "module-a")
+            .expect_err("only a module waiting for acceptance may be accepted");
+        assert!(not_waiting.contains("等待人工验收"));
+
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'WAITING_FOR_ACCEPTANCE' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("mark module waiting for acceptance");
+        insert_relay_message(
+            &connection,
+            "unknown-a",
+            "module-a",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:00Z",
+        );
+        let local_unknown = accept_relay_module_in(&connection, "module-a")
+            .expect_err("local unknown delivery must block acceptance");
+        assert!(local_unknown.contains("不确定送达"));
+
+        connection
+            .execute("DELETE FROM relay_messages WHERE id = 'unknown-a'", [])
+            .expect("remove local recovery fixture");
+        connection
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 1 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("mark termination requested");
+        let terminating = accept_relay_module_in(&connection, "module-a")
+            .expect_err("a terminating module must not be accepted");
+        assert!(terminating.contains("正在终止"));
+        connection
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 0 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("clear termination fixture");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:01Z",
+        );
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None)
+            .expect("insert cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-a'",
+                [],
+            )
+            .expect("mark cycle running");
+        let running = accept_relay_module_in(&connection, "module-a")
+            .expect_err("a running Codex cycle must block acceptance");
+        assert!(running.contains("当前 Codex 回合仍在运行"));
+
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_COMPLETED' WHERE id = 'cycle-a'",
+                [],
+            )
+            .expect("complete cycle");
+        accept_relay_module_in(&connection, "module-a")
+            .expect("other module recovery must not block acceptance");
+    }
+
+    #[test]
+    fn accept_relay_module_completes_once_and_preserves_sent_thread_and_history() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'WAITING_FOR_ACCEPTANCE', codex_thread_id = 'thread-a'
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+        insert_relay_message(
+            &connection,
+            "queued-a",
+            "module-a",
+            1,
+            "QUEUED",
+            "2026-08-18T00:00:00Z",
+        );
+        insert_relay_message(
+            &connection,
+            "sent-a",
+            "module-a",
+            2,
+            "SENT",
+            "2026-08-18T00:00:01Z",
+        );
+
+        accept_relay_module_in(&connection, "module-a").expect("accept module");
+        let module: (String, Option<String>) = connection
+            .query_row(
+                "SELECT phase, codex_thread_id FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("accepted module");
+        assert_eq!(module.0, "COMPLETED");
+        assert_eq!(module.1.as_deref(), Some("thread-a"));
+        let messages: Vec<(String, String, String)> = connection
+            .prepare("SELECT id, text, delivery_state FROM relay_messages WHERE module_id = 'module-a' ORDER BY sequence_number")
+            .expect("message query")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("message rows")
+            .collect::<Result<_, _>>()
+            .expect("collect messages");
+        assert_eq!(messages, vec![
+            ("queued-a".into(), "queued-a".into(), "FAILED".into()),
+            ("sent-a".into(), "sent-a".into(), "SENT".into()),
+        ]);
+        let accepted_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = 'MODULE_ACCEPTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("accepted audit count");
+        let cancelled_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = 'CHATGPT_QUEUED_MESSAGE_CANCELLED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("queued cancellation audit count");
+        assert_eq!(accepted_events, 1);
+        assert_eq!(cancelled_events, 1);
+
+        accept_relay_module_in(&connection, "module-a")
+            .expect("repeated acceptance is an idempotent success");
+        let repeated_accepted_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = 'MODULE_ACCEPTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("repeated accepted audit count");
+        assert_eq!(repeated_accepted_events, 1);
+        assert!(queue_relay_message_in(
+            &connection,
+            "module-a",
+            RelayMessageKind::Automation,
+            "不应排队",
+        )
+        .is_err());
+
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("stop fixture");
+        let stopped = accept_relay_module_in(&connection, "module-stopped")
+            .expect_err("stopped modules cannot be accepted");
+        assert!(stopped.contains("已终止"));
+    }
+
+    #[test]
     fn relay_codex_cycle_enforces_one_cycle_number_per_module() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-a", "模块 A");
@@ -5677,6 +6031,7 @@ pub fn run() {
             get_chatgpt_pairing,
             send_chatgpt_message,
             create_relay_module,
+            accept_relay_module,
             list_relay_modules,
             list_relay_messages,
             list_relay_codex_cycles,
