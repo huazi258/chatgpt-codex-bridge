@@ -270,6 +270,24 @@ struct RelayMessageRecord {
     delivered_at: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayRecoveryRecord {
+    message_id: String,
+    module_id: String,
+    module_name: String,
+    sequence_number: i64,
+    kind: String,
+    created_at: String,
+}
+
+enum RelayDispatchClaim {
+    RecoveryBlocked(i64),
+    InFlight,
+    Empty,
+    Message(RelayMessageRecord),
+}
+
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
     let data_dir = app
         .path()
@@ -1461,6 +1479,44 @@ fn list_relay_messages(
 }
 
 #[tauri::command]
+fn list_relay_recovery_messages(
+    state: State<'_, AppState>,
+) -> Result<Vec<RelayRecoveryRecord>, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    list_relay_recovery_messages_in(&connection)
+}
+
+fn list_relay_recovery_messages_in(
+    connection: &Connection,
+) -> Result<Vec<RelayRecoveryRecord>, String> {
+    let mut statement = connection.prepare(
+        "SELECT message.id, message.module_id, module.name, message.sequence_number, message.kind, message.created_at
+         FROM relay_messages AS message
+         JOIN relay_modules AS module ON module.id = message.module_id
+         WHERE message.direction = 'TO_CHATGPT' AND message.delivery_state = 'UNKNOWN'
+         ORDER BY message.created_at ASC, message.id ASC",
+    ).map_err(|error| format!("无法查询待恢复的不确定消息：{error}"))?;
+    let messages = statement
+        .query_map([], |row| {
+            Ok(RelayRecoveryRecord {
+                message_id: row.get(0)?,
+                module_id: row.get(1)?,
+                module_name: row.get(2)?,
+                sequence_number: row.get(3)?,
+                kind: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("无法读取待恢复的不确定消息：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取待恢复的不确定消息：{error}"))?;
+    Ok(messages)
+}
+
+#[tauri::command]
 fn send_chatgpt_message(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1536,47 +1592,94 @@ fn send_relay_chatgpt_message_internal(
 
 fn next_queued_relay_message(
     connection: &Connection,
-    module_id: &str,
 ) -> Result<Option<RelayMessageRecord>, String> {
     connection.query_row(
         "SELECT id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at
-         FROM relay_messages WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
-         ORDER BY sequence_number ASC LIMIT 1",
-        [module_id], relay_message_row,
+         FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
+         ORDER BY created_at ASC, id ASC LIMIT 1",
+        [], relay_message_row,
     ).optional().map_err(|error| format!("无法读取待发送消息：{error}"))
 }
 
-fn dispatch_next_relay_message(
-    app: &AppHandle,
-    state: &AppState,
-    module_id: &str,
+fn claim_next_relay_message_for_dispatch(
+    connection: &Connection,
+) -> Result<RelayDispatchClaim, String> {
+    let recovery_blocker_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+        [], |row| row.get(0),
+    ).map_err(|error| format!("无法检查消息队列：{error}"))?;
+    if recovery_blocker_count > 0 {
+        return Ok(RelayDispatchClaim::RecoveryBlocked(recovery_blocker_count));
+    }
+    let already_in_flight: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+        [], |row| row.get(0),
+    ).map_err(|error| format!("无法检查消息队列：{error}"))?;
+    if already_in_flight > 0 {
+        return Ok(RelayDispatchClaim::InFlight);
+    }
+    let Some(message) = next_queued_relay_message(connection)? else {
+        return Ok(RelayDispatchClaim::Empty);
+    };
+    connection.execute(
+        "UPDATE relay_messages SET delivery_state = 'SENT' WHERE id = ?1 AND delivery_state = 'QUEUED'",
+        [&message.id],
+    ).map_err(|error| format!("无法标记待发送消息：{error}"))?;
+    append_relay_event(
+        connection,
+        &message.module_id,
+        "CHATGPT_SEND_STARTED",
+        &format!(
+            "requestId={}; 已从全局 FIFO 队列选择消息，等待 ChatGPT 回复。",
+            message.id
+        ),
+    )?;
+    Ok(RelayDispatchClaim::Message(message))
+}
+
+fn record_relay_message_dispatched(
+    connection: &Connection,
+    message: &RelayMessageRecord,
 ) -> Result<(), String> {
-    let message = {
+    append_relay_event(
+        connection,
+        &message.module_id,
+        "CHATGPT_SEND_DISPATCHED",
+        &format!(
+            "requestId={}; 已向本机 WebSocket 发出 sendChatGptMessage。",
+            message.id
+        ),
+    )
+}
+
+fn dispatch_next_relay_message(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    let claim = {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let already_in_flight: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state IN ('SENT', 'UNKNOWN')",
-            [], |row| row.get(0),
-        ).map_err(|error| format!("无法检查消息队列：{error}"))?;
-        if already_in_flight > 0 {
+        claim_next_relay_message_for_dispatch(&connection)?
+    };
+    let message = match claim {
+        RelayDispatchClaim::RecoveryBlocked(recovery_blocker_count) => {
+            let reason = format!("存在待人工处理的不确定送达消息（{recovery_blocker_count} 条）。请明确重发，或选择不重发并继续；系统不会自动重发。");
+            let _ = app.emit(
+                "relay-control",
+                json!({ "type": "RECOVERY_BLOCKED", "reason": reason }),
+            );
+            state.chatgpt_bridge.set_status(
+                app,
+                ChatGptBridgeStatus {
+                    phase: "RELAY_RECOVERY_REQUIRED".into(),
+                    detail: reason,
+                    tab_id: None,
+                    protocol_state: None,
+                },
+            );
             return Ok(());
         }
-        let Some(message) = next_queued_relay_message(&connection, module_id)? else {
-            return Ok(());
-        };
-        connection.execute(
-            "UPDATE relay_messages SET delivery_state = 'SENT' WHERE id = ?1 AND delivery_state = 'QUEUED'",
-            [&message.id],
-        ).map_err(|error| format!("无法标记待发送消息：{error}"))?;
-        append_relay_event(
-            &connection,
-            module_id,
-            "CHATGPT_SEND_STARTED",
-            &format!("requestId={}; 已从队列选择消息，等待 ChatGPT 回复。", message.id),
-        )?;
-        message
+        RelayDispatchClaim::InFlight | RelayDispatchClaim::Empty => return Ok(()),
+        RelayDispatchClaim::Message(message) => message,
     };
     if let Err(error) =
         send_relay_chatgpt_message_internal(app, &state.chatgpt_bridge, &message.id, &message.text)
@@ -1613,12 +1716,7 @@ fn dispatch_next_relay_message(
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        append_relay_event(
-            &connection,
-            module_id,
-            "CHATGPT_SEND_DISPATCHED",
-            &format!("requestId={}; 已向本机 WebSocket 发出 sendChatGptMessage。", message.id),
-        )?;
+        record_relay_message_dispatched(&connection, &message)?;
     }
     Ok(())
 }
@@ -1657,7 +1755,7 @@ fn queue_relay_message(
             "已加入 ChatGPT 发送队列。",
         )?;
     }
-    dispatch_next_relay_message(&app, &state, &module_id)
+    dispatch_next_relay_message(&app, &state)
 }
 
 fn append_relay_message(
@@ -1731,12 +1829,61 @@ fn requeue_unknown_relay_message(
             [message_id],
         )
         .map_err(|error| format!("无法重新排队 ChatGPT 消息：{error}"))?;
-    set_relay_phase(connection, &module_id, "READY")?;
+    set_relay_phase_after_recovery(connection, &module_id)?;
     append_relay_event(
         connection,
         &module_id,
         "CHATGPT_EXPLICIT_RESEND",
         &format!("requestId={message_id}; 用户已明确要求重发此前结果不确定的消息。"),
+    )?;
+    Ok(module_id)
+}
+
+fn set_relay_phase_after_recovery(connection: &Connection, module_id: &str) -> Result<(), String> {
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages
+         WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查模块恢复状态：{error}"))?;
+    set_relay_phase(
+        connection,
+        module_id,
+        if remaining > 0 {
+            "RECOVERY_REQUIRED"
+        } else {
+            "READY"
+        },
+    )
+}
+
+fn resolve_unknown_relay_message_without_resend(
+    connection: &Connection,
+    message_id: &str,
+) -> Result<String, String> {
+    let module_id: String = connection
+        .query_row(
+            "SELECT module_id FROM relay_messages WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取待恢复的 ChatGPT 消息：{error}"))?
+        .ok_or_else(|| "该消息不是可解除阻塞的不确定传话消息。".to_string())?;
+    connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'FAILED' WHERE id = ?1",
+            [message_id],
+        )
+        .map_err(|error| format!("无法保存不重发决定：{error}"))?;
+    set_relay_phase_after_recovery(connection, &module_id)?;
+    append_relay_event(
+        connection,
+        &module_id,
+        "CHATGPT_EXPLICIT_CONTINUE_WITHOUT_RESEND",
+        &format!("requestId={message_id}; 用户确认不重发该送达结果不确定的消息，并解除其阻塞。"),
     )?;
     Ok(module_id)
 }
@@ -1747,14 +1894,30 @@ fn retry_unknown_relay_message(
     state: State<'_, AppState>,
     message_id: String,
 ) -> Result<(), String> {
-    let module_id = {
+    {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        requeue_unknown_relay_message(&connection, &message_id)?
-    };
-    dispatch_next_relay_message(&app, &state, &module_id)
+        requeue_unknown_relay_message(&connection, &message_id)?;
+    }
+    dispatch_next_relay_message(&app, &state)
+}
+
+#[tauri::command]
+fn continue_unknown_relay_message_without_resend(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<(), String> {
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        resolve_unknown_relay_message_without_resend(&connection, &message_id)?;
+    }
+    dispatch_next_relay_message(&app, &state)
 }
 
 fn handle_relay_chatgpt_adapter_failure(
@@ -1787,11 +1950,16 @@ fn handle_relay_chatgpt_adapter_failure(
             &connection,
             &message_id,
             "CHATGPT_ADAPTER_FAILURE",
-            &format!("ChatGPT 适配器失败，消息送达结果不确定，未自动重发：{adapter_error}{diagnostic}"),
+            &format!(
+                "ChatGPT 适配器失败，消息送达结果不确定，未自动重发：{adapter_error}{diagnostic}"
+            ),
         )?;
     }
     let reason = format!("ChatGPT 浏览器适配器失败，消息送达结果不确定，未自动重发。请检查已绑定标签页和扩展后，再明确决定是否重发：{adapter_error}");
-    let _ = app.emit("relay-control", json!({ "type": "ADAPTER_FAILURE", "reason": reason }));
+    let _ = app.emit(
+        "relay-control",
+        json!({ "type": "ADAPTER_FAILURE", "reason": reason }),
+    );
     state.chatgpt_bridge.set_status(
         &app,
         ChatGptBridgeStatus {
@@ -2017,7 +2185,7 @@ fn handle_relay_chatgpt_reply(
             protocol_state: None,
         },
     );
-    dispatch_next_relay_message(&app, &state, &module_id)?;
+    dispatch_next_relay_message(&app, &state)?;
     if let Some(action) = next_action {
         if action.get("type").and_then(Value::as_str) == Some("CODEX_PROMPT") {
             let prompt = action
@@ -2350,7 +2518,7 @@ fn relay_codex_turn_completed(app: &AppHandle, module_id: &str, summary: &str) {
                 "relay-codex-status",
                 json!({ "phase": "CODEX_COMPLETED", "moduleId": module_id }),
             );
-            let _ = dispatch_next_relay_message(app, &state, module_id);
+            let _ = dispatch_next_relay_message(app, &state);
         }
         Err(error) => relay_codex_failed(app, module_id, error),
     }
@@ -3150,6 +3318,37 @@ mod tests {
         }
     }
 
+    fn relay_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(CONVERSATION_RELAY_SCHEMA)
+            .expect("relay schema");
+        connection
+    }
+
+    fn insert_relay_module(connection: &Connection, id: &str, name: &str) {
+        connection.execute(
+            "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
+             VALUES (?1, ?2, 'G:\\workspace', 12, 240, 'retry', 'READY', 0, 0, '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z')",
+            params![id, name],
+        ).expect("relay module");
+    }
+
+    fn insert_relay_message(
+        connection: &Connection,
+        id: &str,
+        module_id: &str,
+        sequence_number: i64,
+        delivery_state: &str,
+        created_at: &str,
+    ) {
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at)
+             VALUES (?1, ?2, ?3, 'TO_CHATGPT', 'AUTOMATION', ?1, ?4, ?5)",
+            params![id, module_id, sequence_number, delivery_state, created_at],
+        ).expect("relay message");
+    }
+
     #[test]
     fn adapter_failure_marks_relay_delivery_unknown_without_parsing_or_retrying() {
         let connection = Connection::open_in_memory().expect("in-memory database");
@@ -3173,7 +3372,8 @@ mod tests {
             "outgoing-1",
             "CHATGPT_ADAPTER_FAILURE",
             "adapter failed after the send may have started",
-        ).expect("adapter failure is recorded");
+        )
+        .expect("adapter failure is recorded");
 
         let (delivery_state, phase, invalid_reply_count): (String, String, i64) = connection.query_row(
             "SELECT message.delivery_state, module.phase, module.invalid_reply_count
@@ -3233,6 +3433,108 @@ mod tests {
     }
 
     #[test]
+    fn all_global_unknown_blockers_remain_visible_until_each_is_explicitly_resolved() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_module(&connection, "module-c", "模块 C");
+        insert_relay_message(
+            &connection,
+            "unknown-a",
+            "module-a",
+            4,
+            "UNKNOWN",
+            "2026-08-17T00:00:01Z",
+        );
+        insert_relay_message(
+            &connection,
+            "queued-b",
+            "module-b",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:02Z",
+        );
+        insert_relay_message(
+            &connection,
+            "unknown-c",
+            "module-c",
+            2,
+            "UNKNOWN",
+            "2026-08-17T00:00:03Z",
+        );
+
+        let blockers = list_relay_recovery_messages_in(&connection).expect("all recovery blockers");
+        assert_eq!(blockers.len(), 2);
+        assert_eq!(blockers[0].module_name, "模块 A");
+        assert_eq!(blockers[1].module_name, "模块 C");
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection),
+            Ok(RelayDispatchClaim::RecoveryBlocked(2))
+        ));
+
+        resolve_unknown_relay_message_without_resend(&connection, "unknown-a")
+            .expect("explicit continue without resend");
+        let remaining = list_relay_recovery_messages_in(&connection).expect("remaining blocker");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].message_id, "unknown-c");
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection),
+            Ok(RelayDispatchClaim::RecoveryBlocked(1))
+        ));
+
+        resolve_unknown_relay_message_without_resend(&connection, "unknown-c")
+            .expect("resolve final blocker without resending it");
+        let old_message_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = 'unknown-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("old message state");
+        assert_eq!(old_message_state, "FAILED");
+        let message =
+            match claim_next_relay_message_for_dispatch(&connection).expect("queue resumes") {
+                RelayDispatchClaim::Message(message) => message,
+                _ => panic!("the queued message must dispatch after every UNKNOWN is resolved"),
+            };
+        assert_eq!(message.id, "queued-b");
+        record_relay_message_dispatched(&connection, &message).expect("dispatch event");
+        let events: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-b' AND event_type IN ('CHATGPT_SEND_STARTED', 'CHATGPT_SEND_DISPATCHED')",
+            [], |row| row.get(0),
+        ).expect("dispatch event count");
+        assert_eq!(events, 2);
+    }
+
+    #[test]
+    fn explicit_resend_requeues_only_the_selected_unknown_message_once() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_message(
+            &connection,
+            "unknown-a",
+            "module-a",
+            1,
+            "UNKNOWN",
+            "2026-08-17T00:00:01Z",
+        );
+
+        requeue_unknown_relay_message(&connection, "unknown-a").expect("explicit resend");
+        let message = match claim_next_relay_message_for_dispatch(&connection)
+            .expect("requeued message dispatches")
+        {
+            RelayDispatchClaim::Message(message) => message,
+            _ => panic!("the selected message must be the only dispatch candidate"),
+        };
+        assert_eq!(message.id, "unknown-a");
+        let resend_events: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = 'CHATGPT_EXPLICIT_RESEND'",
+            [], |row| row.get(0),
+        ).expect("explicit resend count");
+        assert_eq!(resend_events, 1);
+    }
+
+    #[test]
     fn restart_marks_sent_relay_messages_unknown_without_requeueing_them() {
         let connection = Connection::open_in_memory().expect("in-memory database");
         connection
@@ -3252,16 +3554,20 @@ mod tests {
 
         mark_uncertain_relay_deliveries(&connection).expect("restart recovery");
 
-        let delivery_state: String = connection.query_row(
-            "SELECT delivery_state FROM relay_messages WHERE id = 'outgoing-1'",
-            [],
-            |row| row.get(0),
-        ).expect("recovered delivery state");
-        let queued_messages: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM relay_messages WHERE delivery_state = 'QUEUED'",
-            [],
-            |row| row.get(0),
-        ).expect("queued message count");
+        let delivery_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = 'outgoing-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("recovered delivery state");
+        let queued_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages WHERE delivery_state = 'QUEUED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("queued message count");
         assert_eq!(delivery_state, "UNKNOWN");
         assert_eq!(queued_messages, 0);
     }
@@ -3525,8 +3831,10 @@ pub fn run() {
             create_relay_module,
             list_relay_modules,
             list_relay_messages,
+            list_relay_recovery_messages,
             queue_relay_message,
             retry_unknown_relay_message,
+            continue_unknown_relay_message_without_resend,
             start_module_orchestration,
             get_orchestration_snapshot,
             apply_acceptance_action

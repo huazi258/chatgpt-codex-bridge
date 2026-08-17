@@ -5,6 +5,7 @@ import App from './App';
 let modules = [
   { id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', invalidReplyCount: 0, startedCycles: 0 },
 ];
+let recoveryMessages: Array<{ messageId: string; moduleId: string; moduleName: string; sequenceNumber: number; kind: string; createdAt: string }> = [];
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 
@@ -12,6 +13,7 @@ invoke.mockImplementation(async (command: string, args?: { input?: { name: strin
   if (command === 'list_relay_modules') return modules;
   if (command === 'get_chatgpt_pairing') return { endpoint: 'ws://127.0.0.1:17384', pairingSecret: 'secret', paired: false };
   if (command === 'list_relay_messages') return [];
+  if (command === 'list_relay_recovery_messages') return recoveryMessages;
   if (command === 'create_relay_module') {
     const input = args?.input;
     if (!input) throw new Error('missing module input');
@@ -30,6 +32,7 @@ describe('传话模块创建入口', () => {
     modules = [
       { id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', invalidReplyCount: 0, startedCycles: 0 },
     ];
+    recoveryMessages = [];
     invoke.mockClear();
   });
 
@@ -52,5 +55,20 @@ describe('传话模块创建入口', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /原有模块/ }));
     await waitFor(() => expect(screen.getByRole('heading', { name: '原有模块' })).toBeTruthy());
+  });
+
+  it('显示其他模块造成的全部不确定送达阻塞，并提供不重发继续入口', async () => {
+    recoveryMessages = [
+      { messageId: 'unknown-a', moduleId: 'module-a', moduleName: '模块 A', sequenceNumber: 4, kind: 'AUTOMATION', createdAt: '2026-08-17T07:45:37Z' },
+      { messageId: 'unknown-c', moduleId: 'module-c', moduleName: '模块 C', sequenceNumber: 2, kind: 'MANUAL', createdAt: '2026-08-17T07:46:00Z' },
+    ];
+    render(<App />);
+
+    await screen.findByRole('heading', { name: '原有模块' });
+    expect(await screen.findByText('存在待人工处理的不确定送达消息')).toBeTruthy();
+    expect(screen.getByText('模块 A · 第 4 条 · 自动化')).toBeTruthy();
+    expect(screen.getByText('模块 C · 第 2 条 · 手动')).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: '明确重发这条消息' })).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: '不重发并继续' })).toHaveLength(2);
   });
 });
