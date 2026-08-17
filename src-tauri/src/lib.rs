@@ -22,6 +22,8 @@ const INITIAL_SCHEMA: &str = include_str!("../migrations/001_initial.sql");
 const ORCHESTRATION_SCHEMA: &str = include_str!("../migrations/002_orchestration_runtime.sql");
 const EXECUTION_CONTROL_SCHEMA: &str = include_str!("../migrations/003_execution_control.sql");
 const CONVERSATION_RELAY_SCHEMA: &str = include_str!("../migrations/004_conversation_relay_v2.sql");
+const CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA: &str =
+    include_str!("../migrations/005_codex_communication_observability.sql");
 
 struct AppState {
     connection: Mutex<Connection>,
@@ -281,6 +283,28 @@ struct RelayRecoveryRecord {
     created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexCycleRecord {
+    id: String,
+    module_id: String,
+    cycle_number: i64,
+    status: String,
+    prompt_text: String,
+    codex_thread_id: Option<String>,
+    codex_turn_id: Option<String>,
+    result_text: Option<String>,
+    outbound_chatgpt_message_id: Option<String>,
+    error_text: Option<String>,
+    created_at: String,
+    codex_started_at: Option<String>,
+    codex_completed_at: Option<String>,
+    relay_queued_at: Option<String>,
+    relay_delivered_at: Option<String>,
+    updated_at: String,
+    block_reason: Option<String>,
+}
+
 enum RelayDispatchClaim {
     RecoveryBlocked(i64),
     InFlight,
@@ -313,6 +337,11 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
     connection
         .execute_batch(CONVERSATION_RELAY_SCHEMA)
         .map_err(|error| format!("could not initialize conversation-relay storage: {error}"))?;
+    connection
+        .execute_batch(CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA)
+        .map_err(|error| {
+            format!("could not initialize Codex communication observability storage: {error}")
+        })?;
     Ok(connection)
 }
 
@@ -1379,6 +1408,106 @@ fn relay_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayMessageRe
         created_at: row.get(7)?,
         delivered_at: row.get(8)?,
     })
+}
+
+fn relay_codex_cycle_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayCodexCycleRecord> {
+    Ok(RelayCodexCycleRecord {
+        id: row.get(0)?,
+        module_id: row.get(1)?,
+        cycle_number: row.get(2)?,
+        status: row.get(3)?,
+        prompt_text: row.get(4)?,
+        codex_thread_id: row.get(5)?,
+        codex_turn_id: row.get(6)?,
+        result_text: row.get(7)?,
+        outbound_chatgpt_message_id: row.get(8)?,
+        error_text: row.get(9)?,
+        created_at: row.get(10)?,
+        codex_started_at: row.get(11)?,
+        codex_completed_at: row.get(12)?,
+        relay_queued_at: row.get(13)?,
+        relay_delivered_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        block_reason: None,
+    })
+}
+
+const RELAY_CODEX_CYCLE_SELECT: &str = "SELECT id, module_id, cycle_number, status, prompt_text,
+    codex_thread_id, codex_turn_id, result_text, outbound_chatgpt_message_id, error_text,
+    created_at, codex_started_at, codex_completed_at, relay_queued_at, relay_delivered_at, updated_at
+ FROM relay_codex_cycles";
+
+fn create_relay_codex_cycle(
+    connection: &Connection,
+    module_id: &str,
+    cycle_number: i64,
+    prompt_text: &str,
+) -> Result<RelayCodexCycleRecord, String> {
+    let now = Utc::now().to_rfc3339();
+    let cycle = RelayCodexCycleRecord {
+        id: Uuid::new_v4().to_string(),
+        module_id: module_id.to_string(),
+        cycle_number,
+        status: "WAITING_TO_SEND_CODEX".into(),
+        prompt_text: prompt_text.to_string(),
+        codex_thread_id: None,
+        codex_turn_id: None,
+        result_text: None,
+        outbound_chatgpt_message_id: None,
+        error_text: None,
+        created_at: now.clone(),
+        codex_started_at: None,
+        codex_completed_at: None,
+        relay_queued_at: None,
+        relay_delivered_at: None,
+        updated_at: now,
+        block_reason: None,
+    };
+    connection
+        .execute(
+            "INSERT INTO relay_codex_cycles (
+            id, module_id, cycle_number, status, prompt_text, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &cycle.id,
+                &cycle.module_id,
+                cycle.cycle_number,
+                &cycle.status,
+                &cycle.prompt_text,
+                &cycle.created_at,
+                &cycle.updated_at,
+            ],
+        )
+        .map_err(|error| format!("无法创建 Codex 通讯循环：{error}"))?;
+    Ok(cycle)
+}
+
+fn get_relay_codex_cycle_by_id(
+    connection: &Connection,
+    cycle_id: &str,
+) -> Result<Option<RelayCodexCycleRecord>, String> {
+    connection
+        .query_row(
+            &format!("{RELAY_CODEX_CYCLE_SELECT} WHERE id = ?1"),
+            [cycle_id],
+            relay_codex_cycle_row,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))
+}
+
+fn get_relay_codex_cycle_by_outbound_message(
+    connection: &Connection,
+    message_id: &str,
+) -> Result<Option<RelayCodexCycleRecord>, String> {
+    connection
+        .query_row(
+            &format!("{RELAY_CODEX_CYCLE_SELECT} WHERE outbound_chatgpt_message_id = ?1"),
+            [message_id],
+            relay_codex_cycle_row,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))
 }
 
 fn append_relay_event(
@@ -3324,6 +3453,9 @@ mod tests {
             .execute_batch(CONVERSATION_RELAY_SCHEMA)
             .expect("relay schema");
         connection
+            .execute_batch(CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA)
+            .expect("Codex communication observability schema");
+        connection
     }
 
     fn insert_relay_module(connection: &Connection, id: &str, name: &str) {
@@ -3347,6 +3479,115 @@ mod tests {
              VALUES (?1, ?2, ?3, 'TO_CHATGPT', 'AUTOMATION', ?1, ?4, ?5)",
             params![id, module_id, sequence_number, delivery_state, created_at],
         ).expect("relay message");
+    }
+
+    fn insert_relay_codex_cycle(
+        connection: &Connection,
+        id: &str,
+        module_id: &str,
+        cycle_number: i64,
+        outbound_chatgpt_message_id: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO relay_codex_cycles (
+                id, module_id, cycle_number, status, prompt_text,
+                outbound_chatgpt_message_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'WAITING_TO_SEND_CODEX', 'Codex prompt', ?4, ?5, ?5)",
+            params![
+                id,
+                module_id,
+                cycle_number,
+                outbound_chatgpt_message_id,
+                "2026-08-17T00:00:00Z"
+            ],
+        )
+    }
+
+    #[test]
+    fn relay_codex_cycle_enforces_one_cycle_number_per_module() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None).expect("first cycle");
+        let duplicate = insert_relay_codex_cycle(&connection, "cycle-b", "module-a", 1, None);
+
+        assert!(duplicate.is_err(), "a module cycle number must be unique");
+    }
+
+    #[test]
+    fn relay_codex_cycle_create_and_read_helpers_preserve_initial_state() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_message(
+            &connection,
+            "outbound-a",
+            "module-a",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:00Z",
+        );
+
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+        assert_eq!(cycle.status, "WAITING_TO_SEND_CODEX");
+        assert_eq!(cycle.prompt_text, "请只回复 RELAY_E2E_OK");
+        assert!(cycle.codex_thread_id.is_none());
+        assert!(cycle.codex_turn_id.is_none());
+        assert!(cycle.result_text.is_none());
+        assert!(cycle.outbound_chatgpt_message_id.is_none());
+        assert!(cycle.error_text.is_none());
+        assert!(cycle.codex_started_at.is_none());
+        assert!(cycle.codex_completed_at.is_none());
+        assert!(cycle.relay_queued_at.is_none());
+        assert!(cycle.relay_delivered_at.is_none());
+        assert!(cycle.block_reason.is_none());
+        DateTime::parse_from_rfc3339(&cycle.created_at).expect("UTC RFC3339 created timestamp");
+        DateTime::parse_from_rfc3339(&cycle.updated_at).expect("UTC RFC3339 updated timestamp");
+
+        let by_id = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read cycle")
+            .expect("cycle exists");
+        assert_eq!(by_id.id, cycle.id);
+        assert!(
+            get_relay_codex_cycle_by_outbound_message(&connection, "outbound-a")
+                .expect("read unlinked message")
+                .is_none()
+        );
+
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET outbound_chatgpt_message_id = ?1 WHERE id = ?2",
+                params!["outbound-a", &cycle.id],
+            )
+            .expect("link outbound message");
+        let by_outbound = get_relay_codex_cycle_by_outbound_message(&connection, "outbound-a")
+            .expect("read linked message")
+            .expect("cycle is linked");
+        assert_eq!(by_outbound.id, cycle.id);
+    }
+
+    #[test]
+    fn relay_codex_cycle_enforces_one_outbound_message_per_cycle() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_message(
+            &connection,
+            "outbound-a",
+            "module-a",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:00Z",
+        );
+
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, Some("outbound-a"))
+            .expect("first linked cycle");
+        let duplicate =
+            insert_relay_codex_cycle(&connection, "cycle-b", "module-a", 2, Some("outbound-a"));
+
+        assert!(
+            duplicate.is_err(),
+            "an outbound message must link to only one cycle"
+        );
     }
 
     #[test]
