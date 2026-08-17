@@ -1,6 +1,10 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
+import { CodexCommunicationPanel } from './components/CodexCommunicationPanel';
+import { CodexCycleCard } from './components/CodexCycleCard';
+import { GlobalChannelStatus } from './components/GlobalChannelStatus';
+import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
 
 let modules = [
   { id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', invalidReplyCount: 0, startedCycles: 0 },
@@ -70,5 +74,114 @@ describe('传话模块创建入口', () => {
     expect(screen.getByText('模块 C · 第 2 条 · 手动')).toBeTruthy();
     expect(screen.getAllByRole('button', { name: '明确重发这条消息' })).toHaveLength(2);
     expect(screen.getAllByRole('button', { name: '不重发并继续' })).toHaveLength(2);
+  });
+});
+
+const runningSnapshot: RelayChannelSnapshot = {
+  chatgpt: {
+    status: 'IN_FLIGHT',
+    activeModuleId: 'module-a',
+    activeModuleName: '模块 A',
+    activeMessageId: 'chatgpt-message-17',
+    activeKind: 'AUTOMATION',
+    activePhase: '等待完成回复',
+    recoveryBlockerCount: 0,
+  },
+  codex: {
+    status: 'RUNNING',
+    activeModuleId: 'module-b',
+    activeModuleName: '模块 B',
+    cycleNumber: 3,
+    codexThreadId: 'thread-codex-3',
+    codexTurnId: null,
+    cycleStatus: 'CODEX_RUNNING',
+  },
+};
+
+const completedCycle: RelayCodexCycle = {
+  id: 'cycle-3',
+  moduleId: 'module-b',
+  cycleNumber: 3,
+  status: 'WAITING_FOR_CHATGPT',
+  promptText: '请实现 Relay E2E 检查。',
+  codexThreadId: 'thread-codex-3',
+  codexTurnId: null,
+  resultText: 'RELAY_E2E_OK',
+  outboundChatgptMessageId: 'chatgpt-message-18',
+  errorText: null,
+  createdAt: '2026-08-17T08:00:00Z',
+  codexStartedAt: '2026-08-17T08:01:00Z',
+  codexCompletedAt: '2026-08-17T08:02:00Z',
+  relayQueuedAt: '2026-08-17T08:02:01Z',
+  relayDeliveredAt: null,
+  updatedAt: '2026-08-17T08:02:01Z',
+  blockReason: 'ChatGPT 通道当前被模块「模块 A」占用（消息 chatgpt-message-17）。',
+};
+
+describe('Codex 通讯可观测性组件', () => {
+  afterEach(cleanup);
+
+  it('展示忙碌 ChatGPT、recovery blocker 与运行中的 Codex 通道', () => {
+    const { rerender } = render(<GlobalChannelStatus snapshot={runningSnapshot} />);
+
+    expect(screen.getByText('ChatGPT 通道：忙碌')).toBeTruthy();
+    expect(screen.getByText('当前占用模块：模块 A')).toBeTruthy();
+    expect(screen.getByText('当前消息：chatgpt-message-17')).toBeTruthy();
+    expect(screen.getByText('Codex 通道：运行中')).toBeTruthy();
+    expect(screen.getByText('当前模块：模块 B')).toBeTruthy();
+    expect(screen.getByText('Cycle：3')).toBeTruthy();
+    expect(screen.getByText('Codex thread：thread-codex-3')).toBeTruthy();
+    expect(screen.getByText('Codex turn：尚未获得')).toBeTruthy();
+
+    rerender(<GlobalChannelStatus snapshot={{
+      ...runningSnapshot,
+      chatgpt: { ...runningSnapshot.chatgpt, status: 'RECOVERY_BLOCKED', recoveryBlockerCount: 2 },
+    }} />);
+    expect(screen.getByText('ChatGPT 通道：恢复阻塞')).toBeTruthy();
+    expect(screen.getByText('待恢复 UNKNOWN：2 条')).toBeTruthy();
+  });
+
+  it('展示 cycle 的 prompt、thread、result、缺失 turn 与阻塞原因', () => {
+    render(<CodexCycleCard cycle={completedCycle} />);
+
+    expect(screen.getByText('Cycle 3 · 等待回传 ChatGPT')).toBeTruthy();
+    expect(screen.getByText('Prompt 原文')).toBeTruthy();
+    expect(screen.getByText(completedCycle.promptText)).toBeTruthy();
+    expect(screen.getByText('Codex thread：thread-codex-3')).toBeTruthy();
+    expect(screen.getByText('Codex turn：尚未获得')).toBeTruthy();
+    expect(screen.getByText('Codex final text')).toBeTruthy();
+    expect(screen.getByText('RELAY_E2E_OK')).toBeTruthy();
+    expect(screen.getByText('Outbound ChatGPT message：chatgpt-message-18')).toBeTruthy();
+    expect(screen.getByText(`阻塞原因：${completedCycle.blockReason}`)).toBeTruthy();
+  });
+
+  it('以后台顺序显示 cycle，并为失败 cycle 显示错误而不显示成功状态', () => {
+    const failedCycle: RelayCodexCycle = {
+      ...completedCycle,
+      id: 'cycle-2',
+      cycleNumber: 2,
+      status: 'FAILED',
+      resultText: null,
+      outboundChatgptMessageId: null,
+      errorText: 'Codex turn 启动失败。',
+      blockReason: null,
+    };
+    render(<CodexCommunicationPanel cycles={[completedCycle, failedCycle]} />);
+
+    expect(screen.getAllByRole('article').map((card) => card.textContent)).toEqual([
+      expect.stringContaining('Cycle 3'),
+      expect.stringContaining('Cycle 2'),
+    ]);
+    expect(screen.getByText('Cycle 2 · 失败')).toBeTruthy();
+    expect(screen.getByText('错误：Codex turn 启动失败。')).toBeTruthy();
+    expect(screen.queryByText('Cycle 2 · Codex 已完成')).toBeNull();
+  });
+
+  it('显示加载和空 cycle 状态', () => {
+    const { rerender } = render(<CodexCommunicationPanel cycles={null} />);
+    expect(screen.getByText('正在读取 Codex 通讯状态…')).toBeTruthy();
+
+    rerender(<CodexCommunicationPanel cycles={[]} />);
+    expect(screen.getByText('尚未开始 Codex 循环。')).toBeTruthy();
   });
 });
