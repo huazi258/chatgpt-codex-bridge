@@ -2230,6 +2230,12 @@ enum RelayModuleAcceptance {
     AlreadyCompleted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayModuleTermination {
+    Stopped,
+    AlreadyStopped,
+}
+
 fn accept_relay_module_in(
     connection: &Connection,
     module_id: &str,
@@ -2333,6 +2339,110 @@ fn accept_relay_module_in(
         .commit()
         .map_err(|error| format!("无法提交模块验收事务：{error}"))?;
     Ok(RelayModuleAcceptance::Accepted)
+}
+
+fn terminate_relay_module_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<RelayModuleTermination, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始终止模块事务：{error}"))?;
+    let module = transaction
+        .query_row(
+            "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+             FROM relay_modules WHERE id = ?1",
+            [module_id],
+            relay_row_to_module,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取传话模块：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.phase == "STOPPED" {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交终止模块事务：{error}"))?;
+        return Ok(RelayModuleTermination::AlreadyStopped);
+    }
+    if module.phase == "COMPLETED" {
+        return Err("模块已验收完成，不能终止。".into());
+    }
+    if module.stop_after_turn {
+        return Err("模块正在终止，等待当前 Codex 回合结束。".into());
+    }
+
+    let unknown_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages
+             WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查不确定送达消息：{error}"))?;
+    if unknown_count > 0 {
+        return Err("请先处理本模块的不确定送达消息。".into());
+    }
+    let running_cycle_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_codex_cycles
+             WHERE module_id = ?1 AND status = 'CODEX_RUNNING'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查 Codex 回合状态：{error}"))?;
+    if running_cycle_count > 0 {
+        return Err("当前 Codex 回合仍在运行，不能立即终止模块。".into());
+    }
+
+    let queued_message_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id FROM relay_messages
+                 WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?;
+        let message_ids = statement
+            .query_map([module_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?;
+        message_ids
+    };
+    for message_id in &queued_message_ids {
+        transaction
+            .execute(
+                "UPDATE relay_messages SET delivery_state = 'FAILED'
+                 WHERE id = ?1 AND delivery_state = 'QUEUED'",
+                [message_id],
+            )
+            .map_err(|error| format!("无法取消待发送消息：{error}"))?;
+        append_relay_event_in_transaction(
+            &transaction,
+            module_id,
+            "CHATGPT_QUEUED_MESSAGE_CANCELLED",
+            &format!("requestId={message_id}; 模块已由用户终止，消息未发送。"),
+        )?;
+    }
+    transaction
+        .execute(
+            "UPDATE relay_modules
+             SET phase = 'STOPPED', stop_after_turn = 0, updated_at = ?2
+             WHERE id = ?1",
+            params![module_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法终止传话模块：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        module_id,
+        "MODULE_TERMINATED",
+        "用户已终止模块。",
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交终止模块事务：{error}"))?;
+    Ok(RelayModuleTermination::Stopped)
 }
 
 fn submit_relay_acceptance_feedback_in(
@@ -2472,6 +2582,66 @@ fn accept_relay_module(
         json!({ "type": "MODULE_ACCEPTED", "moduleId": module_id }),
     );
     emit_relay_codex_changed(&app, &module_id, "", "COMPLETED");
+    Ok(())
+}
+
+#[tauri::command]
+fn terminate_relay_module(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<(), String> {
+    if relay_codex_turn_is_active_for_module(&state, &module_id)? {
+        return Err("当前 Codex 回合仍在运行，不能立即终止模块。".into());
+    }
+    let outcome = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        terminate_relay_module_in(&connection, &module_id)?
+    };
+    if outcome == RelayModuleTermination::AlreadyStopped {
+        return Ok(());
+    }
+
+    match release_relay_codex_runtime(&app, &module_id) {
+        Ok(()) => {
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            append_relay_event(
+                &connection,
+                &module_id,
+                "CODEX_THREAD_RELEASED",
+                "模块已终止，Codex 对话已释放。",
+            )?;
+        }
+        Err(error) => {
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            append_relay_event(
+                &connection,
+                &module_id,
+                "CODEX_THREAD_RELEASE_FAILED",
+                &format!("模块已终止，但 Codex 对话释放失败：{error}"),
+            )?;
+            let _ = app.emit(
+                "relay-control",
+                json!({ "type": "MODULE_TERMINATED", "moduleId": module_id }),
+            );
+            emit_relay_codex_changed(&app, &module_id, "", "STOPPED");
+            return Err(format!("模块已终止，但无法释放 Codex 对话：{error}"));
+        }
+    }
+    let _ = app.emit(
+        "relay-control",
+        json!({ "type": "MODULE_TERMINATED", "moduleId": module_id }),
+    );
+    emit_relay_codex_changed(&app, &module_id, "", "STOPPED");
     Ok(())
 }
 
@@ -5319,6 +5489,164 @@ mod tests {
     }
 
     #[test]
+    fn terminate_idle_relay_module_stops_only_safe_non_running_modules() {
+        let connection = relay_connection();
+        for (id, phase) in [
+            ("module-ready", "READY"),
+            ("module-acceptance", "WAITING_FOR_ACCEPTANCE"),
+            ("module-blocked", "BLOCKED"),
+            ("module-recovery", "RECOVERY_REQUIRED"),
+            ("module-chatgpt", "WAITING_FOR_CHATGPT"),
+        ] {
+            insert_relay_module(&connection, id, id);
+            connection
+                .execute("UPDATE relay_modules SET phase = ?2 WHERE id = ?1", params![id, phase])
+                .expect("prepare idle phase");
+            connection
+                .execute(
+                    "UPDATE relay_modules SET codex_thread_id = 'thread-kept' WHERE id = ?1",
+                    [id],
+                )
+                .expect("retain thread id");
+            insert_relay_message(
+                &connection,
+                &format!("queued-{id}"),
+                id,
+                1,
+                "QUEUED",
+                "2026-08-18T00:00:00Z",
+            );
+            insert_relay_message(
+                &connection,
+                &format!("sent-{id}"),
+                id,
+                2,
+                "SENT",
+                "2026-08-18T00:00:01Z",
+            );
+
+            assert_eq!(
+                terminate_relay_module_in(&connection, id).expect("terminate idle module"),
+                RelayModuleTermination::Stopped
+            );
+            let module: (String, Option<String>) = connection
+                .query_row(
+                    "SELECT phase, codex_thread_id FROM relay_modules WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("stopped module");
+            assert_eq!(module.0, "STOPPED");
+            assert_eq!(module.1.as_deref(), Some("thread-kept"));
+            let message_states: Vec<(String, String, String)> = connection
+                .prepare(
+                    "SELECT id, text, delivery_state FROM relay_messages
+                     WHERE module_id = ?1 ORDER BY sequence_number",
+                )
+                .expect("message query")
+                .query_map([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("message rows")
+                .collect::<Result<_, _>>()
+                .expect("collect messages");
+            assert_eq!(
+                message_states,
+                vec![
+                    (format!("queued-{id}"), format!("queued-{id}"), "FAILED".into()),
+                    (format!("sent-{id}"), format!("sent-{id}"), "SENT".into()),
+                ]
+            );
+            let termination_events: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'MODULE_TERMINATED'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("termination event count");
+            let cancelled_events: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'CHATGPT_QUEUED_MESSAGE_CANCELLED'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("queued cancellation count");
+            assert_eq!(termination_events, 1);
+            assert_eq!(cancelled_events, 1);
+            assert_eq!(
+                terminate_relay_module_in(&connection, id).expect("repeat termination is inert"),
+                RelayModuleTermination::AlreadyStopped
+            );
+            let repeated_events: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'MODULE_TERMINATED'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("repeated termination event count");
+            assert_eq!(repeated_events, 1);
+            assert!(queue_relay_message_in(
+                &connection,
+                id,
+                RelayMessageKind::Manual,
+                "终态模块不得发送",
+            )
+            .is_err());
+        }
+
+        insert_relay_module(&connection, "module-unknown", "本模块不确定送达");
+        insert_relay_message(
+            &connection,
+            "unknown-local",
+            "module-unknown",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:02Z",
+        );
+        let unknown_error = terminate_relay_module_in(&connection, "module-unknown")
+            .expect_err("local unknown must block termination");
+        assert!(unknown_error.contains("不确定送达"));
+
+        insert_relay_module(&connection, "module-other-unknown", "其他模块不确定送达");
+        insert_relay_message(
+            &connection,
+            "unknown-other",
+            "module-other-unknown",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:03Z",
+        );
+        insert_relay_module(&connection, "module-safe", "可终止模块");
+        terminate_relay_module_in(&connection, "module-safe")
+            .expect("other module unknown must not block termination");
+
+        insert_relay_module(&connection, "module-running", "运行模块");
+        insert_relay_codex_cycle(&connection, "cycle-running", "module-running", 1, None)
+            .expect("insert cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-running'",
+                [],
+            )
+            .expect("mark running cycle");
+        let running_error = terminate_relay_module_in(&connection, "module-running")
+            .expect_err("Task 5 must not terminate a running Codex turn");
+        assert!(running_error.contains("当前 Codex 回合仍在运行"));
+
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("complete module");
+        let completed_error = terminate_relay_module_in(&connection, "module-completed")
+            .expect_err("completed module cannot be stopped");
+        assert!(completed_error.contains("已验收完成"));
+    }
+
+    #[test]
     fn relay_codex_cycle_enforces_one_cycle_number_per_module() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-a", "模块 A");
@@ -6339,6 +6667,7 @@ pub fn run() {
             send_chatgpt_message,
             create_relay_module,
             accept_relay_module,
+            terminate_relay_module,
             submit_relay_acceptance_feedback,
             list_relay_modules,
             list_relay_messages,
