@@ -71,6 +71,22 @@ nav { display: grid; gap: 9px; }
 .connection-card { display: grid; gap: 15px; }
 .relay-summary { display: grid; gap: 10px; }
 .relay-summary h3, .conversation h3 { margin-bottom: 7px; }
+.global-channel-status, .codex-communication-panel { margin-bottom: 22px; padding: 22px 26px; border: 1px solid #d9e1ec; border-radius: 14px; background: #fff; box-shadow: 0 6px 20px rgba(24, 35, 60, .04); }
+.global-channel-status h3, .codex-communication-panel h3 { margin-bottom: 14px; }
+.global-channel-status-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.channel-card, .channel-status-card { padding: 14px; border: 1px solid #d9e1ec; border-radius: 10px; background: #f8fbff; }
+.channel-card h4, .channel-status-card h4 { margin: 0 0 10px; color: #273c5d; font-size: 14px; }
+.channel-card p, .channel-status-card p { margin: 5px 0; color: #52637d; font-size: 13px; line-height: 1.4; }
+.codex-communication { display: grid; gap: 12px; }
+.codex-cycle-card { margin-top: 12px; padding: 16px; border: 1px solid #d9e1ec; border-radius: 10px; background: #f8fbff; }
+.codex-cycle-card header { margin-bottom: 12px; }
+.codex-cycle-card h4, .codex-cycle-card h5 { margin: 0; color: #273c5d; }
+.codex-cycle-card h5 { margin-bottom: 7px; font-size: 12px; }
+.codex-cycle-card p { margin: 7px 0; color: #52637d; font-size: 13px; line-height: 1.45; }
+.codex-cycle-card section { margin-top: 12px; }
+.codex-cycle-card pre { margin: 0; padding: 10px; border: 1px solid #d9e1ec; border-radius: 8px; overflow-wrap: anywhere; white-space: pre-wrap; background: #fff; color: #273c5d; font: 12px/1.5 ui-monospace, Consolas, monospace; }
+.cycle-progress { color: #196340; font-weight: 800; }
+.cycle-block-reason { color: #7a5b12; }
 .conversation { display: grid; gap: 16px; }
 .message-history { display: grid; gap: 12px; min-height: 250px; max-height: 540px; overflow: auto; padding: 4px; }
 .message { padding: 14px; border: 1px solid #d9e1ec; border-radius: 10px; background: #f8fbff; }

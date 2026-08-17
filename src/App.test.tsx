@@ -10,6 +10,11 @@ let modules = [
   { id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', invalidReplyCount: 0, startedCycles: 0 },
 ];
 let recoveryMessages: Array<{ messageId: string; moduleId: string; moduleName: string; sequenceNumber: number; kind: string; createdAt: string }> = [];
+let codexCycles: RelayCodexCycle[] = [];
+let channelSnapshot: RelayChannelSnapshot = {
+  chatgpt: { status: 'IDLE', recoveryBlockerCount: 0 },
+  codex: { status: 'IDLE' },
+};
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 
@@ -18,6 +23,8 @@ invoke.mockImplementation(async (command: string, args?: { input?: { name: strin
   if (command === 'get_chatgpt_pairing') return { endpoint: 'ws://127.0.0.1:17384', pairingSecret: 'secret', paired: false };
   if (command === 'list_relay_messages') return [];
   if (command === 'list_relay_recovery_messages') return recoveryMessages;
+  if (command === 'list_relay_codex_cycles') return codexCycles;
+  if (command === 'get_relay_channel_snapshot') return channelSnapshot;
   if (command === 'create_relay_module') {
     const input = args?.input;
     if (!input) throw new Error('missing module input');
@@ -37,6 +44,11 @@ describe('传话模块创建入口', () => {
       { id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', invalidReplyCount: 0, startedCycles: 0 },
     ];
     recoveryMessages = [];
+    codexCycles = [];
+    channelSnapshot = {
+      chatgpt: { status: 'IDLE', recoveryBlockerCount: 0 },
+      codex: { status: 'IDLE' },
+    };
     invoke.mockClear();
   });
 
@@ -74,6 +86,39 @@ describe('传话模块创建入口', () => {
     expect(screen.getByText('模块 C · 第 2 条 · 手动')).toBeTruthy();
     expect(screen.getAllByRole('button', { name: '明确重发这条消息' })).toHaveLength(2);
     expect(screen.getAllByRole('button', { name: '不重发并继续' })).toHaveLength(2);
+  });
+
+  it('在独立 Codex 面板展示已完成结果和其他模块的 ChatGPT 占用，不污染 ChatGPT 时间线', async () => {
+    channelSnapshot = {
+      chatgpt: {
+        status: 'IN_FLIGHT',
+        activeModuleId: 'other-module',
+        activeModuleName: '占用模块',
+        activeMessageId: 'other-message-7',
+        activeKind: 'AUTOMATION',
+        activePhase: '等待完成回复',
+        recoveryBlockerCount: 0,
+      },
+      codex: { status: 'IDLE' },
+    };
+    codexCycles = [{
+      ...completedCycle,
+      moduleId: 'existing',
+      blockReason: 'ChatGPT 通道当前被模块「占用模块」占用（消息 other-message-7）。',
+    }];
+
+    const { container } = render(<App />);
+    await screen.findByRole('heading', { name: '原有模块' });
+
+    expect(await screen.findByText('全局通道状态')).toBeTruthy();
+    expect(screen.getByText('ChatGPT 通道：忙碌')).toBeTruthy();
+    expect(screen.getByText('当前占用模块：占用模块')).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Codex 通讯' })).toBeTruthy();
+    expect(screen.getByText('RELAY_E2E_OK')).toBeTruthy();
+    expect(screen.getByText('阻塞原因：ChatGPT 通道当前被模块「占用模块」占用（消息 other-message-7）。')).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '常驻 ChatGPT 对话' })).toBeTruthy();
+    expect(container.querySelector('.message-history')?.textContent).not.toContain('RELAY_E2E_OK');
+    expect(container.querySelector('.message-history')?.textContent).not.toContain('Codex 运行中');
   });
 });
 
