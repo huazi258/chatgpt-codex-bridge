@@ -346,6 +346,16 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
 }
 
 fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String> {
+    let message_ids: Vec<String> = connection
+        .prepare(
+            "SELECT id FROM relay_messages
+             WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+        )
+        .map_err(|error| format!("could not inspect relay delivery state: {error}"))?
+        .query_map([], |row| row.get(0))
+        .map_err(|error| format!("could not read relay delivery state: {error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("could not collect relay delivery state: {error}"))?;
     let affected = connection
         .execute(
             "UPDATE relay_messages SET delivery_state = 'UNKNOWN'
@@ -359,6 +369,14 @@ fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String
              WHERE id IN (SELECT DISTINCT module_id FROM relay_messages WHERE delivery_state = 'UNKNOWN')",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| format!("could not mark relay recovery state: {error}"))?;
+        for message_id in message_ids {
+            sync_codex_cycle_for_chatgpt_message_state(
+                connection,
+                &message_id,
+                "UNKNOWN",
+                Some("应用重启后无法确认 ChatGPT 消息是否已送达；未自动重发。"),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1716,6 +1734,93 @@ fn queue_relay_codex_result_to_chatgpt(
     Ok(message_id)
 }
 
+fn sync_codex_cycle_for_chatgpt_message_state(
+    connection: &Connection,
+    message_id: &str,
+    delivery_state: &str,
+    error_text: Option<&str>,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 回传状态同步事务：{error}"))?;
+    let Some((cycle_id, module_id, current_status)) = transaction
+        .query_row(
+            "SELECT id, module_id, status FROM relay_codex_cycles
+             WHERE outbound_chatgpt_message_id = ?1",
+            [message_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 回传循环：{error}"))?
+    else {
+        return transaction
+            .commit()
+            .map_err(|error| format!("无法提交非 Codex 回传状态同步：{error}"));
+    };
+
+    let (target_status, next_error_text, event_type) = match delivery_state {
+        "QUEUED" => ("WAITING_FOR_CHATGPT", None, None),
+        "SENT" => (
+            "SENDING_TO_CHATGPT",
+            None,
+            Some("CODEX_RESULT_SEND_STARTED"),
+        ),
+        "DELIVERED" => (
+            "DELIVERED_TO_CHATGPT",
+            None,
+            Some("CODEX_RESULT_DELIVERED_TO_CHATGPT"),
+        ),
+        "UNKNOWN" => (
+            "WAITING_FOR_CHATGPT",
+            Some(error_text.unwrap_or("ChatGPT 回传送达结果不确定，等待人工恢复。")),
+            None,
+        ),
+        "FAILED" => (
+            "FAILED",
+            Some(error_text.unwrap_or("用户确认不重发 Codex 回传结果。")),
+            None,
+        ),
+        _ => {
+            return Err(format!(
+                "不支持同步的 ChatGPT 送达状态：`{delivery_state}`。"
+            ))
+        }
+    };
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "UPDATE relay_codex_cycles
+             SET status = ?2, error_text = ?3,
+                 relay_delivered_at = CASE
+                    WHEN ?2 = 'DELIVERED_TO_CHATGPT' AND relay_delivered_at IS NULL THEN ?4
+                    ELSE relay_delivered_at
+                 END,
+                 updated_at = ?4
+             WHERE id = ?1",
+            params![cycle_id, target_status, next_error_text, &now],
+        )
+        .map_err(|error| format!("无法同步 Codex 回传状态：{error}"))?;
+    if current_status != target_status {
+        if let Some(event_type) = event_type {
+            append_relay_event_in_transaction(
+                &transaction,
+                &module_id,
+                event_type,
+                &format!("cycleId={cycle_id}; requestId={message_id}; ChatGPT 回传状态已变为 {delivery_state}。"),
+            )?;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 回传状态同步：{error}"))
+}
+
 fn fail_relay_codex_cycle(
     connection: &Connection,
     cycle_id: &str,
@@ -1992,6 +2097,7 @@ fn claim_next_relay_message_for_dispatch(
         "UPDATE relay_messages SET delivery_state = 'SENT' WHERE id = ?1 AND delivery_state = 'QUEUED'",
         [&message.id],
     ).map_err(|error| format!("无法标记待发送消息：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, &message.id, "SENT", None)?;
     append_relay_event(
         connection,
         &message.module_id,
@@ -2172,6 +2278,7 @@ fn pause_relay_for_uncertain_delivery(
             [message_id],
         )
         .map_err(|error| format!("无法保存 ChatGPT 不确定送达状态：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, message_id, "UNKNOWN", Some(detail))?;
     set_relay_phase(connection, &module_id, "RECOVERY_REQUIRED")?;
     append_relay_event(connection, &module_id, event_type, detail)?;
     Ok(module_id)
@@ -2196,6 +2303,7 @@ fn requeue_unknown_relay_message(
             [message_id],
         )
         .map_err(|error| format!("无法重新排队 ChatGPT 消息：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, message_id, "QUEUED", None)?;
     set_relay_phase_after_recovery(connection, &module_id)?;
     append_relay_event(
         connection,
@@ -2239,18 +2347,21 @@ fn resolve_unknown_relay_message_without_resend(
         .optional()
         .map_err(|error| format!("无法读取待恢复的 ChatGPT 消息：{error}"))?
         .ok_or_else(|| "该消息不是可解除阻塞的不确定传话消息。".to_string())?;
+    let detail =
+        format!("requestId={message_id}; 用户确认不重发该送达结果不确定的消息，并解除其阻塞。");
     connection
         .execute(
             "UPDATE relay_messages SET delivery_state = 'FAILED' WHERE id = ?1",
             [message_id],
         )
         .map_err(|error| format!("无法保存不重发决定：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, message_id, "FAILED", Some(&detail))?;
     set_relay_phase_after_recovery(connection, &module_id)?;
     append_relay_event(
         connection,
         &module_id,
         "CHATGPT_EXPLICIT_CONTINUE_WITHOUT_RESEND",
-        &format!("requestId={message_id}; 用户确认不重发该送达结果不确定的消息，并解除其阻塞。"),
+        &detail,
     )?;
     Ok(module_id)
 }
@@ -2389,6 +2500,7 @@ fn handle_relay_chatgpt_reply(
             "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
             params![outgoing.0, Utc::now().to_rfc3339()],
         ).map_err(|error| format!("无法确认 ChatGPT 消息送达：{error}"))?;
+        sync_codex_cycle_for_chatgpt_message_state(&connection, &outgoing.0, "DELIVERED", None)?;
         append_relay_message(
             &connection,
             &outgoing.1,
@@ -4125,11 +4237,188 @@ mod tests {
     }
 
     #[test]
-    fn adapter_failure_marks_relay_delivery_unknown_without_parsing_or_retrying() {
-        let connection = Connection::open_in_memory().expect("in-memory database");
+    fn codex_cycle_chatgpt_delivery_tracks_fifo_claim_and_matching_reply_once() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start turn");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("persist result");
+        let message_id =
+            queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+
+        let message = match claim_next_relay_message_for_dispatch(&connection)
+            .expect("claim global FIFO message")
+        {
+            RelayDispatchClaim::Message(message) => message,
+            _ => panic!("Codex result should be claimed for dispatch"),
+        };
+        assert_eq!(message.id, message_id);
+        let sending = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read sending cycle")
+            .expect("cycle exists");
+        assert_eq!(sending.status, "SENDING_TO_CHATGPT");
+
         connection
-            .execute_batch(CONVERSATION_RELAY_SCHEMA)
-            .expect("relay schema");
+            .execute(
+                "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
+                params![&message_id, "2026-08-17T00:00:02Z"],
+            )
+            .expect("accept matching chatgptReply");
+        sync_codex_cycle_for_chatgpt_message_state(&connection, &message_id, "DELIVERED", None)
+            .expect("sync matching reply delivery");
+
+        let delivered = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read delivered cycle")
+            .expect("cycle exists");
+        assert_eq!(delivered.status, "DELIVERED_TO_CHATGPT");
+        assert!(delivered.relay_delivered_at.is_some());
+        let send_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events
+                 WHERE module_id = 'module-a' AND event_type = 'CODEX_RESULT_SEND_STARTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count send-start events");
+        let delivered_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events
+                 WHERE module_id = 'module-a' AND event_type = 'CODEX_RESULT_DELIVERED_TO_CHATGPT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count delivered events");
+        assert_eq!(send_events, 1);
+        assert_eq!(delivered_events, 1);
+    }
+
+    #[test]
+    fn codex_cycle_chatgpt_delivery_restart_marks_result_unknown_without_rerunning_codex() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start turn");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("persist result");
+        let message_id =
+            queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim result") {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.id, message_id),
+            _ => panic!("Codex result should be in flight before restart"),
+        }
+
+        mark_uncertain_relay_deliveries(&connection).expect("restart recovery");
+
+        let uncertain = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read uncertain cycle")
+            .expect("cycle exists");
+        assert_eq!(uncertain.status, "WAITING_FOR_CHATGPT");
+        assert_eq!(uncertain.result_text.as_deref(), Some("RELAY_E2E_OK"));
+        assert!(uncertain.error_text.is_some());
+        let outbound_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'module-a' AND direction = 'TO_CHATGPT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count outbound results");
+        let cycle_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = 'module-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count cycles");
+        assert_eq!(outbound_count, 1);
+        assert_eq!(cycle_count, 1);
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection),
+            Ok(RelayDispatchClaim::RecoveryBlocked(1))
+        ));
+    }
+
+    #[test]
+    fn codex_cycle_chatgpt_delivery_explicit_recovery_reuses_or_abandons_the_linked_result() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start turn");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("persist result");
+        let message_id =
+            queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim result") {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.id, message_id),
+            _ => panic!("Codex result should be in flight"),
+        }
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            &message_id,
+            "CHATGPT_TRANSPORT_FAILURE",
+            "transport outcome unknown",
+        )
+        .expect("mark result uncertain");
+
+        requeue_unknown_relay_message(&connection, &message_id).expect("explicit resend");
+        let requeued = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read requeued cycle")
+            .expect("cycle exists");
+        assert_eq!(requeued.status, "WAITING_FOR_CHATGPT");
+        assert_eq!(
+            requeued.outbound_chatgpt_message_id.as_deref(),
+            Some(message_id.as_str())
+        );
+
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim explicit resend") {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.id, message_id),
+            _ => panic!("explicit resend must reuse the original result message"),
+        }
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            &message_id,
+            "CHATGPT_TRANSPORT_FAILURE",
+            "transport outcome unknown again",
+        )
+        .expect("mark retried result uncertain");
+        resolve_unknown_relay_message_without_resend(&connection, &message_id)
+            .expect("explicitly continue without resending");
+
+        let failed = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read failed cycle")
+            .expect("cycle exists");
+        assert_eq!(failed.status, "FAILED");
+        assert_eq!(failed.result_text.as_deref(), Some("RELAY_E2E_OK"));
+        let outbound_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'module-a' AND direction = 'TO_CHATGPT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count outbound results");
+        assert_eq!(
+            outbound_count, 1,
+            "continue without resend must not allocate a replacement"
+        );
+        let message_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .expect("read original message state");
+        assert_eq!(message_state, "FAILED");
+    }
+
+    #[test]
+    fn adapter_failure_marks_relay_delivery_unknown_without_parsing_or_retrying() {
+        let connection = relay_connection();
         let now = "2026-08-17T00:00:00Z";
         connection.execute(
             "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
@@ -4177,10 +4466,7 @@ mod tests {
 
     #[test]
     fn unknown_relay_delivery_only_requeues_after_an_explicit_user_action() {
-        let connection = Connection::open_in_memory().expect("in-memory database");
-        connection
-            .execute_batch(CONVERSATION_RELAY_SCHEMA)
-            .expect("relay schema");
+        let connection = relay_connection();
         let now = "2026-08-17T00:00:00Z";
         connection.execute(
             "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
@@ -4311,10 +4597,7 @@ mod tests {
 
     #[test]
     fn restart_marks_sent_relay_messages_unknown_without_requeueing_them() {
-        let connection = Connection::open_in_memory().expect("in-memory database");
-        connection
-            .execute_batch(CONVERSATION_RELAY_SCHEMA)
-            .expect("relay schema");
+        let connection = relay_connection();
         let now = "2026-08-17T00:00:00Z";
         connection.execute(
             "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
