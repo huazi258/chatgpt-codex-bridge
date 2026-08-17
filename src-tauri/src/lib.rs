@@ -2335,9 +2335,14 @@ fn next_queued_relay_message(
     connection: &Connection,
 ) -> Result<Option<RelayMessageRecord>, String> {
     connection.query_row(
-        "SELECT id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at
-         FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
-         ORDER BY created_at ASC, id ASC LIMIT 1",
+        "SELECT message.id, message.module_id, message.sequence_number, message.direction,
+                message.kind, message.text, message.delivery_state, message.created_at, message.delivered_at
+         FROM relay_messages AS message
+         JOIN relay_modules AS module ON module.id = message.module_id
+         WHERE message.direction = 'TO_CHATGPT'
+           AND message.delivery_state = 'QUEUED'
+           AND module.phase NOT IN ('COMPLETED', 'STOPPED')
+         ORDER BY message.created_at ASC, message.id ASC LIMIT 1",
         [], relay_message_row,
     ).optional().map_err(|error| format!("无法读取待发送消息：{error}"))
 }
@@ -2479,25 +2484,35 @@ fn queue_relay_message(
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let module = get_relay_module(&connection, &module_id)?
-            .ok_or_else(|| "传话模块不存在。".to_string())?;
-        if matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
-            return Err("模块已经结束，不能再发送消息。".into());
-        }
-        let now = Utc::now().to_rfc3339();
-        connection.execute(
-            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at)
-             VALUES (?1, ?2, ?3, 'TO_CHATGPT', ?4, ?5, 'QUEUED', ?6, NULL)",
-            params![Uuid::new_v4().to_string(), module_id, next_relay_sequence(&connection, &module_id)?, kind.as_db(), text.trim(), now],
-        ).map_err(|error| format!("无法将消息加入队列：{error}"))?;
-        append_relay_event(
-            &connection,
-            &module_id,
-            "CHATGPT_MESSAGE_QUEUED",
-            "已加入 ChatGPT 发送队列。",
-        )?;
+        queue_relay_message_in(&connection, &module_id, kind, &text)?;
     }
     dispatch_next_relay_message(&app, &state)
+}
+
+fn queue_relay_message_in(
+    connection: &Connection,
+    module_id: &str,
+    kind: RelayMessageKind,
+    text: &str,
+) -> Result<(), String> {
+    let module = get_relay_module(connection, module_id)?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+        return Err("模块已经结束，不能再发送消息。".into());
+    }
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at)
+         VALUES (?1, ?2, ?3, 'TO_CHATGPT', ?4, ?5, 'QUEUED', ?6, NULL)",
+        params![Uuid::new_v4().to_string(), module_id, next_relay_sequence(connection, module_id)?, kind.as_db(), text.trim(), now],
+    ).map_err(|error| format!("无法将消息加入队列：{error}"))?;
+    append_relay_event(
+        connection,
+        module_id,
+        "CHATGPT_MESSAGE_QUEUED",
+        "已加入 ChatGPT 发送队列。",
+    )?;
+    Ok(())
 }
 
 fn append_relay_message(
@@ -2584,6 +2599,18 @@ fn requeue_unknown_relay_message(
 }
 
 fn set_relay_phase_after_recovery(connection: &Connection, module_id: &str) -> Result<(), String> {
+    let phase: String = connection
+        .query_row(
+            "SELECT phase FROM relay_modules WHERE id = ?1",
+            [module_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取模块恢复状态：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if matches!(phase.as_str(), "STOPPED" | "COMPLETED") {
+        return Ok(());
+    }
     let remaining: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM relay_messages
@@ -4304,6 +4331,147 @@ mod tests {
                 "2026-08-17T00:00:00Z"
             ],
         )
+    }
+
+    #[test]
+    fn terminal_relay_modules_are_skipped_without_changing_active_global_fifo() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+        insert_relay_module(&connection, "module-active-a", "活动模块 A");
+        insert_relay_module(&connection, "module-active-b", "活动模块 B");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("mark stopped");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("mark completed");
+        insert_relay_message(
+            &connection,
+            "terminal-stopped",
+            "module-stopped",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:01Z",
+        );
+        insert_relay_message(
+            &connection,
+            "terminal-completed",
+            "module-completed",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:02Z",
+        );
+        insert_relay_message(
+            &connection,
+            "active-first",
+            "module-active-a",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:03Z",
+        );
+        insert_relay_message(
+            &connection,
+            "active-second",
+            "module-active-b",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:04Z",
+        );
+
+        let claimed = match claim_next_relay_message_for_dispatch(&connection)
+            .expect("claim next active message")
+        {
+            RelayDispatchClaim::Message(message) => message,
+            _ => panic!("an active queued message should be selected"),
+        };
+
+        assert_eq!(claimed.id, "active-first");
+        let terminal_states: Vec<String> = ["terminal-stopped", "terminal-completed"]
+            .iter()
+            .map(|id| {
+                connection
+                    .query_row(
+                        "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .expect("terminal message state")
+            })
+            .collect();
+        assert_eq!(terminal_states, ["QUEUED", "QUEUED"]);
+    }
+
+    #[test]
+    fn terminal_relay_modules_reject_new_queue_messages() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("mark stopped");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("mark completed");
+
+        for module_id in ["module-stopped", "module-completed"] {
+            let error = queue_relay_message_in(
+                &connection,
+                module_id,
+                RelayMessageKind::Manual,
+                "不得发送到终态模块",
+            )
+            .expect_err("terminal modules must reject new queue messages");
+            assert_eq!(error, "模块已经结束，不能再发送消息。");
+        }
+        let queued_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM relay_messages", [], |row| row.get(0))
+            .expect("queued count");
+        assert_eq!(queued_count, 0);
+    }
+
+    #[test]
+    fn terminal_relay_recovery_never_resets_phase_to_ready() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("mark completed");
+        insert_relay_message(
+            &connection,
+            "unknown-terminal",
+            "module-completed",
+            1,
+            "UNKNOWN",
+            "2026-08-17T00:00:01Z",
+        );
+
+        resolve_unknown_relay_message_without_resend(&connection, "unknown-terminal")
+            .expect("explicitly resolve legacy unknown message");
+
+        let phase: String = connection
+            .query_row(
+                "SELECT phase FROM relay_modules WHERE id = 'module-completed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal phase");
+        assert_eq!(phase, "COMPLETED");
     }
 
     #[test]
