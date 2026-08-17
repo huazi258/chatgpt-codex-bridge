@@ -206,6 +206,23 @@ fn clear_relay_codex_session_if_matches(
     }
 }
 
+fn mark_relay_codex_session_turn_inactive(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    module_id: &str,
+) -> bool {
+    let Ok(sessions) = sessions.lock() else {
+        return false;
+    };
+    let Some(session) = sessions.as_ref() else {
+        return false;
+    };
+    if session.module_id != module_id {
+        return false;
+    }
+    session.turn_active.store(false, Ordering::SeqCst);
+    true
+}
+
 fn release_relay_codex_runtime(app: &AppHandle, module_id: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
     release_relay_codex_session(
@@ -1767,6 +1784,19 @@ fn relay_codex_cycle_block_reason(
     cycle: &RelayCodexCycleRecord,
     snapshot: &RelayChannelSnapshot,
 ) -> Result<Option<String>, String> {
+    if cycle.status == "CODEX_COMPLETED" && cycle.outbound_chatgpt_message_id.is_none() {
+        let phase = connection
+            .query_row(
+                "SELECT phase FROM relay_modules WHERE id = ?1",
+                [&cycle.module_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取 Codex 通讯模块状态：{error}"))?;
+        if phase.as_deref() == Some("STOPPED") {
+            return Ok(Some("模块已由用户终止，结果未回传 ChatGPT".into()));
+        }
+    }
     if cycle.status == "FAILED" {
         return Ok(cycle.error_text.clone());
     }
@@ -2233,7 +2263,15 @@ enum RelayModuleAcceptance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayModuleTermination {
     Stopped,
+    StopRequested,
     AlreadyStopped,
+    AlreadyStopRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCodexTurnCompletion {
+    ReturnedToChatGpt,
+    StoppedAfterTurn,
 }
 
 fn accept_relay_module_in(
@@ -2345,6 +2383,14 @@ fn terminate_relay_module_in(
     connection: &Connection,
     module_id: &str,
 ) -> Result<RelayModuleTermination, String> {
+    terminate_relay_module_with_active_turn_in(connection, module_id, false)
+}
+
+fn terminate_relay_module_with_active_turn_in(
+    connection: &Connection,
+    module_id: &str,
+    has_active_turn: bool,
+) -> Result<RelayModuleTermination, String> {
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| format!("无法开始终止模块事务：{error}"))?;
@@ -2369,7 +2415,10 @@ fn terminate_relay_module_in(
         return Err("模块已验收完成，不能终止。".into());
     }
     if module.stop_after_turn {
-        return Err("模块正在终止，等待当前 Codex 回合结束。".into());
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交重复终止模块事务：{error}"))?;
+        return Ok(RelayModuleTermination::AlreadyStopRequested);
     }
 
     let unknown_count: i64 = transaction
@@ -2391,10 +2440,6 @@ fn terminate_relay_module_in(
             |row| row.get(0),
         )
         .map_err(|error| format!("无法检查 Codex 回合状态：{error}"))?;
-    if running_cycle_count > 0 {
-        return Err("当前 Codex 回合仍在运行，不能立即终止模块。".into());
-    }
-
     let queued_message_ids = {
         let mut statement = transaction
             .prepare(
@@ -2425,24 +2470,41 @@ fn terminate_relay_module_in(
             &format!("requestId={message_id}; 模块已由用户终止，消息未发送。"),
         )?;
     }
-    transaction
-        .execute(
-            "UPDATE relay_modules
-             SET phase = 'STOPPED', stop_after_turn = 0, updated_at = ?2
-             WHERE id = ?1",
-            params![module_id, Utc::now().to_rfc3339()],
-        )
-        .map_err(|error| format!("无法终止传话模块：{error}"))?;
-    append_relay_event_in_transaction(
-        &transaction,
-        module_id,
-        "MODULE_TERMINATED",
-        "用户已终止模块。",
-    )?;
+    let outcome = if running_cycle_count > 0 || has_active_turn {
+        transaction
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 1, updated_at = ?2 WHERE id = ?1",
+                params![module_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| format!("无法记录终止请求：{error}"))?;
+        append_relay_event_in_transaction(
+            &transaction,
+            module_id,
+            "MODULE_STOP_REQUESTED",
+            "用户已请求在当前 Codex 回合自然结束后终止模块。",
+        )?;
+        RelayModuleTermination::StopRequested
+    } else {
+        transaction
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'STOPPED', stop_after_turn = 0, updated_at = ?2
+                 WHERE id = ?1",
+                params![module_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| format!("无法终止传话模块：{error}"))?;
+        append_relay_event_in_transaction(
+            &transaction,
+            module_id,
+            "MODULE_TERMINATED",
+            "用户已终止模块。",
+        )?;
+        RelayModuleTermination::Stopped
+    };
     transaction
         .commit()
         .map_err(|error| format!("无法提交终止模块事务：{error}"))?;
-    Ok(RelayModuleTermination::Stopped)
+    Ok(outcome)
 }
 
 fn submit_relay_acceptance_feedback_in(
@@ -2525,6 +2587,31 @@ fn relay_codex_turn_is_active_for_module(state: &AppState, module_id: &str) -> R
     }))
 }
 
+fn finalize_relay_module_stop_after_turn_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<bool, String> {
+    let changed = connection
+        .execute(
+            "UPDATE relay_modules
+             SET phase = 'STOPPED', stop_after_turn = 0, updated_at = ?2
+             WHERE id = ?1 AND stop_after_turn = 1 AND phase NOT IN ('COMPLETED', 'STOPPED')",
+            params![module_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法完成终止中的传话模块：{error}"))?;
+    Ok(changed > 0)
+}
+
+fn relay_codex_start_block_reason(module: &RelayModuleRecord) -> Option<&'static str> {
+    if module.stop_after_turn {
+        Some("模块正在终止，不能启动新的 Codex 回合。")
+    } else if matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+        Some("模块已经结束，不能启动新的 Codex 回合。")
+    } else {
+        None
+    }
+}
+
 #[tauri::command]
 fn accept_relay_module(
     app: AppHandle,
@@ -2591,17 +2678,30 @@ fn terminate_relay_module(
     state: State<'_, AppState>,
     module_id: String,
 ) -> Result<(), String> {
-    if relay_codex_turn_is_active_for_module(&state, &module_id)? {
-        return Err("当前 Codex 回合仍在运行，不能立即终止模块。".into());
-    }
+    let has_active_turn = relay_codex_turn_is_active_for_module(&state, &module_id)?;
     let outcome = {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        terminate_relay_module_in(&connection, &module_id)?
+        if has_active_turn {
+            terminate_relay_module_with_active_turn_in(&connection, &module_id, true)?
+        } else {
+            terminate_relay_module_in(&connection, &module_id)?
+        }
     };
-    if outcome == RelayModuleTermination::AlreadyStopped {
+    if matches!(
+        outcome,
+        RelayModuleTermination::AlreadyStopped | RelayModuleTermination::AlreadyStopRequested
+    ) {
+        return Ok(());
+    }
+    if outcome == RelayModuleTermination::StopRequested {
+        let _ = app.emit(
+            "relay-control",
+            json!({ "type": "MODULE_STOP_REQUESTED", "moduleId": module_id }),
+        );
+        emit_relay_codex_changed(&app, &module_id, "", "CODEX_RUNNING");
         return Ok(());
     }
 
@@ -3548,6 +3648,11 @@ fn start_or_continue_relay_codex_turn(
             .map_err(|_| "数据库锁已损坏。".to_string())?;
         let module = get_relay_module(&connection, module_id)?
             .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if let Some(reason) = relay_codex_start_block_reason(&module) {
+            fail_relay_codex_cycle(&connection, cycle_id, reason)?;
+            emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
+            return Err(reason.into());
+        }
         if module.started_cycles >= module.max_cycles {
             set_relay_phase(&connection, module_id, "WAITING_FOR_ACCEPTANCE")?;
             append_relay_event(
@@ -3937,7 +4042,26 @@ fn relay_codex_worker(
         .map(|_| ())
         .map_err(|error| format!("无法结束 Codex 对话：{error}"));
     let state = app.state::<AppState>();
-    clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
+    let cleared_session = clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
+    if release_acknowledgement.is_none() && cleared_session {
+        if let Ok(connection) = state.connection.lock() {
+            let stopped = connection
+                .query_row(
+                    "SELECT phase = 'STOPPED' FROM relay_modules WHERE id = ?1",
+                    [&module_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+            if stopped {
+                let _ = append_relay_event(
+                    &connection,
+                    &module_id,
+                    "CODEX_THREAD_RELEASED",
+                    "模块已终止，Codex 对话已在当前回合收尾后释放。",
+                );
+            }
+        }
+    }
     if let Some(acknowledgement) = release_acknowledgement {
         let _ = acknowledgement.send(release_result);
     }
@@ -3994,39 +4118,87 @@ fn relay_codex_turn_started(
     Ok(())
 }
 
-fn relay_codex_turn_completed(app: &AppHandle, module_id: &str, cycle_id: &str, summary: &str) {
-    let state = app.state::<AppState>();
+fn complete_relay_codex_turn_in(
+    connection: &Connection,
+    module_id: &str,
+    cycle_id: &str,
+    summary: &str,
+) -> Result<RelayCodexTurnCompletion, String> {
     let summary = if summary.is_empty() {
         "Codex 回合已完成，但没有返回文字。"
     } else {
         summary
     };
-    let result = (|| -> Result<bool, String> {
+    let already_received = get_relay_codex_cycle_by_id(connection, cycle_id)?
+        .ok_or_else(|| "Codex 通讯循环不存在。".to_string())?
+        .result_text
+        .is_some();
+    mark_relay_codex_result_received(connection, cycle_id, summary)?;
+    if !already_received {
+        append_relay_message(
+            connection,
+            module_id,
+            "FROM_CODEX",
+            "AUTOMATION",
+            summary,
+            "DELIVERED",
+        )?;
+    }
+    let module = get_relay_module(connection, module_id)?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.stop_after_turn {
+        if !finalize_relay_module_stop_after_turn_in(connection, module_id)? {
+            return Err("终止中的传话模块状态已被并发更新。".into());
+        }
+        return Ok(RelayCodexTurnCompletion::StoppedAfterTurn);
+    }
+    if module.phase == "STOPPED" {
+        return Ok(RelayCodexTurnCompletion::StoppedAfterTurn);
+    }
+    if module.phase == "COMPLETED" {
+        return Err("模块已验收完成，不能回传 Codex 结果。".into());
+    }
+    queue_relay_codex_result_to_chatgpt(connection, cycle_id)?;
+    set_relay_phase(connection, module_id, "READY")?;
+    Ok(RelayCodexTurnCompletion::ReturnedToChatGpt)
+}
+
+fn finish_stopped_relay_codex_runtime(app: AppHandle, module_id: String, cycle_id: String) {
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        let release_result = release_relay_codex_runtime(&app, &module_id);
+        if let Ok(connection) = state.connection.lock() {
+            let (event_type, detail) = match release_result {
+                Ok(()) => (
+                    "CODEX_THREAD_RELEASED",
+                    "模块已终止，当前 Codex 回合结束后已释放 Codex 对话。".to_string(),
+                ),
+                Err(error) => (
+                    "CODEX_THREAD_RELEASE_FAILED",
+                    format!("模块已终止，但 Codex 对话释放失败：{error}"),
+                ),
+            };
+            let _ = append_relay_event(&connection, &module_id, event_type, &detail);
+        }
+        emit_relay_codex_changed(&app, &module_id, &cycle_id, "STOPPED");
+        let _ = app.emit(
+            "relay-control",
+            json!({ "type": "MODULE_TERMINATED", "moduleId": module_id }),
+        );
+    });
+}
+
+fn relay_codex_turn_completed(app: &AppHandle, module_id: &str, cycle_id: &str, summary: &str) {
+    let state = app.state::<AppState>();
+    let result = (|| -> Result<RelayCodexTurnCompletion, String> {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let already_received = get_relay_codex_cycle_by_id(&connection, cycle_id)?
-            .ok_or_else(|| "Codex 通讯循环不存在。".to_string())?
-            .result_text
-            .is_some();
-        mark_relay_codex_result_received(&connection, cycle_id, summary)?;
-        if !already_received {
-            append_relay_message(
-                &connection,
-                module_id,
-                "FROM_CODEX",
-                "AUTOMATION",
-                summary,
-                "DELIVERED",
-            )?;
-        }
-        queue_relay_codex_result_to_chatgpt(&connection, cycle_id)?;
-        set_relay_phase(&connection, module_id, "READY")?;
-        Ok(!already_received)
+        complete_relay_codex_turn_in(&connection, module_id, cycle_id, summary)
     })();
     match result {
-        Ok(_) => {
+        Ok(RelayCodexTurnCompletion::ReturnedToChatGpt) => {
             emit_relay_codex_changed(app, module_id, cycle_id, "CODEX_COMPLETED");
             emit_relay_codex_changed(app, module_id, cycle_id, "WAITING_FOR_CHATGPT");
             let _ = app.emit(
@@ -4035,21 +4207,52 @@ fn relay_codex_turn_completed(app: &AppHandle, module_id: &str, cycle_id: &str, 
             );
             let _ = dispatch_next_relay_message(app, &state);
         }
+        Ok(RelayCodexTurnCompletion::StoppedAfterTurn) => {
+            emit_relay_codex_changed(app, module_id, cycle_id, "CODEX_COMPLETED");
+            let _ = app.emit(
+                "relay-codex-status",
+                json!({ "phase": "CODEX_COMPLETED", "moduleId": module_id, "cycleId": cycle_id }),
+            );
+            finish_stopped_relay_codex_runtime(
+                app.clone(),
+                module_id.to_string(),
+                cycle_id.to_string(),
+            );
+        }
         Err(error) => relay_codex_failed(app, module_id, Some(cycle_id), error),
     }
 }
 
 fn relay_codex_failed(app: &AppHandle, module_id: &str, cycle_id: Option<&str>, reason: String) {
     let state = app.state::<AppState>();
+    let mut stopped_after_turn = false;
     if let Ok(connection) = state.connection.lock() {
         if let Some(cycle_id) = cycle_id {
             let _ = fail_relay_codex_cycle(&connection, cycle_id, &reason);
             emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
         }
-        let _ = set_relay_phase(&connection, module_id, "BLOCKED");
+        let stop_requested = get_relay_module(&connection, module_id)
+            .ok()
+            .flatten()
+            .is_some_and(|module| module.stop_after_turn);
+        if stop_requested {
+            stopped_after_turn = finalize_relay_module_stop_after_turn_in(&connection, module_id)
+                .unwrap_or(false);
+        } else {
+            let _ = set_relay_phase(&connection, module_id, "BLOCKED");
+        }
         let _ = append_relay_event(&connection, module_id, "CODEX_FAILED", &reason);
     }
-    clear_relay_codex_session_if_matches(&state.relay_codex, module_id);
+    if !stopped_after_turn {
+        clear_relay_codex_session_if_matches(&state.relay_codex, module_id);
+    } else {
+        mark_relay_codex_session_turn_inactive(&state.relay_codex, module_id);
+        finish_stopped_relay_codex_runtime(
+            app.clone(),
+            module_id.to_string(),
+            cycle_id.unwrap_or_default().to_string(),
+        );
+    }
     let _ = app.emit(
         "relay-control",
         json!({ "type": "ERROR", "reason": reason }),
@@ -4981,6 +5184,31 @@ mod tests {
     }
 
     #[test]
+    fn terminate_running_relay_codex_failure_makes_the_matching_session_releasable() {
+        let (sender, receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+
+        assert!(mark_relay_codex_session_turn_inactive(&sessions, "module-a"));
+        let worker = std::thread::spawn(move || match receiver.recv().expect("release command") {
+            RelayCodexCommand::Release { acknowledgement } => acknowledgement
+                .send(Ok(()))
+                .expect("acknowledge failed-turn release"),
+            RelayCodexCommand::StartTurn { .. } => panic!("failed turn must only schedule release"),
+        });
+        release_relay_codex_session(
+            &sessions,
+            "module-a",
+            std::time::Duration::from_millis(100),
+        )
+        .expect("failed turn session is releasable after turn activity is cleared");
+        worker.join().expect("release worker joins");
+    }
+
+    #[test]
     fn terminal_relay_modules_are_skipped_without_changing_active_global_fifo() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-stopped", "已终止模块");
@@ -5630,9 +5858,11 @@ mod tests {
                 [],
             )
             .expect("mark running cycle");
-        let running_error = terminate_relay_module_in(&connection, "module-running")
-            .expect_err("Task 5 must not terminate a running Codex turn");
-        assert!(running_error.contains("当前 Codex 回合仍在运行"));
+        assert_eq!(
+            terminate_relay_module_in(&connection, "module-running")
+                .expect("Task 6 records a stop request for a running Codex turn"),
+            RelayModuleTermination::StopRequested
+        );
 
         insert_relay_module(&connection, "module-completed", "已完成模块");
         connection
@@ -5644,6 +5874,248 @@ mod tests {
         let completed_error = terminate_relay_module_in(&connection, "module-completed")
             .expect_err("completed module cannot be stopped");
         assert!(completed_error.contains("已验收完成"));
+    }
+
+    #[test]
+    fn terminate_running_relay_codex_persists_stop_intent_and_finishes_without_returning_result() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-running", "运行模块");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'CODEX_RUNNING', codex_thread_id = 'thread-kept'
+                 WHERE id = 'module-running'",
+                [],
+            )
+            .expect("mark module running");
+        insert_relay_message(
+            &connection,
+            "queued-before-stop",
+            "module-running",
+            1,
+            "QUEUED",
+            "2026-08-18T00:00:00Z",
+        );
+        insert_relay_codex_cycle(&connection, "cycle-running", "module-running", 1, None)
+            .expect("insert running cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-running'",
+                [],
+            )
+            .expect("mark cycle running");
+
+        assert_eq!(
+            terminate_relay_module_in(&connection, "module-running")
+                .expect("running turn accepts a stop request"),
+            RelayModuleTermination::StopRequested
+        );
+        let stop_requested: (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT phase, stop_after_turn, codex_thread_id
+                 FROM relay_modules WHERE id = 'module-running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after stop request");
+        assert_eq!(stop_requested.0, "CODEX_RUNNING");
+        assert_eq!(stop_requested.1, 1);
+        assert_eq!(stop_requested.2.as_deref(), Some("thread-kept"));
+        let queued_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = 'queued-before-stop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("queued message state");
+        assert_eq!(queued_state, "FAILED");
+        let stop_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events
+                 WHERE module_id = 'module-running' AND event_type = 'MODULE_STOP_REQUESTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stop request count");
+        assert_eq!(stop_events, 1);
+        assert!(matches!(
+            terminate_relay_module_in(&connection, "module-running"),
+            Ok(RelayModuleTermination::AlreadyStopRequested)
+        ));
+
+        assert_eq!(
+            complete_relay_codex_turn_in(
+                &connection,
+                "module-running",
+                "cycle-running",
+                "最终结果仍需保留。",
+            )
+            .expect("running turn may naturally complete after termination"),
+            RelayCodexTurnCompletion::StoppedAfterTurn
+        );
+        let stopped: (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT phase, stop_after_turn, codex_thread_id
+                 FROM relay_modules WHERE id = 'module-running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("stopped module");
+        assert_eq!(stopped.0, "STOPPED");
+        assert_eq!(stopped.1, 0);
+        assert_eq!(stopped.2.as_deref(), Some("thread-kept"));
+        let cycle: (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, result_text, outbound_chatgpt_message_id
+                 FROM relay_codex_cycles WHERE id = 'cycle-running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("completed cycle");
+        assert_eq!(cycle.0, "CODEX_COMPLETED");
+        assert_eq!(cycle.1.as_deref(), Some("最终结果仍需保留。"));
+        assert!(cycle.2.is_none());
+        let from_codex_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = 'module-running' AND direction = 'FROM_CODEX'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("saved final text count");
+        let outbound_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = 'module-running' AND direction = 'TO_CHATGPT'
+                   AND id != 'queued-before-stop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("result outbound count");
+        assert_eq!(from_codex_count, 1);
+        assert_eq!(outbound_count, 0);
+    }
+
+    #[test]
+    fn terminate_running_relay_codex_finishes_once_and_keeps_stop_semantics_for_failure() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-complete", "完成竞态模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'CODEX_RUNNING', stop_after_turn = 1
+                 WHERE id = 'module-complete'",
+                [],
+            )
+            .expect("prepare completion stop request");
+        insert_relay_codex_cycle(&connection, "cycle-complete", "module-complete", 1, None)
+            .expect("insert completion cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-complete'",
+                [],
+            )
+            .expect("mark completion cycle running");
+
+        for _ in 0..2 {
+            assert_eq!(
+                complete_relay_codex_turn_in(
+                    &connection,
+                    "module-complete",
+                    "cycle-complete",
+                    "同一份最终结果。",
+                )
+                .expect("completion interleaving remains idempotent"),
+                RelayCodexTurnCompletion::StoppedAfterTurn
+            );
+        }
+        let final_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = 'module-complete' AND direction = 'FROM_CODEX'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("one final history row");
+        assert_eq!(final_rows, 1);
+
+        insert_relay_module(&connection, "module-failed", "失败收尾模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'CODEX_RUNNING', stop_after_turn = 1
+                 WHERE id = 'module-failed'",
+                [],
+            )
+            .expect("prepare failed stop request");
+        insert_relay_codex_cycle(&connection, "cycle-failed", "module-failed", 1, None)
+            .expect("insert failure cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-failed'",
+                [],
+            )
+            .expect("mark failure cycle running");
+        fail_relay_codex_cycle(&connection, "cycle-failed", "App Server 失败")
+            .expect("record actual failure");
+        assert!(
+            finalize_relay_module_stop_after_turn_in(&connection, "module-failed")
+                .expect("finish stop after actual failure")
+        );
+        let failed: (String, String, i64) = connection
+            .query_row(
+                "SELECT module.phase, cycle.status, module.stop_after_turn
+                 FROM relay_modules AS module
+                 JOIN relay_codex_cycles AS cycle ON cycle.module_id = module.id
+                 WHERE module.id = 'module-failed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("failed stop result");
+        assert_eq!(failed, ("STOPPED".into(), "FAILED".into(), 0));
+
+        insert_relay_module(&connection, "module-no-new-turn", "禁止新回合模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 1 WHERE id = 'module-no-new-turn'",
+                [],
+            )
+            .expect("prepare stop requested module");
+        let module = get_relay_module(&connection, "module-no-new-turn")
+            .expect("read module")
+            .expect("module exists");
+        assert_eq!(
+            relay_codex_start_block_reason(&module),
+            Some("模块正在终止，不能启动新的 Codex 回合。")
+        );
+    }
+
+    #[test]
+    fn terminate_running_relay_codex_exposes_completed_result_without_chatgpt_return() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("stop module");
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None)
+            .expect("insert cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles
+                 SET status = 'CODEX_COMPLETED', result_text = '已完成', codex_completed_at = '2026-08-18T00:00:00Z'
+                 WHERE id = 'cycle-a'",
+                [],
+            )
+            .expect("complete cycle without outbound");
+
+        let cycles = list_relay_codex_cycles_in(&connection, "module-a")
+            .expect("list stopped module cycles");
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(
+            cycles[0].block_reason.as_deref(),
+            Some("模块已由用户终止，结果未回传 ChatGPT")
+        );
     }
 
     #[test]
