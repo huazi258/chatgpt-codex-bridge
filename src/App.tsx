@@ -3,6 +3,8 @@ import { listen } from '@tauri-apps/api/event';
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { CodexCommunicationPanel } from './components/CodexCommunicationPanel';
 import { GlobalChannelStatus } from './components/GlobalChannelStatus';
+import { RelayAcceptancePanel } from './components/RelayAcceptancePanel';
+import { RelayModuleActions } from './components/RelayModuleActions';
 import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
 
 type RelayKind = 'MANUAL' | 'AUTOMATION';
@@ -12,6 +14,7 @@ interface BridgeStatus { phase: string; detail: string; }
 interface RelayModule {
   id: string; name: string; workingDirectory: string; maxCycles: number; maxRuntimeMinutes: number;
   retryTemplate: string; phase: string; codexThreadId?: string; invalidReplyCount: number; startedCycles: number;
+  stopAfterTurn: boolean;
 }
 interface RelayMessage {
   id: string; sequenceNumber: number; direction: 'TO_CHATGPT' | 'FROM_CHATGPT' | 'TO_CODEX' | 'FROM_CODEX';
@@ -22,6 +25,7 @@ interface RelayRecoveryMessage {
 }
 
 const defaultRetry = '请根据既定格式，在回复最后且仅输出一个有效控制块：@@@CODEX_PROMPT@@@、@@@MODULE_DONE@@@、@@@BLOCKED@@@ 或正在等待输入时的 @@@CODEX_INPUT@@@。';
+const terminalPhases = new Set(['COMPLETED', 'STOPPED']);
 
 export default function App() {
   const [modules, setModules] = useState<RelayModule[]>([]);
@@ -147,6 +151,76 @@ export default function App() {
     } catch (error) { setNotice(`无法解除不确定消息阻塞：${String(error)}`); } finally { setBusy(false); }
   }
 
+  async function refreshAfterModuleAction(moduleId: string) {
+    await Promise.all([
+      refreshModules(undefined, false),
+      refreshMessages(moduleId),
+      refreshRecoveryMessages(),
+      refreshCodexCycles(moduleId),
+      refreshChannelSnapshot(),
+    ]);
+  }
+
+  async function acceptSelectedModule() {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      await invoke('accept_relay_module', { moduleId: selected.id });
+      setNotice('模块已验收完成。');
+    } catch (error) {
+      const detail = String(error);
+      setNotice(`验收模块失败：${detail}`);
+      throw error;
+    } finally {
+      try {
+        await refreshAfterModuleAction(selected.id);
+      } catch (error) {
+        setNotice(`无法刷新模块状态：${String(error)}`);
+      }
+      setBusy(false);
+    }
+  }
+
+  async function submitAcceptanceFeedback(text: string) {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      await invoke('submit_relay_acceptance_feedback', { moduleId: selected.id, text });
+      setNotice('验收反馈已进入 ChatGPT 自动化队列。');
+    } catch (error) {
+      const detail = String(error);
+      setNotice(`提交验收反馈失败：${detail}`);
+      throw error;
+    } finally {
+      try {
+        await refreshAfterModuleAction(selected.id);
+      } catch (error) {
+        setNotice(`无法刷新模块状态：${String(error)}`);
+      }
+      setBusy(false);
+    }
+  }
+
+  async function terminateSelectedModule() {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      await invoke('terminate_relay_module', { moduleId: selected.id });
+      setNotice('已请求终止模块。');
+    } catch (error) {
+      const detail = String(error);
+      setNotice(`终止模块失败：${detail}`);
+      throw error;
+    } finally {
+      try {
+        await refreshAfterModuleAction(selected.id);
+      } catch (error) {
+        setNotice(`无法刷新模块状态：${String(error)}`);
+      }
+      setBusy(false);
+    }
+  }
+
   return <main className="shell relay-shell">
     <aside className="sidebar">
       <div><p className="eyebrow">CONVERSATION RELAY V2</p><h1>传话模块</h1><p className="muted">一个模块对应一个 ChatGPT 对话和一个由中间件持有的 Codex 对话。</p></div>
@@ -161,8 +235,12 @@ export default function App() {
       {!selected ? <form className="form-section" onSubmit={createModule}><h3>新建模块</h3><label>模块名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="例如：中间件 V2 实现" /></label><label>Codex 工作目录<input value={draft.workingDirectory} onChange={(event) => setDraft({ ...draft, workingDirectory: event.target.value })} placeholder="G:\\projects\\your-project" /></label><div className="budget-grid"><label>最大自动循环次数<input inputMode="numeric" value={draft.maxCycles} onChange={(event) => setDraft({ ...draft, maxCycles: event.target.value })} /></label><label>模块最长时间（分钟）<input inputMode="numeric" value={draft.maxRuntimeMinutes} onChange={(event) => setDraft({ ...draft, maxRuntimeMinutes: event.target.value })} /></label></div><label>协议重试模板<textarea rows={3} value={draft.retryTemplate} onChange={(event) => setDraft({ ...draft, retryTemplate: event.target.value })} /></label><button className="primary" disabled={busy} type="submit">创建传话模块</button></form> : <>
         <GlobalChannelStatus snapshot={channelSnapshot} />
         <section className="form-section relay-summary"><div><h3>模块状态</h3><p className="execution-status">工作目录：{selected.workingDirectory}</p></div><p className="execution-status">已开始循环：{selected.startedCycles} / {selected.maxCycles} · 最长运行：{selected.maxRuntimeMinutes} 分钟 · 无效自动化回复：{selected.invalidReplyCount}</p>{selected.codexThreadId ? <p className="protocol-result">Codex 对话：{selected.codexThreadId}</p> : <p className="execution-status">首个有效 CODEX_PROMPT 到来后才会创建 Codex 对话。</p>}</section>
+        {selected.phase === 'COMPLETED' ? <section className="form-section relay-terminal-notice"><h3>已验收完成</h3><p className="execution-status">该模块已完成验收，保留历史记录且不会再发送消息或启动 Codex。</p></section> : null}
+        {selected.phase === 'STOPPED' ? <section className="form-section relay-terminal-notice"><h3>已终止</h3><p className="execution-status">该模块已由用户终止，保留历史记录且不会再发送消息或启动 Codex。</p></section> : null}
+        {selected.phase === 'WAITING_FOR_ACCEPTANCE' ? <RelayAcceptancePanel blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onAccept={acceptSelectedModule} onSubmitFeedback={submitAcceptanceFeedback} /> : null}
+        <RelayModuleActions phase={selected.phase} stopAfterTurn={selected.stopAfterTurn} blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onTerminate={terminateSelectedModule} />
         <CodexCommunicationPanel cycles={codexCycles} />
-        <section className="form-section conversation"><h3>常驻 ChatGPT 对话</h3><div className="message-history" aria-live="polite">{messages.length === 0 ? <p className="empty light">历史将在本次传话开始后显示。</p> : messages.map((message) => <article className={`message ${message.direction.toLowerCase()} ${message.kind.toLowerCase()}`} key={message.id}><header><strong>{message.direction === 'FROM_CHATGPT' ? 'ChatGPT' : message.direction === 'TO_CODEX' ? 'Codex 提示词' : '你 → ChatGPT'}</strong><span>{message.kind === 'MANUAL' ? '手动' : '自动化'} · {message.deliveryState}</span></header><pre>{message.text}</pre>{message.direction === 'TO_CHATGPT' && message.deliveryState === 'UNKNOWN' ? <div className="uncertain-delivery"><p>这条消息的送达结果不确定，系统没有自动重发。</p><button className="secondary" disabled={busy} type="button" onClick={() => void retryUnknownMessage(message.id)}>明确重发这条消息</button><button className="secondary" disabled={busy} type="button" onClick={() => void continueUnknownMessageWithoutResend(message.id)}>不重发并继续</button></div> : null}</article>)}</div><form className="composer" onSubmit={send}><div className="mode-switch"><button className={kind === 'MANUAL' ? 'selected' : ''} type="button" onClick={() => setKind('MANUAL')}>手动聊天</button><button className={kind === 'AUTOMATION' ? 'selected' : ''} type="button" onClick={() => setKind('AUTOMATION')}>发送自动化请求</button></div><textarea rows={4} value={text} onChange={(event) => setText(event.target.value)} placeholder={kind === 'MANUAL' ? '这条消息只用于和 ChatGPT 沟通，不解析控制块。' : '明确要求 ChatGPT 给出下一个控制块；仅这条消息的回复会参与自动化。'} /><button className="primary" disabled={busy} type="submit">{busy ? '正在处理…' : '发送给 ChatGPT'}</button></form></section>
+        <section className="form-section conversation"><h3>常驻 ChatGPT 对话</h3><div className="message-history" aria-live="polite">{messages.filter((message) => message.direction === 'TO_CHATGPT' || message.direction === 'FROM_CHATGPT').length === 0 ? <p className="empty light">历史将在本次传话开始后显示。</p> : messages.filter((message) => message.direction === 'TO_CHATGPT' || message.direction === 'FROM_CHATGPT').map((message) => <article className={`message ${message.direction.toLowerCase()} ${message.kind.toLowerCase()}`} key={message.id}><header><strong>{message.direction === 'FROM_CHATGPT' ? 'ChatGPT' : '你 → ChatGPT'}</strong><span>{message.kind === 'MANUAL' ? '手动' : '自动化'} · {message.deliveryState}</span></header><pre>{message.text}</pre>{message.direction === 'TO_CHATGPT' && message.deliveryState === 'UNKNOWN' ? <div className="uncertain-delivery"><p>这条消息的送达结果不确定，系统没有自动重发。</p><button className="secondary" disabled={busy} type="button" onClick={() => void retryUnknownMessage(message.id)}>明确重发这条消息</button><button className="secondary" disabled={busy} type="button" onClick={() => void continueUnknownMessageWithoutResend(message.id)}>不重发并继续</button></div> : null}</article>)}</div>{!terminalPhases.has(selected.phase) ? <form className="composer" onSubmit={send}><div className="mode-switch"><button className={kind === 'MANUAL' ? 'selected' : ''} type="button" onClick={() => setKind('MANUAL')}>手动聊天</button><button className={kind === 'AUTOMATION' ? 'selected' : ''} type="button" onClick={() => setKind('AUTOMATION')}>发送自动化请求</button></div><textarea rows={4} value={text} onChange={(event) => setText(event.target.value)} placeholder={kind === 'MANUAL' ? '这条消息只用于和 ChatGPT 沟通，不解析控制块。' : '明确要求 ChatGPT 给出下一个控制块；仅这条消息的回复会参与自动化。'} /><button className="primary" disabled={busy} type="submit">{busy ? '正在处理…' : '发送给 ChatGPT'}</button></form> : null}</section>
       </>}
     </section>
   </main>;
