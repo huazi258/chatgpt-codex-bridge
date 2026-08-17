@@ -305,6 +305,37 @@ struct RelayCodexCycleRecord {
     block_reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayChatGptChannelSnapshot {
+    status: String,
+    active_module_id: Option<String>,
+    active_module_name: Option<String>,
+    active_message_id: Option<String>,
+    active_kind: Option<String>,
+    active_phase: Option<String>,
+    recovery_blocker_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexChannelSnapshot {
+    status: String,
+    active_module_id: Option<String>,
+    active_module_name: Option<String>,
+    cycle_number: Option<i64>,
+    codex_thread_id: Option<String>,
+    codex_turn_id: Option<String>,
+    cycle_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayChannelSnapshot {
+    chatgpt: RelayChatGptChannelSnapshot,
+    codex: RelayCodexChannelSnapshot,
+}
+
 enum RelayDispatchClaim {
     RecoveryBlocked(i64),
     InFlight,
@@ -1528,6 +1559,223 @@ fn get_relay_codex_cycle_by_outbound_message(
         .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))
 }
 
+fn relay_channel_snapshot_from_connection(
+    connection: &Connection,
+) -> Result<RelayChannelSnapshot, String> {
+    let recovery_blocker_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages
+             WHERE direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法统计 ChatGPT 不确定送达消息：{error}"))?;
+
+    let active_chatgpt_message = if recovery_blocker_count > 0 {
+        connection
+            .query_row(
+                "SELECT message.module_id, module.name, message.id, message.kind, message.delivery_state
+                 FROM relay_messages AS message
+                 JOIN relay_modules AS module ON module.id = message.module_id
+                 WHERE message.direction = 'TO_CHATGPT' AND message.delivery_state = 'UNKNOWN'
+                 ORDER BY message.created_at ASC, message.id ASC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("无法读取 ChatGPT 不确定送达消息：{error}"))?
+    } else {
+        connection
+            .query_row(
+                "SELECT message.module_id, module.name, message.id, message.kind, message.delivery_state
+                 FROM relay_messages AS message
+                 JOIN relay_modules AS module ON module.id = message.module_id
+                 WHERE message.direction = 'TO_CHATGPT' AND message.delivery_state = 'SENT'
+                 ORDER BY message.created_at ASC, message.id ASC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("无法读取 ChatGPT 在途消息：{error}"))?
+    };
+    let chatgpt = match (recovery_blocker_count, active_chatgpt_message) {
+        (count, Some((module_id, module_name, message_id, kind, phase))) if count > 0 => {
+            RelayChatGptChannelSnapshot {
+                status: "RECOVERY_BLOCKED".into(),
+                active_module_id: Some(module_id),
+                active_module_name: Some(module_name),
+                active_message_id: Some(message_id),
+                active_kind: Some(kind),
+                active_phase: Some(phase),
+                recovery_blocker_count: count,
+            }
+        }
+        (0, Some((module_id, module_name, message_id, kind, phase))) => {
+            RelayChatGptChannelSnapshot {
+                status: "IN_FLIGHT".into(),
+                active_module_id: Some(module_id),
+                active_module_name: Some(module_name),
+                active_message_id: Some(message_id),
+                active_kind: Some(kind),
+                active_phase: Some(phase),
+                recovery_blocker_count: 0,
+            }
+        }
+        _ => RelayChatGptChannelSnapshot {
+            status: "IDLE".into(),
+            active_module_id: None,
+            active_module_name: None,
+            active_message_id: None,
+            active_kind: None,
+            active_phase: None,
+            recovery_blocker_count: 0,
+        },
+    };
+
+    let active_codex_cycle = connection
+        .query_row(
+            "SELECT cycle.module_id, module.name, cycle.cycle_number,
+                    cycle.codex_thread_id, cycle.codex_turn_id, cycle.status
+             FROM relay_codex_cycles AS cycle
+             JOIN relay_modules AS module ON module.id = cycle.module_id
+             WHERE cycle.status = 'CODEX_RUNNING'
+             ORDER BY cycle.codex_started_at ASC, cycle.id ASC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("无法读取运行中的 Codex 通讯循环：{error}"))?;
+    let codex = match active_codex_cycle {
+        Some((module_id, module_name, cycle_number, thread_id, turn_id, cycle_status)) => {
+            RelayCodexChannelSnapshot {
+                status: "RUNNING".into(),
+                active_module_id: Some(module_id),
+                active_module_name: Some(module_name),
+                cycle_number: Some(cycle_number),
+                codex_thread_id: thread_id,
+                codex_turn_id: turn_id,
+                cycle_status: Some(cycle_status),
+            }
+        }
+        None => RelayCodexChannelSnapshot {
+            status: "IDLE".into(),
+            active_module_id: None,
+            active_module_name: None,
+            cycle_number: None,
+            codex_thread_id: None,
+            codex_turn_id: None,
+            cycle_status: None,
+        },
+    };
+
+    Ok(RelayChannelSnapshot { chatgpt, codex })
+}
+
+fn relay_codex_cycle_block_reason(
+    connection: &Connection,
+    cycle: &RelayCodexCycleRecord,
+    snapshot: &RelayChannelSnapshot,
+) -> Result<Option<String>, String> {
+    if cycle.status == "FAILED" {
+        return Ok(cycle.error_text.clone());
+    }
+    if !matches!(
+        cycle.status.as_str(),
+        "WAITING_FOR_CHATGPT" | "SENDING_TO_CHATGPT"
+    ) {
+        return Ok(None);
+    }
+
+    let outbound_delivery_state = match cycle.outbound_chatgpt_message_id.as_deref() {
+        Some(message_id) => connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取 Codex 回传消息状态：{error}"))?,
+        None => None,
+    };
+    if outbound_delivery_state.as_deref() == Some("UNKNOWN") {
+        return Ok(Some("回传结果不确定，等待人工恢复。".into()));
+    }
+    if snapshot.chatgpt.status == "RECOVERY_BLOCKED" {
+        return Ok(Some(format!(
+            "存在待人工处理的不确定送达消息（{} 条）。",
+            snapshot.chatgpt.recovery_blocker_count
+        )));
+    }
+    if cycle.status == "SENDING_TO_CHATGPT" {
+        return Ok(Some("等待 ChatGPT 完成回复。".into()));
+    }
+    if snapshot.chatgpt.status == "IN_FLIGHT"
+        && snapshot.chatgpt.active_module_id.as_deref() != Some(cycle.module_id.as_str())
+    {
+        let module_name = snapshot
+            .chatgpt
+            .active_module_name
+            .as_deref()
+            .unwrap_or("未知模块");
+        let message_id = snapshot
+            .chatgpt
+            .active_message_id
+            .as_deref()
+            .unwrap_or("未知消息");
+        return Ok(Some(format!(
+            "ChatGPT 通道当前被模块「{module_name}」占用（消息 {message_id}）。"
+        )));
+    }
+    Ok(Some("等待全局 FIFO 调度。".into()))
+}
+
+fn list_relay_codex_cycles_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<Vec<RelayCodexCycleRecord>, String> {
+    let snapshot = relay_channel_snapshot_from_connection(connection)?;
+    let mut statement = connection
+        .prepare(&format!(
+            "{RELAY_CODEX_CYCLE_SELECT} WHERE module_id = ?1 ORDER BY cycle_number DESC"
+        ))
+        .map_err(|error| format!("无法查询 Codex 通讯循环：{error}"))?;
+    let mut cycles = statement
+        .query_map([module_id], relay_codex_cycle_row)
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))?;
+    drop(statement);
+    for cycle in &mut cycles {
+        cycle.block_reason = relay_codex_cycle_block_reason(connection, cycle, &snapshot)?;
+    }
+    Ok(cycles)
+}
+
 fn append_relay_event(
     connection: &Connection,
     module_id: &str,
@@ -1948,6 +2196,27 @@ fn list_relay_messages(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("无法读取消息历史：{error}"))?;
     Ok(messages)
+}
+
+#[tauri::command]
+fn list_relay_codex_cycles(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<Vec<RelayCodexCycleRecord>, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    list_relay_codex_cycles_in(&connection, &module_id)
+}
+
+#[tauri::command]
+fn get_relay_channel_snapshot(state: State<'_, AppState>) -> Result<RelayChannelSnapshot, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    relay_channel_snapshot_from_connection(&connection)
 }
 
 #[tauri::command]
@@ -4417,6 +4686,176 @@ mod tests {
     }
 
     #[test]
+    fn relay_channel_snapshot_is_idle_without_in_flight_chatgpt_or_running_codex() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+
+        let snapshot = relay_channel_snapshot_from_connection(&connection)
+            .expect("read idle channel snapshot");
+
+        assert_eq!(snapshot.chatgpt.status, "IDLE");
+        assert_eq!(snapshot.chatgpt.recovery_blocker_count, 0);
+        assert!(snapshot.chatgpt.active_message_id.is_none());
+        assert_eq!(snapshot.codex.status, "IDLE");
+        assert!(snapshot.codex.active_module_id.is_none());
+    }
+
+    #[test]
+    fn relay_channel_snapshot_reports_sent_message_as_chatgpt_in_flight() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_message(
+            &connection,
+            "message-a",
+            "module-a",
+            1,
+            "SENT",
+            "2026-08-17T00:00:00Z",
+        );
+
+        let snapshot = relay_channel_snapshot_from_connection(&connection)
+            .expect("read in-flight channel snapshot");
+
+        assert_eq!(snapshot.chatgpt.status, "IN_FLIGHT");
+        assert_eq!(
+            snapshot.chatgpt.active_module_id.as_deref(),
+            Some("module-a")
+        );
+        assert_eq!(
+            snapshot.chatgpt.active_module_name.as_deref(),
+            Some("模块 A")
+        );
+        assert_eq!(
+            snapshot.chatgpt.active_message_id.as_deref(),
+            Some("message-a")
+        );
+        assert_eq!(snapshot.chatgpt.active_kind.as_deref(), Some("AUTOMATION"));
+        assert_eq!(snapshot.chatgpt.active_phase.as_deref(), Some("SENT"));
+        assert_eq!(snapshot.chatgpt.recovery_blocker_count, 0);
+    }
+
+    #[test]
+    fn relay_channel_snapshot_gives_unknown_priority_over_sent_message() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_message(
+            &connection,
+            "sent-a",
+            "module-a",
+            1,
+            "SENT",
+            "2026-08-17T00:00:00Z",
+        );
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-17T00:00:01Z",
+        );
+
+        let snapshot = relay_channel_snapshot_from_connection(&connection)
+            .expect("read recovery-blocked channel snapshot");
+
+        assert_eq!(snapshot.chatgpt.status, "RECOVERY_BLOCKED");
+        assert_eq!(snapshot.chatgpt.recovery_blocker_count, 1);
+        assert_eq!(
+            snapshot.chatgpt.active_message_id.as_deref(),
+            Some("unknown-b")
+        );
+        assert_eq!(snapshot.chatgpt.active_phase.as_deref(), Some("UNKNOWN"));
+    }
+
+    #[test]
+    fn relay_channel_snapshot_reports_the_single_running_codex_cycle() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 4, "执行任务").expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start cycle");
+
+        let snapshot = relay_channel_snapshot_from_connection(&connection)
+            .expect("read running Codex snapshot");
+
+        assert_eq!(snapshot.codex.status, "RUNNING");
+        assert_eq!(snapshot.codex.active_module_id.as_deref(), Some("module-a"));
+        assert_eq!(snapshot.codex.active_module_name.as_deref(), Some("模块 A"));
+        assert_eq!(snapshot.codex.cycle_number, Some(4));
+        assert_eq!(snapshot.codex.codex_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(snapshot.codex.codex_turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(
+            snapshot.codex.cycle_status.as_deref(),
+            Some("CODEX_RUNNING")
+        );
+    }
+
+    #[test]
+    fn relay_channel_snapshot_explains_when_completed_cycle_waits_for_another_module() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_message(
+            &connection,
+            "sent-b",
+            "module-b",
+            1,
+            "SENT",
+            "2026-08-17T00:00:00Z",
+        );
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 1, "执行任务").expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), None)
+            .expect("start cycle");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("complete cycle");
+        queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+
+        let cycles =
+            list_relay_codex_cycles_in(&connection, "module-a").expect("list module cycles");
+
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].status, "WAITING_FOR_CHATGPT");
+        assert_eq!(
+            cycles[0].block_reason.as_deref(),
+            Some("ChatGPT 通道当前被模块「模块 B」占用（消息 sent-b）。")
+        );
+    }
+
+    #[test]
+    fn relay_channel_snapshot_explains_recovery_blockers_for_waiting_cycles() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-17T00:00:00Z",
+        );
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 1, "执行任务").expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), None)
+            .expect("start cycle");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("complete cycle");
+        queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+
+        let cycles =
+            list_relay_codex_cycles_in(&connection, "module-a").expect("list module cycles");
+
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(
+            cycles[0].block_reason.as_deref(),
+            Some("存在待人工处理的不确定送达消息（1 条）。")
+        );
+    }
+
+    #[test]
     fn adapter_failure_marks_relay_delivery_unknown_without_parsing_or_retrying() {
         let connection = relay_connection();
         let now = "2026-08-17T00:00:00Z";
@@ -4889,6 +5328,8 @@ pub fn run() {
             create_relay_module,
             list_relay_modules,
             list_relay_messages,
+            list_relay_codex_cycles,
+            get_relay_channel_snapshot,
             list_relay_recovery_messages,
             queue_relay_message,
             retry_unknown_relay_message,
