@@ -3175,7 +3175,18 @@ fn pause_relay_for_uncertain_delivery(
         )
         .map_err(|error| format!("无法保存 ChatGPT 不确定送达状态：{error}"))?;
     sync_codex_cycle_for_chatgpt_message_state(connection, message_id, "UNKNOWN", Some(detail))?;
-    set_relay_phase(connection, &module_id, "RECOVERY_REQUIRED")?;
+    let phase: String = connection
+        .query_row(
+            "SELECT phase FROM relay_modules WHERE id = ?1",
+            [&module_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取模块恢复状态：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if !matches!(phase.as_str(), "STOPPED" | "COMPLETED") {
+        set_relay_phase(connection, &module_id, "RECOVERY_REQUIRED")?;
+    }
     append_relay_event(connection, &module_id, event_type, detail)?;
     Ok(module_id)
 }
@@ -5537,6 +5548,43 @@ mod tests {
             )
             .expect("terminal phase");
         assert_eq!(phase, "COMPLETED");
+    }
+
+    #[test]
+    fn terminal_relay_adapter_failure_keeps_terminal_phase() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("mark stopped");
+        insert_relay_message(
+            &connection,
+            "sent-terminal",
+            "module-stopped",
+            1,
+            "SENT",
+            "2026-08-18T00:00:00Z",
+        );
+
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            "sent-terminal",
+            "CHATGPT_ADAPTER_FAILURE",
+            "适配器失败",
+        )
+        .expect("terminal sent message can still become explicitly recoverable");
+
+        let phase: String = connection
+            .query_row(
+                "SELECT phase FROM relay_modules WHERE id = 'module-stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal phase");
+        assert_eq!(phase, "STOPPED");
     }
 
     #[test]
