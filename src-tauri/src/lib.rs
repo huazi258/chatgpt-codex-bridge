@@ -3483,7 +3483,7 @@ fn handle_relay_chatgpt_reply(
             (outgoing.1, outgoing.2, None)
         } else {
             let module = reply_outcome.module;
-            match relay_protocol::parse_terminal_control_block(reply, None) {
+            match relay_protocol::parse_terminal_control_block(reply) {
                 Ok(relay_protocol::ControlBlock::CodexPrompt(prompt)) => {
                     connection.execute(
                         "UPDATE relay_modules SET phase = 'CODEX_PROMPT_READY', invalid_reply_count = 0, updated_at = ?2 WHERE id = ?1",
@@ -3543,22 +3543,6 @@ fn handle_relay_chatgpt_reply(
                         outgoing.1,
                         outgoing.2,
                         Some(json!({ "type": "BLOCKED", "reason": reason })),
-                    )
-                }
-                Ok(relay_protocol::ControlBlock::CodexInput(_)) => {
-                    set_relay_phase(&connection, &module.id, "BLOCKED")?;
-                    append_relay_event(
-                        &connection,
-                        &module.id,
-                        "INVALID_CODEX_INPUT",
-                        "当前没有待回答的 Codex 输入请求。",
-                    )?;
-                    (
-                        outgoing.1,
-                        outgoing.2,
-                        Some(
-                            json!({ "type": "ERROR", "reason": "当前没有待回答的 Codex 输入请求。" }),
-                        ),
                     )
                 }
                 Err(error) => {
@@ -5915,7 +5899,6 @@ mod tests {
 
         let control = relay_protocol::parse_terminal_control_block(
             "已收到验收反馈。\n\n@@@CODEX_PROMPT@@@\n继续处理验收反馈。\n@@@END_CODEX_PROMPT@@@",
-            None,
         )
         .expect("valid follow-up CODEX_PROMPT");
         let relay_protocol::ControlBlock::CodexPrompt(prompt) = control else {

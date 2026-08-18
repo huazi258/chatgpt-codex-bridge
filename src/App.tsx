@@ -24,7 +24,7 @@ interface RelayRecoveryMessage {
   messageId: string; moduleId: string; moduleName: string; sequenceNumber: number; kind: RelayKind; createdAt: string;
 }
 
-const defaultRetry = '请根据既定格式，在回复最后且仅输出一个有效控制块：@@@CODEX_PROMPT@@@、@@@MODULE_DONE@@@、@@@BLOCKED@@@ 或正在等待输入时的 @@@CODEX_INPUT@@@。';
+const defaultRetry = '请根据既定格式，在回复最后且仅输出一个有效控制块：@@@CODEX_PROMPT@@@、@@@MODULE_DONE@@@ 或 @@@BLOCKED@@@。';
 const terminalPhases = new Set(['COMPLETED', 'STOPPED']);
 
 export default function App() {

@@ -112,17 +112,17 @@ assert.equal(promptResponse.ok, true);
 assert.equal(promptResponse.response, promptComplete, 'must not capture a partial CODEX_PROMPT terminal marker after stop-button disappears');
 assert.notEqual(promptResponse.response, promptPartial, 'must wait for the delayed CODEX_PROMPT DOM reconciliation');
 
-const inputPartial = '@@@CODEX_INPUT@@@\n请';
-const inputComplete = '@@@CODEX_INPUT@@@\n1. 请返回 Codex 的输出\n@@@END_CODEX_INPUT@@@';
-const inputScenario = await runRelayCompletionScenario({
-  initialText: inputPartial,
-  finalText: inputComplete,
+const blockedPartial = '@@@BLOCKED@@@\n请';
+const blockedComplete = '@@@BLOCKED@@@\n请提供必要信息\n@@@END_BLOCKED@@@';
+const blockedScenario = await runRelayCompletionScenario({
+  initialText: blockedPartial,
+  finalText: blockedComplete,
   reconcileAfterMs: 3_250,
 });
-const { response: inputResponse } = inputScenario;
-assert.equal(inputResponse.ok, true);
-assert.equal(inputResponse.response, inputComplete, 'must not capture an incomplete CODEX_INPUT body or end marker');
-assert.notEqual(inputResponse.response, inputPartial, 'must wait for the delayed CODEX_INPUT DOM reconciliation');
+const { response: blockedResponse } = blockedScenario;
+assert.equal(blockedResponse.ok, true);
+assert.equal(blockedResponse.response, blockedComplete, 'must not capture an incomplete BLOCKED body or end marker');
+assert.notEqual(blockedResponse.response, blockedPartial, 'must wait for the delayed BLOCKED DOM reconciliation');
 
 const ordinaryText = '普通聊天回复完成。';
 const ordinaryScenario = await runRelayCompletionScenario({ initialText: ordinaryText });

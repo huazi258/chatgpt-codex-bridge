@@ -1,5 +1,5 @@
 (() => {
-const contentAdapterVersion = '1.3.2';
+const contentAdapterVersion = '1.3.3';
 const contentAdapterInstanceKey = '__chatgptCodexContentAdapterInstanceV3__';
 const previousAdapterInstance = globalThis[contentAdapterInstanceKey];
 
@@ -21,7 +21,6 @@ const stopButtonSelector = 'button[data-testid="stop-button"]';
 const relayWrappedControls = [
   ['@@@CODEX_PROMPT@@@', '@@@END_CODEX_PROMPT@@@'],
   ['@@@BLOCKED@@@', '@@@END_BLOCKED@@@'],
-  ['@@@CODEX_INPUT@@@', '@@@END_CODEX_INPUT@@@'],
 ];
 const relayControlMarkers = [
   ...relayWrappedControls.flatMap(([start, end]) => [start, end]),

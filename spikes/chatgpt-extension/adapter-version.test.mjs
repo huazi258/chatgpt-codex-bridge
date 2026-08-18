@@ -4,6 +4,9 @@ import { readFileSync } from 'node:fs';
 const content = readFileSync(new URL('./content.js', import.meta.url), 'utf8');
 const background = readFileSync(new URL('./background.js', import.meta.url), 'utf8');
 
+assert.match(content, /contentAdapterVersion = '1\.3\.3'/, 'content adapter must advertise the retired-control-block version');
+assert.doesNotMatch(content, /CODEX_INPUT/, 'the public relay adapter must not treat CODEX_INPUT as a pending control marker');
+
 assert.match(content, /adapterStatusV3/, 'content script must expose its version over an isolated V3 message');
 assert.match(content, /contentAdapterInstanceKey/, 'content script must identify its single active adapter instance');
 assert.match(content, /previousAdapterInstance\?\.version === contentAdapterVersion && previousAdapterInstance\.active/, 'reinjection of the same adapter version must be idempotent');
