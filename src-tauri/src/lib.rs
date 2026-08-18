@@ -7499,6 +7499,21 @@ Copy code"#;
         assert_eq!(interrupt_unfinished_relay_codex_input_requests(&mut connection).unwrap(),2); assert_eq!(interrupt_unfinished_relay_codex_input_requests(&mut connection).unwrap(),0);
         assert_eq!(get_relay_module(&connection,"old").unwrap().unwrap().phase,"STOPPED"); assert_eq!(get_relay_module(&connection,"new").unwrap().unwrap().phase,"RECOVERY_REQUIRED");
     }
+
+    #[test]
+    fn relay_codex_input_request_snapshot_uses_only_the_running_cycle() {
+        let connection=relay_connection(); insert_relay_module(&connection,"module","模块");
+        connection.execute("INSERT INTO relay_codex_cycles (id,module_id,cycle_number,status,prompt_text,codex_thread_id,codex_turn_id,created_at,codex_started_at,updated_at) VALUES ('old','module',1,'CODEX_COMPLETED','p','thread','turn-old','n','n','n'),('current','module',2,'CODEX_RUNNING','p','thread','turn-current','n','n','n')",[]).unwrap();
+        connection.execute("INSERT INTO relay_codex_input_requests (id,module_id,cycle_id,codex_thread_id,codex_turn_id,app_server_request_id_json,questions_json,secret_answer_status_json,is_blocking,request_compatibility_json,status,created_at,updated_at) VALUES ('stale','module','old','thread','turn-old','1','[]','{}',1,'{}','PENDING','n','n')",[]).unwrap();
+        let snapshot=relay_channel_snapshot_from_connection(&connection).unwrap(); assert_eq!(snapshot.codex.status,"RUNNING"); assert!(snapshot.codex.active_input_request_id.is_none());
+    }
+
+    #[test]
+    fn relay_codex_input_request_runtime_budget_is_exactly_once() {
+        let connection=relay_connection(); insert_relay_module(&connection,"module","模块"); connection.execute("UPDATE relay_modules SET phase='CODEX_RUNNING',module_started_at='2026-08-01T00:00:00Z',max_runtime_minutes=1 WHERE id='module'",[]).unwrap();
+        assert!(mark_relay_runtime_budget_reached_in(&connection,"module",DateTime::parse_from_rfc3339("2026-08-01T00:02:00Z").unwrap().with_timezone(&Utc)).unwrap()); assert!(!mark_relay_runtime_budget_reached_in(&connection,"module",DateTime::parse_from_rfc3339("2026-08-01T00:03:00Z").unwrap().with_timezone(&Utc)).unwrap());
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM relay_events WHERE module_id='module' AND event_type='RUNTIME_BUDGET_REACHED'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
 }
 
 pub fn run() {
