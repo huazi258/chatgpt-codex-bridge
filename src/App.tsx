@@ -5,7 +5,9 @@ import { CodexCommunicationPanel } from './components/CodexCommunicationPanel';
 import { GlobalChannelStatus } from './components/GlobalChannelStatus';
 import { RelayAcceptancePanel } from './components/RelayAcceptancePanel';
 import { RelayModuleActions } from './components/RelayModuleActions';
+import { CodexHumanInputPanel } from './components/CodexHumanInputPanel';
 import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
+import type { RelayCodexInputRequest } from './relay-codex-input';
 
 type RelayKind = 'MANUAL' | 'AUTOMATION';
 
@@ -34,6 +36,7 @@ export default function App() {
   const [messages, setMessages] = useState<RelayMessage[]>([]);
   const [recoveryMessages, setRecoveryMessages] = useState<RelayRecoveryMessage[]>([]);
   const [codexCycles, setCodexCycles] = useState<RelayCodexCycle[]>([]);
+  const [codexInputRequests, setCodexInputRequests] = useState<RelayCodexInputRequest[]>([]);
   const [channelSnapshot, setChannelSnapshot] = useState<RelayChannelSnapshot | null>(null);
   const [pairing, setPairing] = useState<PairingInfo | null>(null);
   const [bridge, setBridge] = useState<BridgeStatus | null>(null);
@@ -69,6 +72,11 @@ export default function App() {
     if (!moduleId) return setCodexCycles([]);
     setCodexCycles(await invoke<RelayCodexCycle[]>('list_relay_codex_cycles', { moduleId }));
   }
+  async function refreshCodexInputRequests(moduleId = selectedId) {
+    if (!moduleId) return setCodexInputRequests([]);
+    try { setCodexInputRequests(await invoke<RelayCodexInputRequest[]>('list_relay_codex_input_requests', { moduleId })); }
+    catch { setCodexInputRequests([]); }
+  }
   async function refreshChannelSnapshot() {
     setChannelSnapshot(await invoke<RelayChannelSnapshot>('get_relay_channel_snapshot'));
   }
@@ -82,6 +90,7 @@ export default function App() {
   useEffect(() => {
     void refreshMessages().catch((error) => setNotice(`无法读取消息历史：${String(error)}`));
     void refreshCodexCycles().catch((error) => setNotice(`无法读取 Codex 通讯状态：${String(error)}`));
+    void refreshCodexInputRequests().catch((error) => setNotice(`无法读取 Codex 输入请求：${String(error)}`));
   }, [selectedId]);
   useEffect(() => {
     let stopStatus: (() => void) | undefined;
@@ -95,7 +104,7 @@ export default function App() {
       void refreshModules().catch(() => undefined); void refreshMessages().catch(() => undefined); void refreshRecoveryMessages().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
     }).then((unsubscribe) => { stopControl = unsubscribe; });
     void listen<{ moduleId: string }>('relay-codex', () => {
-      void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
+      void refreshCodexCycles().catch(() => undefined); void refreshCodexInputRequests().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined); void refreshModules().catch(() => undefined);
     }).then((unsubscribe) => { stopCodex = unsubscribe; });
     return () => { stopStatus?.(); stopControl?.(); stopCodex?.(); };
   }, [selectedId]);
@@ -157,8 +166,16 @@ export default function App() {
       refreshMessages(moduleId),
       refreshRecoveryMessages(),
       refreshCodexCycles(moduleId),
+      refreshCodexInputRequests(moduleId),
       refreshChannelSnapshot(),
     ]);
+  }
+
+  async function submitCodexInput(inputRequestId: string, answers: { questionId: string; answer: string }[]) {
+    if (!selected) return;
+    setBusy(true);
+    try { await invoke('submit_relay_codex_input', { inputRequestId, answers }); setNotice('答案已发送，正在等待 Codex 确认'); await Promise.all([refreshCodexInputRequests(selected.id), refreshCodexCycles(selected.id), refreshChannelSnapshot(), refreshModules()]); }
+    catch (error) { setNotice(`提交 Codex 输入失败：${String(error)}`); } finally { setBusy(false); }
   }
 
   async function acceptSelectedModule() {
@@ -240,6 +257,7 @@ export default function App() {
         {selected.phase === 'WAITING_FOR_ACCEPTANCE' ? <RelayAcceptancePanel blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onAccept={acceptSelectedModule} onSubmitFeedback={submitAcceptanceFeedback} /> : null}
         <RelayModuleActions phase={selected.phase} stopAfterTurn={selected.stopAfterTurn} blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onTerminate={terminateSelectedModule} />
         <CodexCommunicationPanel cycles={codexCycles} />
+        {codexInputRequests.map((request) => <CodexHumanInputPanel key={request.id} request={request} stopAfterTurn={selected.stopAfterTurn} onSubmit={(answers) => submitCodexInput(request.id, answers)} />)}
         <section className="form-section conversation"><h3>常驻 ChatGPT 对话</h3><div className="message-history" aria-live="polite">{messages.filter((message) => message.direction === 'TO_CHATGPT' || message.direction === 'FROM_CHATGPT').length === 0 ? <p className="empty light">历史将在本次传话开始后显示。</p> : messages.filter((message) => message.direction === 'TO_CHATGPT' || message.direction === 'FROM_CHATGPT').map((message) => <article className={`message ${message.direction.toLowerCase()} ${message.kind.toLowerCase()}`} key={message.id}><header><strong>{message.direction === 'FROM_CHATGPT' ? 'ChatGPT' : '你 → ChatGPT'}</strong><span>{message.kind === 'MANUAL' ? '手动' : '自动化'} · {message.deliveryState}</span></header><pre>{message.text}</pre>{message.direction === 'TO_CHATGPT' && message.deliveryState === 'UNKNOWN' ? <div className="uncertain-delivery"><p>这条消息的送达结果不确定，系统没有自动重发。</p><button className="secondary" disabled={busy} type="button" onClick={() => void retryUnknownMessage(message.id)}>明确重发这条消息</button><button className="secondary" disabled={busy} type="button" onClick={() => void continueUnknownMessageWithoutResend(message.id)}>不重发并继续</button></div> : null}</article>)}</div>{!terminalPhases.has(selected.phase) ? <form className="composer" onSubmit={send}><div className="mode-switch"><button className={kind === 'MANUAL' ? 'selected' : ''} type="button" onClick={() => setKind('MANUAL')}>手动聊天</button><button className={kind === 'AUTOMATION' ? 'selected' : ''} type="button" onClick={() => setKind('AUTOMATION')}>发送自动化请求</button></div><textarea rows={4} value={text} onChange={(event) => setText(event.target.value)} placeholder={kind === 'MANUAL' ? '这条消息只用于和 ChatGPT 沟通，不解析控制块。' : '明确要求 ChatGPT 给出下一个控制块；仅这条消息的回复会参与自动化。'} /><button className="primary" disabled={busy} type="submit">{busy ? '正在处理…' : '发送给 ChatGPT'}</button></form> : null}</section>
       </>}
     </section>
