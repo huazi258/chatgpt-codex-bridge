@@ -555,6 +555,17 @@ fn interrupt_unfinished_relay_codex_input_requests(connection: &mut Connection) 
     transaction.commit().map_err(|e| e.to_string())?; Ok(rows.len())
 }
 
+fn mark_relay_runtime_budget_reached_in(connection: &Connection, module_id: &str, now: DateTime<Utc>) -> Result<bool, String> {
+    let module=get_relay_module(connection,module_id)?.ok_or_else(||"传话模块不存在。".to_string())?;
+    let Some(started)=module.module_started_at else { return Ok(false); };
+    let started=DateTime::parse_from_rfc3339(&started).map_err(|e|format!("模块开始时间无法读取：{e}"))?.with_timezone(&Utc);
+    if now-started < Duration::minutes(module.max_runtime_minutes) || module.stop_after_turn || matches!(module.phase.as_str(),"STOPPED"|"COMPLETED") { return Ok(false); }
+    let tx=connection.unchecked_transaction().map_err(|e|e.to_string())?;
+    let changed=tx.execute("UPDATE relay_modules SET stop_after_turn=1,updated_at=?2 WHERE id=?1 AND stop_after_turn=0 AND phase NOT IN ('STOPPED','COMPLETED')",params![module_id,now.to_rfc3339()]).map_err(|e|e.to_string())?;
+    if changed==1 { append_relay_event_in_transaction(&tx,module_id,"RUNTIME_BUDGET_REACHED","已达到模块最长运行时间；当前回合完成后停止，不会强制中断 Codex 输入。")?; }
+    tx.commit().map_err(|e|e.to_string())?; Ok(changed==1)
+}
+
 fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String> {
     let message_ids: Vec<String> = connection
         .prepare(
@@ -3964,6 +3975,7 @@ fn relay_codex_worker(
     let mut final_summary = String::new();
     let mut release_acknowledgement: Option<std_mpsc::Sender<Result<(), String>>> = None;
     'worker: loop {
+        if let Ok(connection) = app.state::<AppState>().connection.lock() { let _ = mark_relay_runtime_budget_reached_in(&connection, &module_id, Utc::now()); }
         while let Ok(command) = commands.try_recv() {
             match command {
                 RelayCodexCommand::StartTurn { cycle_id, prompt } => {
