@@ -1,5 +1,5 @@
 (() => {
-const contentAdapterVersion = '1.3.0';
+const contentAdapterVersion = '1.3.1';
 const contentAdapterInstanceKey = '__chatgptCodexContentAdapterInstanceV3__';
 const previousAdapterInstance = globalThis[contentAdapterInstanceKey];
 
@@ -18,6 +18,15 @@ const sendButtonSelectors = [
   'button[title*="发送"]'
 ];
 const stopButtonSelector = 'button[data-testid="stop-button"]';
+const relayWrappedControls = [
+  ['@@@CODEX_PROMPT@@@', '@@@END_CODEX_PROMPT@@@'],
+  ['@@@BLOCKED@@@', '@@@END_BLOCKED@@@'],
+  ['@@@CODEX_INPUT@@@', '@@@END_CODEX_INPUT@@@'],
+];
+const relayControlMarkers = [
+  ...relayWrappedControls.flatMap(([start, end]) => [start, end]),
+  '@@@MODULE_DONE@@@',
+];
 
 function assistantMessages() {
   return [...document.querySelectorAll(assistantMessageSelector)];
@@ -63,6 +72,20 @@ function assistantDiagnosticsSummary(previousCount, baselineAssistantText, chang
 function hasPendingProtocolCandidate(message) {
   return Boolean(message.querySelector('pre, pre code'))
     || /"(?:state|module|reason)"\s*:/.test(message.innerText);
+}
+
+function hasPendingRelayControlCandidate(text) {
+  const current = text.trimEnd();
+  for (const [start, end] of relayWrappedControls) {
+    const startOffset = current.lastIndexOf(start);
+    if (startOffset >= 0 && !current.slice(startOffset + start.length).includes(end)) return true;
+  }
+  if (relayControlMarkers.some((marker) => current.endsWith(marker))) return false;
+  const markerOffset = current.lastIndexOf('@@@');
+  if (markerOffset < 0) return false;
+  const trailingMarker = current.slice(markerOffset);
+  return trailingMarker.length >= 3
+    && relayControlMarkers.some((marker) => marker !== trailingMarker && marker.startsWith(trailingMarker));
 }
 
 function textOfLatestAssistantMessage() {
@@ -143,6 +166,8 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
       const signature = `${messageCount}\n${latestReply.text}`;
       const pendingProtocolCandidate = requireProtocolJson
         && changedMessages.some(hasPendingProtocolCandidate);
+      const pendingRelayControlCandidate = !requireProtocolJson
+        && hasPendingRelayControlCandidate(latestReply.text);
       const deadlineMs = globalThis.protocolReplyDeadlineMs(
         requireProtocolJson,
         pendingProtocolCandidate,
@@ -152,7 +177,7 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
         const error = new Error(requireProtocolJson
           ? 'Timed out waiting for a complete structured protocol JSON reply.'
           : 'Timed out waiting for the ChatGPT reply to finish.');
-        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},baselineProtocolJson=${baselineProtocolJson.size},current=${messageCount},changed=${changedAssistantMessages.size},replyOutsideBaseline=${Boolean(replyOutsideBaseline)},pendingProtocolCandidate=${pendingProtocolCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
+        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},baselineProtocolJson=${baselineProtocolJson.size},current=${messageCount},changed=${changedAssistantMessages.size},replyOutsideBaseline=${Boolean(replyOutsideBaseline)},pendingProtocolCandidate=${pendingProtocolCandidate},pendingRelayControlCandidate=${pendingRelayControlCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
         finish(error);
         return;
       }
@@ -162,7 +187,10 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
         stableSince = 0;
       }
 
-      if ((requireProtocolJson && !protocolReply) || (!requireProtocolJson && messageCount <= previousCount) || (!requireProtocolJson && isGenerating())) {
+      if ((requireProtocolJson && !protocolReply)
+        || (!requireProtocolJson && messageCount <= previousCount)
+        || (!requireProtocolJson && isGenerating())
+        || pendingRelayControlCandidate) {
         stableSince = 0;
         return;
       }

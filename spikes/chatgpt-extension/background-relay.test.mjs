@@ -37,8 +37,8 @@ const chrome = {
   tabs: {
     async sendMessage(tabId, message) {
       tabMessages.push({ tabId, message });
-      if (message.type === 'adapterStatusV3') return { ok: true, adapterVersion: '1.3.0' };
-      if (message.type === 'sendMiddlewareMessageV3') return { ok: true, response: 'relay reply', adapterVersion: '1.3.0' };
+      if (message.type === 'adapterStatusV3') return { ok: true, adapterVersion: '1.3.1' };
+      if (message.type === 'sendMiddlewareMessageV3') return { ok: true, response: 'relay reply', adapterVersion: '1.3.1' };
       throw new Error(`unexpected tab message: ${message.type}`);
     },
   },
@@ -62,7 +62,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(relayDispatches)), [{
 }], 'relay dispatch must use the paired tab and isolated message type');
 assert.deepEqual(JSON.parse(JSON.stringify(socketSent.at(-1))), {
   type: 'chatgptReply', sessionId: 'session-1', requestId: 'request-1', text: 'relay reply',
-  protocolJsonPresent: false, adapterVersion: '1.3.0', relay: true,
+  protocolJsonPresent: false, adapterVersion: '1.3.1', relay: true,
 }, 'a successful relay adapter response must emit exactly one correlated reply');
 
 const replyCount = socketSent.length;

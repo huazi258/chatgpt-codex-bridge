@@ -1,5 +1,5 @@
 const bridgeUrl = 'ws://127.0.0.1:8765';
-const contentAdapterVersion = '1.3.0';
+const contentAdapterVersion = '1.3.1';
 let socket = null;
 let sessionId = null;
 let pairedTabId = null;
