@@ -74,8 +74,7 @@ export default function App() {
   }
   async function refreshCodexInputRequests(moduleId = selectedId) {
     if (!moduleId) return setCodexInputRequests([]);
-    try { setCodexInputRequests(await invoke<RelayCodexInputRequest[]>('list_relay_codex_input_requests', { moduleId })); }
-    catch { setCodexInputRequests([]); }
+    setCodexInputRequests(await invoke<RelayCodexInputRequest[]>('list_relay_codex_input_requests', { moduleId }));
   }
   async function refreshChannelSnapshot() {
     setChannelSnapshot(await invoke<RelayChannelSnapshot>('get_relay_channel_snapshot'));

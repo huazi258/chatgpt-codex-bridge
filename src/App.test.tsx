@@ -11,6 +11,7 @@ let modules = [
 ];
 let recoveryMessages: Array<{ messageId: string; moduleId: string; moduleName: string; sequenceNumber: number; kind: string; createdAt: string }> = [];
 let codexCycles: RelayCodexCycle[] = [];
+let codexInputRequests: Array<unknown> = [];
 let relayMessages: Array<{ id: string; sequenceNumber: number; direction: 'TO_CHATGPT' | 'FROM_CHATGPT' | 'TO_CODEX' | 'FROM_CODEX'; kind: 'MANUAL' | 'AUTOMATION' | 'SYSTEM'; text: string; deliveryState: string }> = [];
 let terminateError: Error | null = null;
 let channelSnapshot: RelayChannelSnapshot = {
@@ -26,6 +27,7 @@ invoke.mockImplementation(async (command: string, args?: { input?: { name: strin
   if (command === 'list_relay_messages') return relayMessages;
   if (command === 'list_relay_recovery_messages') return recoveryMessages;
   if (command === 'list_relay_codex_cycles') return codexCycles;
+  if (command === 'list_relay_codex_input_requests') return codexInputRequests;
   if (command === 'get_relay_channel_snapshot') return channelSnapshot;
   if (command === 'create_relay_module') {
     const input = args?.input;
@@ -52,6 +54,7 @@ describe('传话模块创建入口', () => {
     ];
     recoveryMessages = [];
     codexCycles = [];
+    codexInputRequests = [];
     relayMessages = [];
     terminateError = null;
     channelSnapshot = {
