@@ -4814,10 +4814,12 @@ fn relay_codex_worker(
                         .pointer("/params/turn/status")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
+                    let mut unresolved_response_sent = false;
                     if status == "completed" {
                         if let Some(input) = active_input.take() {
                             if let Ok(mut connection) = app.state::<AppState>().connection.lock() {
                                 let (changed, input_status) = if input.response_sent {
+                                    unresolved_response_sent = true;
                                     (
                                         interrupt_relay_codex_input_request_in(
                                             &mut connection,
@@ -4844,12 +4846,19 @@ fn relay_codex_worker(
                         }
                         if let Some(cycle_id) = active_cycle_id.take() {
                             turn_active.store(false, Ordering::SeqCst);
-                            relay_codex_turn_completed(
-                                &app,
-                                &module_id,
-                                &cycle_id,
-                                final_summary.trim(),
-                            );
+                            if unresolved_response_sent {
+                                if let Ok(connection) = app.state::<AppState>().connection.lock() {
+                                    let _ = fail_relay_codex_cycle(&connection, &cycle_id, "Codex 回合结束前未确认人工输入答案送达；模块已进入恢复状态。");
+                                }
+                                emit_relay_codex_changed(&app, &module_id, &cycle_id, "FAILED");
+                            } else {
+                                relay_codex_turn_completed(
+                                    &app,
+                                    &module_id,
+                                    &cycle_id,
+                                    final_summary.trim(),
+                                );
+                            }
                         } else {
                             relay_codex_failed(
                                 &app,
@@ -4862,6 +4871,7 @@ fn relay_codex_worker(
                         if let Some(input) = active_input.take() {
                             if let Ok(mut connection) = app.state::<AppState>().connection.lock() {
                                 let (changed, input_status) = if input.response_sent {
+                                    unresolved_response_sent = true;
                                     (
                                         interrupt_relay_codex_input_request_in(
                                             &mut connection,
@@ -4887,12 +4897,21 @@ fn relay_codex_worker(
                             }
                         }
                         turn_active.store(false, Ordering::SeqCst);
-                        relay_codex_failed(
-                            &app,
-                            &module_id,
-                            active_cycle_id.as_deref(),
-                            format!("Codex 回合以 `{status}` 结束。"),
-                        );
+                        if unresolved_response_sent {
+                            if let Some(cycle_id) = active_cycle_id.as_deref() {
+                                if let Ok(connection) = app.state::<AppState>().connection.lock() {
+                                    let _ = fail_relay_codex_cycle(&connection, cycle_id, "Codex 回合结束前未确认人工输入答案送达；模块已进入恢复状态。");
+                                }
+                                emit_relay_codex_changed(&app, &module_id, cycle_id, "FAILED");
+                            }
+                        } else {
+                            relay_codex_failed(
+                                &app,
+                                &module_id,
+                                active_cycle_id.as_deref(),
+                                format!("Codex 回合以 `{status}` 结束。"),
+                            );
+                        }
                         active_cycle_id = None;
                     }
                 }
