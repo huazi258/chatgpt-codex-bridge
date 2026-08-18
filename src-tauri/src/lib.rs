@@ -398,11 +398,12 @@ struct RelayCodexInputRequestRecord {
     secret_answer_status_json: String, is_blocking: bool, auto_resolution_ms: Option<i64>, status: String,
     error_text: Option<String>, created_at: String, submitted_at: Option<String>, answered_at: Option<String>,
     interrupted_at: Option<String>, expired_at: Option<String>, updated_at: String,
+    request_compatibility_json: String,
 }
 
 fn list_relay_codex_input_requests_in(connection: &Connection, module_id: &str) -> Result<Vec<RelayCodexInputRequestRecord>, String> {
-    let mut statement = connection.prepare("SELECT id,module_id,cycle_id,codex_thread_id,codex_turn_id,app_server_request_id_json,questions_json,answers_json,secret_answer_status_json,is_blocking,auto_resolution_ms,status,error_text,created_at,submitted_at,answered_at,interrupted_at,expired_at,updated_at FROM relay_codex_input_requests WHERE module_id=?1 ORDER BY created_at DESC").map_err(|e| e.to_string())?;
-    let records = statement.query_map([module_id], |r| Ok(RelayCodexInputRequestRecord { id:r.get(0)?, module_id:r.get(1)?, cycle_id:r.get(2)?, codex_thread_id:r.get(3)?, codex_turn_id:r.get(4)?, app_server_request_id_json:r.get(5)?, questions_json:r.get(6)?, answers_json:r.get(7)?, secret_answer_status_json:r.get(8)?, is_blocking:r.get::<_,i64>(9)? != 0, auto_resolution_ms:r.get(10)?, status:r.get(11)?, error_text:r.get(12)?, created_at:r.get(13)?, submitted_at:r.get(14)?, answered_at:r.get(15)?, interrupted_at:r.get(16)?, expired_at:r.get(17)?, updated_at:r.get(18)? })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
+    let mut statement = connection.prepare("SELECT id,module_id,cycle_id,codex_thread_id,codex_turn_id,app_server_request_id_json,questions_json,answers_json,secret_answer_status_json,is_blocking,auto_resolution_ms,status,error_text,created_at,submitted_at,answered_at,interrupted_at,expired_at,updated_at,request_compatibility_json FROM relay_codex_input_requests WHERE module_id=?1 ORDER BY created_at DESC").map_err(|e| e.to_string())?;
+    let records = statement.query_map([module_id], |r| Ok(RelayCodexInputRequestRecord { id:r.get(0)?, module_id:r.get(1)?, cycle_id:r.get(2)?, codex_thread_id:r.get(3)?, codex_turn_id:r.get(4)?, app_server_request_id_json:r.get(5)?, questions_json:r.get(6)?, answers_json:r.get(7)?, secret_answer_status_json:r.get(8)?, is_blocking:r.get::<_,i64>(9)? != 0, auto_resolution_ms:r.get(10)?, status:r.get(11)?, error_text:r.get(12)?, created_at:r.get(13)?, submitted_at:r.get(14)?, answered_at:r.get(15)?, interrupted_at:r.get(16)?, expired_at:r.get(17)?, updated_at:r.get(18)?, request_compatibility_json:r.get(19)? })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
     Ok(records)
 }
 
@@ -485,13 +486,12 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
     Ok(connection)
 }
 
-fn interrupt_unfinished_relay_codex_input_requests(connection: &Connection) -> Result<(), String> {
+fn interrupt_unfinished_relay_codex_input_requests(connection: &mut Connection) -> Result<usize, String> {
     let now = Utc::now().to_rfc3339();
-    let changed = connection.execute("UPDATE relay_codex_input_requests SET status='INTERRUPTED', error_text='应用或运行时已重启，答案不会自动重发。', interrupted_at=?1, updated_at=?1 WHERE status IN ('PENDING','ANSWERING')", [&now]).map_err(|error| error.to_string())?;
-    if changed > 0 {
-        connection.execute("UPDATE relay_modules SET phase='RECOVERY_REQUIRED', updated_at=?1 WHERE id IN (SELECT DISTINCT module_id FROM relay_codex_input_requests WHERE status='INTERRUPTED')", [&now]).map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    let transaction = connection.transaction().map_err(|e| e.to_string())?;
+    let rows: Vec<(String,String)> = transaction.prepare("SELECT id,module_id FROM relay_codex_input_requests WHERE status IN ('PENDING','ANSWERING')").map_err(|e| e.to_string())?.query_map([], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?.collect::<Result<_,_>>().map_err(|e| e.to_string())?;
+    for (id,module_id) in &rows { transaction.execute("UPDATE relay_codex_input_requests SET status='INTERRUPTED',error_text='应用或运行时已重启，答案不会自动重发。',interrupted_at=?2,updated_at=?2 WHERE id=?1",params![id,&now]).map_err(|e|e.to_string())?; transaction.execute("UPDATE relay_modules SET phase='RECOVERY_REQUIRED',updated_at=?2 WHERE id=?1 AND phase NOT IN ('STOPPED','COMPLETED')",params![module_id,&now]).map_err(|e|e.to_string())?; append_relay_event_in_transaction(&transaction,module_id,"CODEX_INPUT_INTERRUPTED","Codex 人工输入因重启中断；答案不会自动重发。")?; }
+    transaction.commit().map_err(|e| e.to_string())?; Ok(rows.len())
 }
 
 fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String> {
@@ -7372,10 +7372,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            let connection = create_connection(app.handle())?;
+            let mut connection = create_connection(app.handle())?;
             pause_unfinished_orchestrations(&connection)?;
             mark_uncertain_relay_deliveries(&connection)?;
-            interrupt_unfinished_relay_codex_input_requests(&connection)?;
+            interrupt_unfinished_relay_codex_input_requests(&mut connection)?;
             let chatgpt_bridge = Arc::new(ChatGptBridge::new());
             start_chatgpt_bridge(app.handle().clone(), chatgpt_bridge.clone())?;
             app.manage(AppState {
