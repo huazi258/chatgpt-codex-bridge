@@ -78,18 +78,7 @@ This is not final completion. The middleware enters `WAITING_FOR_ACCEPTANCE`. Th
 
 The middleware shows a Chinese intervention card. The user enters a reply in the middleware; it is sent to ChatGPT as an automation message and the workflow continues from ChatGPT's next eligible reply.
 
-### Answer a pending Codex input request
-
-```text
-@@@CODEX_INPUT@@@
-1. <answer to the first question>
-2. <answer to the second question, if any>
-@@@END_CODEX_INPUT@@@
-```
-
-`CODEX_INPUT` is valid only while the current Codex turn has a pending App Server user-input request. The middleware maps numbered answers to the questions in their presented order, replies to the same App Server request, and lets the existing turn continue. Missing, duplicate, or extra answers are invalid.
-
-No reply may contain more than one control block, and `CODEX_INPUT` is invalid when no input request is pending.
+No reply may contain more than one control block. Codex App Server user-input requests are not ChatGPT control blocks: they follow the direct middleware-to-user flow defined below.
 
 ## Retry, errors, and runtime control
 
@@ -100,17 +89,17 @@ The module has only two configured budgets:
 - total module runtime, starting when the first Codex turn starts;
 - maximum started `CODEX_PROMPT` cycles.
 
-Retries, `CODEX_INPUT` exchanges, and manual messages do not increment the cycle count, but all elapsed time after module start counts toward the runtime budget. When a budget is reached, the active Codex turn is allowed to finish before termination.
+Retries, direct Codex human-input exchanges, and manual messages do not increment the cycle count, but all elapsed time after module start counts toward the runtime budget. When a budget is reached, the active Codex turn is allowed to finish before termination.
 
-If the user requests termination while a Codex turn is running, the middleware allows that turn to finish. If it is waiting for required Codex input, only the `CODEX_INPUT` exchange necessary to finish that same turn may continue. The final result is not sent to ChatGPT and no additional Codex prompt begins.
+If the user requests termination while a Codex turn is running, the middleware allows that turn to finish. If it is waiting for required Codex input, the user may answer the current original App Server request only to finish that same turn. The final result is not sent to ChatGPT and no additional Codex prompt begins.
 
 Connection loss, page refresh, application restart, or a delivery result whose outcome is unknown must never trigger automatic resend. The middleware preserves history, queue records, module/thread references, and the last known state; after reconnection the user chooses to inspect and continue or to resend explicitly.
 
 ## App Server permissions and input
 
-The middleware runs Codex with the configured default of full execution access. It does not create a human approval pause for App Server user-input requests. Instead, it forwards the request to ChatGPT and awaits a valid `CODEX_INPUT` response. This does not start another Codex turn.
+The middleware runs Codex with the configured default of full execution access. When an App Server user-input request arrives for the active turn, the middleware persists it and directly displays its questions to the user. The user supplies free-text answers in the middleware, which responds to the same original App Server request without involving ChatGPT. This does not start another Codex turn, cycle, or thread; options supplied by App Server are reference-only.
 
-An App Server request still requires a protocol response before the existing turn can continue. If ChatGPT fails twice to provide one, the middleware reports the failure to the user; it must not fabricate an answer.
+The request is actionable only while it remains pending in the active runtime. On application or runtime restart it is marked interrupted and the module enters recovery; the middleware never automatically restores or resends it. If App Server has already resolved or cleared it, the request is expired and cannot accept a late answer.
 
 ## User experience and observability
 
@@ -122,7 +111,7 @@ The desktop UI is Chinese by default. Every action immediately enters a visible 
 2. Manual replies that contain control-looking text never start Codex work.
 3. A Codex final reply is delivered to ChatGPT in FIFO order behind all pre-existing manual messages.
 4. A malformed eligible reply triggers one configured retry, then a Chinese user-actionable failure.
-5. A pending App Server input request completes via a valid `CODEX_INPUT` reply from ChatGPT without creating another Codex thread or turn.
+5. A pending App Server input request is displayed and answered directly by the user through the middleware to the same App Server request, without creating another Codex cycle, thread, or turn and without involving ChatGPT.
 6. `MODULE_DONE` waits for explicit user acceptance, and feedback from that screen can resume automation.
 7. Restart and uncertain delivery preserve state and require an explicit user decision before any resend or continuation.
 8. A completed module releases its middleware-owned thread; a later module can resume that released thread only when `thread/resume` succeeds.
@@ -133,4 +122,4 @@ The first V2 implementation slice is in progress. It replaces the desktop view w
 
 Plain-text terminal control-block parsing, one configured retry, `MODULE_DONE`, and `BLOCKED` are wired into the relay persistence layer. A valid `CODEX_PROMPT` now starts or continues one middleware-owned local App Server process and keeps its created thread alive for later prompts; Codex final text is appended to the same FIFO ChatGPT queue without modification.
 
-The remaining V2 work is the App Server input-response adapter (`CODEX_INPUT`), terminate/acceptance actions, released-thread resume, browser-history synchronization, and end-to-end browser pilot evidence. None of those incomplete paths may be presented as completed automation.
+The remaining V2 work includes the direct human App Server input-response flow, released-thread resume, browser-history synchronization, and end-to-end browser pilot evidence. None of those incomplete paths may be presented as completed automation.
