@@ -38,13 +38,15 @@ export interface RelayChannelSnapshot {
     recoveryBlockerCount: number;
   };
   codex: {
-    status: 'IDLE' | 'RUNNING';
+    status: 'IDLE' | 'RUNNING' | 'WAITING_FOR_USER_INPUT';
     activeModuleId?: string | null;
     activeModuleName?: string | null;
     cycleNumber?: number | null;
     codexThreadId?: string | null;
     codexTurnId?: string | null;
     cycleStatus?: CodexCycleStatus | null;
+    activeInputRequestId?: string | null;
+    inputStatus?: 'PENDING' | 'ANSWERING' | null;
   };
 }
 

@@ -485,6 +485,8 @@ struct RelayCodexChannelSnapshot {
     codex_thread_id: Option<String>,
     codex_turn_id: Option<String>,
     cycle_status: Option<String>,
+    active_input_request_id: Option<String>,
+    input_status: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1840,14 +1842,17 @@ fn relay_channel_snapshot_from_connection(
         .map_err(|error| format!("无法读取运行中的 Codex 通讯循环：{error}"))?;
     let codex = match active_codex_cycle {
         Some((module_id, module_name, cycle_number, thread_id, turn_id, cycle_status)) => {
+            let input = connection.query_row("SELECT id,status FROM relay_codex_input_requests WHERE module_id=?1 AND status IN ('PENDING','ANSWERING') ORDER BY created_at DESC LIMIT 1",[&module_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).optional().map_err(|e|format!("无法读取 Codex 输入状态：{e}"))?;
             RelayCodexChannelSnapshot {
-                status: "RUNNING".into(),
+                status: if input.is_some() { "WAITING_FOR_USER_INPUT".into() } else { "RUNNING".into() },
                 active_module_id: Some(module_id),
                 active_module_name: Some(module_name),
                 cycle_number: Some(cycle_number),
                 codex_thread_id: thread_id,
                 codex_turn_id: turn_id,
                 cycle_status: Some(cycle_status),
+                active_input_request_id: input.as_ref().map(|(id,_)|id.clone()),
+                input_status: input.map(|(_,status)|status),
             }
         }
         None => RelayCodexChannelSnapshot {
@@ -1858,6 +1863,8 @@ fn relay_channel_snapshot_from_connection(
             codex_thread_id: None,
             codex_turn_id: None,
             cycle_status: None,
+            active_input_request_id: None,
+            input_status: None,
         },
     };
 

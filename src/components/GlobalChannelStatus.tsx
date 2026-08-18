@@ -17,6 +17,7 @@ function codexChannelStatusLabel(status: RelayChannelSnapshot['codex']['status']
   switch (status) {
     case 'IDLE': return '空闲';
     case 'RUNNING': return '运行中';
+    case 'WAITING_FOR_USER_INPUT': return '等待用户输入';
   }
 }
 
@@ -51,6 +52,7 @@ export function GlobalChannelStatus({ snapshot }: GlobalChannelStatusProps) {
         <p>Codex thread：{displayValue(codex.codexThreadId)}</p>
         <p>Codex turn：{displayValue(codex.codexTurnId)}</p>
         <p>当前状态：{codex.cycleStatus ? codexCycleStatusLabel(codex.cycleStatus) : '尚未获得'}</p>
+        {codex.activeInputRequestId && <p>输入请求：{codex.activeInputRequestId}（{displayValue(codex.inputStatus)}）</p>}
       </article>
     </div>
   </section>;
