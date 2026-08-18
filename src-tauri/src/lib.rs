@@ -407,6 +407,37 @@ fn list_relay_codex_input_requests_in(connection: &Connection, module_id: &str) 
     Ok(records)
 }
 
+fn relay_codex_input_record_by_id(connection: &Connection, id: &str) -> Result<Option<RelayCodexInputRequestRecord>, String> {
+    connection.query_row("SELECT id,module_id,cycle_id,codex_thread_id,codex_turn_id,app_server_request_id_json,questions_json,answers_json,secret_answer_status_json,is_blocking,auto_resolution_ms,status,error_text,created_at,submitted_at,answered_at,interrupted_at,expired_at,updated_at,request_compatibility_json FROM relay_codex_input_requests WHERE id=?1", [id], |r| Ok(RelayCodexInputRequestRecord { id:r.get(0)?, module_id:r.get(1)?, cycle_id:r.get(2)?, codex_thread_id:r.get(3)?, codex_turn_id:r.get(4)?, app_server_request_id_json:r.get(5)?, questions_json:r.get(6)?, answers_json:r.get(7)?, secret_answer_status_json:r.get(8)?, is_blocking:r.get::<_,i64>(9)? != 0, auto_resolution_ms:r.get(10)?, status:r.get(11)?, error_text:r.get(12)?, created_at:r.get(13)?, submitted_at:r.get(14)?, answered_at:r.get(15)?, interrupted_at:r.get(16)?, expired_at:r.get(17)?, updated_at:r.get(18)?, request_compatibility_json:r.get(19)? })).optional().map_err(|e| e.to_string())
+}
+
+fn insert_relay_codex_input_request_in(connection: &mut Connection, module_id: &str, cycle_id: &str, request: &relay_codex_input::RelayCodexInputRequest) -> Result<RelayCodexInputRequestRecord, String> {
+    let now = Utc::now().to_rfc3339(); let id = Uuid::new_v4().to_string();
+    let secret = request.params.questions.iter().filter(|q| q.is_secret).map(|q| (q.id.clone(), json!({"provided":false}))).collect::<serde_json::Map<_,_>>();
+    let tx = connection.transaction().map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO relay_codex_input_requests (id,module_id,cycle_id,codex_thread_id,codex_turn_id,app_server_request_id_json,questions_json,answers_json,secret_answer_status_json,is_blocking,auto_resolution_ms,request_compatibility_json,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9,?10,?11,'PENDING',?12,?12)", params![&id,module_id,cycle_id,&request.params.thread_id,&request.params.turn_id,serde_json::to_string(&request.request_id).unwrap(),serde_json::to_string(&request.params.questions).unwrap(),serde_json::to_string(&secret).unwrap(),request.params.is_blocking as i64,request.params.auto_resolution_ms,serde_json::to_string(&request.params.compatibility).unwrap(),&now]).map_err(|e| format!("无法保存 Codex 输入请求：{e}"))?;
+    append_relay_event_in_transaction(&tx,module_id,"CODEX_INPUT_REQUEST_RECEIVED",&format!("inputRequestId={id}; 已收到 Codex 人工输入请求。"))?; tx.commit().map_err(|e|e.to_string())?;
+    relay_codex_input_record_by_id(connection,&id)?.ok_or_else(|| "输入请求保存后不可读取。".into())
+}
+
+fn claim_relay_codex_input_request_in(connection: &mut Connection, id: &str, answers: &[(String,String)]) -> Result<RelayCodexInputRequestRecord, String> {
+    let existing = relay_codex_input_record_by_id(connection,id)?.ok_or_else(|| "未找到 Codex 输入请求。".to_string())?;
+    if existing.status != "PENDING" { return Err("Codex 输入请求不再等待回答。".into()); }
+    let questions: Vec<relay_codex_input::RelayCodexInputQuestion> = serde_json::from_str(&existing.questions_json).map_err(|_|"输入问题数据无效。".to_string())?;
+    let secret_ids: std::collections::HashSet<_> = questions.iter().filter(|q|q.is_secret).map(|q|q.id.as_str()).collect();
+    let normal = answers.iter().filter(|(id,_)|!secret_ids.contains(id.as_str())).map(|(id,value)|(id.clone(),json!({"answers":if value.is_empty(){Vec::<String>::new()}else{vec![value.clone()]}}))).collect::<serde_json::Map<_,_>>();
+    let secret = answers.iter().filter(|(id,_)|secret_ids.contains(id.as_str())).map(|(id,value)|(id.clone(),json!({"provided":!value.is_empty()}))).collect::<serde_json::Map<_,_>>();
+    let now=Utc::now().to_rfc3339(); let tx=connection.transaction().map_err(|e|e.to_string())?;
+    let changed=tx.execute("UPDATE relay_codex_input_requests SET status='ANSWERING',answers_json=?2,secret_answer_status_json=?3,submitted_at=?4,updated_at=?4 WHERE id=?1 AND status='PENDING'",params![id,serde_json::to_string(&normal).unwrap(),serde_json::to_string(&secret).unwrap(),&now]).map_err(|e|e.to_string())?;
+    if changed != 1 { return Err("Codex 输入请求已由其他操作处理。".into()); }
+    append_relay_event_in_transaction(&tx,&existing.module_id,"CODEX_INPUT_ANSWER_SUBMITTED",&format!("inputRequestId={id}; questionCount={}; secretCount={}",answers.len(),secret_ids.len()))?; tx.commit().map_err(|e|e.to_string())?; relay_codex_input_record_by_id(connection,id)?.ok_or_else(||"输入请求不可读取。".into())
+}
+
+fn mark_relay_codex_input_response_sent_in(connection: &Connection, id: &str) -> Result<(), String> { if relay_codex_input_record_by_id(connection,id)?.is_some_and(|r|r.status=="ANSWERING") { Ok(()) } else { Err("Codex 输入请求不在回答中。".into()) } }
+fn resolve_relay_codex_input_request_in(connection: &mut Connection, id: &str) -> Result<bool,String> { transition_relay_codex_input_in(connection,id,"ANSWERING","ANSWERED","answered_at","CODEX_INPUT_ANSWERED","Codex 已确认收到答案。") }
+fn expire_relay_codex_input_request_in(connection: &mut Connection, id: &str) -> Result<bool,String> { transition_relay_codex_input_in(connection,id,"PENDING","EXPIRED","expired_at","CODEX_INPUT_EXPIRED","Codex 输入请求已失效。") }
+fn transition_relay_codex_input_in(connection:&mut Connection,id:&str,from:&str,to:&str,time_column:&str,event:&str,detail:&str)->Result<bool,String>{ let record=relay_codex_input_record_by_id(connection,id)?.ok_or_else(||"未找到 Codex 输入请求。".to_string())?; let now=Utc::now().to_rfc3339(); let tx=connection.transaction().map_err(|e|e.to_string())?; let sql=format!("UPDATE relay_codex_input_requests SET status=?3,{time_column}=?2,updated_at=?2 WHERE id=?1 AND status=?4"); let changed=tx.execute(&sql,params![id,&now,to,from]).map_err(|e|e.to_string())?; if changed==1{append_relay_event_in_transaction(&tx,&record.module_id,event,&format!("inputRequestId={id}; {detail}"))?;} tx.commit().map_err(|e|e.to_string())?;Ok(changed==1)}
+
 #[tauri::command]
 fn list_relay_codex_input_requests(module_id: String, state: State<'_, AppState>) -> Result<Vec<RelayCodexInputRequestRecord>, String> {
     let connection = state.connection.lock().map_err(|_| "数据库锁已损坏。".to_string())?;
@@ -7365,6 +7396,24 @@ Copy code"#;
     fn bridge_keeps_a_paired_connection_alive_when_it_receives_a_ping() {
         let frame = classify_bridge_frame(Some(Ok(Message::Ping(vec![1, 2, 3].into()))));
         assert!(matches!(frame, BridgeFrame::Ping(_)));
+    }
+    #[test]
+    fn relay_codex_input_request_lifecycle_persists_without_relay_messages() {
+        let mut connection = relay_connection(); insert_relay_module(&connection,"input-module","输入模块");
+        connection.execute("INSERT INTO relay_codex_cycles (id,module_id,cycle_number,status,prompt_text,created_at,updated_at) VALUES ('cycle','input-module',1,'CODEX_RUNNING','p','now','now')",[]).unwrap();
+        let request = relay_codex_input::parse_request(&json!({"id":-7,"method":"item/tool/requestUserInput","params":{"threadId":"thread","turnId":"turn","itemId":"item","isBlocking":true,"autoResolutionMs":99,"questions":[{"id":"normal","header":"N","question":"Q","options":null},{"id":"secret","header":"S","question":"Q","options":null,"isSecret":true}],"compatibilityFlag":true}})).unwrap();
+        let record=insert_relay_codex_input_request_in(&mut connection,"input-module","cycle",&request).unwrap(); assert_eq!(record.status,"PENDING"); assert_eq!(record.app_server_request_id_json,"-7"); assert!(record.request_compatibility_json.contains("compatibilityFlag"));
+        let claimed=claim_relay_codex_input_request_in(&mut connection,&record.id,&[("normal".into(),"visible".into()),("secret".into(),"SECRET_SENTINEL_DO_NOT_PERSIST".into())]).unwrap(); assert_eq!(claimed.status,"ANSWERING"); assert!(!claimed.answers_json.unwrap().contains("SECRET_SENTINEL")); assert!(!claimed.secret_answer_status_json.contains("SECRET_SENTINEL"));
+        mark_relay_codex_input_response_sent_in(&connection,&record.id).unwrap(); assert!(resolve_relay_codex_input_request_in(&mut connection,&record.id).unwrap()); assert!(!resolve_relay_codex_input_request_in(&mut connection,&record.id).unwrap());
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM relay_messages",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn relay_codex_input_request_restart_is_idempotent_and_preserves_terminal_modules() {
+        let mut connection=relay_connection(); insert_relay_module(&connection,"old","old"); insert_relay_module(&connection,"new","new"); connection.execute("UPDATE relay_modules SET phase='STOPPED' WHERE id='old'",[]).unwrap();
+        for module in ["old","new"] { let status=if module=="old"{"CODEX_COMPLETED"}else{"CODEX_RUNNING"}; let request_id=if module=="old"{"1"}else{"2"}; connection.execute("INSERT INTO relay_codex_cycles (id,module_id,cycle_number,status,prompt_text,created_at,updated_at) VALUES (?1,?1,1,?2,'p','n','n')",params![module,status]).unwrap(); connection.execute("INSERT INTO relay_codex_input_requests (id,module_id,cycle_id,codex_thread_id,codex_turn_id,app_server_request_id_json,questions_json,secret_answer_status_json,is_blocking,request_compatibility_json,status,created_at,updated_at) VALUES (?1,?1,?1,'t','u',?2,'[]','{}',1,'{}','PENDING','n','n')",params![module,request_id]).unwrap(); }
+        assert_eq!(interrupt_unfinished_relay_codex_input_requests(&mut connection).unwrap(),2); assert_eq!(interrupt_unfinished_relay_codex_input_requests(&mut connection).unwrap(),0);
+        assert_eq!(get_relay_module(&connection,"old").unwrap().unwrap().phase,"STOPPED"); assert_eq!(get_relay_module(&connection,"new").unwrap().unwrap().phase,"RECOVERY_REQUIRED");
     }
 }
 
