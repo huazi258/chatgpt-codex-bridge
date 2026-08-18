@@ -153,10 +153,13 @@ struct RelayCodexSession {
 
 enum RelayCodexCommand {
     StartTurn { cycle_id: String, prompt: String },
+    AnswerInput { input_request_id: String, submission: relay_codex_input::RelayCodexInputSubmission, acknowledgement: std_mpsc::Sender<RelayCodexInputAnswerResult> },
     Release {
         acknowledgement: std_mpsc::Sender<Result<(), String>>,
     },
 }
+
+enum RelayCodexInputAnswerResult { ResponseSent, Expired(String), TransportFailure(String) }
 
 fn release_relay_codex_session(
     sessions: &Mutex<Option<RelayCodexSession>>,
@@ -436,12 +439,28 @@ fn claim_relay_codex_input_request_in(connection: &mut Connection, id: &str, ans
 fn mark_relay_codex_input_response_sent_in(connection: &Connection, id: &str) -> Result<(), String> { if relay_codex_input_record_by_id(connection,id)?.is_some_and(|r|r.status=="ANSWERING") { Ok(()) } else { Err("Codex 输入请求不在回答中。".into()) } }
 fn resolve_relay_codex_input_request_in(connection: &mut Connection, id: &str) -> Result<bool,String> { transition_relay_codex_input_in(connection,id,"ANSWERING","ANSWERED","answered_at","CODEX_INPUT_ANSWERED","Codex 已确认收到答案。") }
 fn expire_relay_codex_input_request_in(connection: &mut Connection, id: &str) -> Result<bool,String> { transition_relay_codex_input_in(connection,id,"PENDING","EXPIRED","expired_at","CODEX_INPUT_EXPIRED","Codex 输入请求已失效。") }
+fn interrupt_relay_codex_input_request_in(connection: &mut Connection, id: &str, reason: &str) -> Result<bool,String> { let record=relay_codex_input_record_by_id(connection,id)?.ok_or_else(||"未找到 Codex 输入请求。".to_string())?; let now=Utc::now().to_rfc3339(); let tx=connection.transaction().map_err(|e|e.to_string())?; let changed=tx.execute("UPDATE relay_codex_input_requests SET status='INTERRUPTED',error_text=?2,interrupted_at=?3,updated_at=?3 WHERE id=?1 AND status='ANSWERING'",params![id,reason,&now]).map_err(|e|e.to_string())?; if changed==1 {tx.execute("UPDATE relay_modules SET phase='RECOVERY_REQUIRED',updated_at=?2 WHERE id=?1 AND phase NOT IN ('STOPPED','COMPLETED')",params![&record.module_id,&now]).map_err(|e|e.to_string())?;append_relay_event_in_transaction(&tx,&record.module_id,"CODEX_INPUT_ANSWER_FAILED",&format!("inputRequestId={id}; 答案送达未确认。"))?;}tx.commit().map_err(|e|e.to_string())?;Ok(changed==1)}
 fn transition_relay_codex_input_in(connection:&mut Connection,id:&str,from:&str,to:&str,time_column:&str,event:&str,detail:&str)->Result<bool,String>{ let record=relay_codex_input_record_by_id(connection,id)?.ok_or_else(||"未找到 Codex 输入请求。".to_string())?; let now=Utc::now().to_rfc3339(); let tx=connection.transaction().map_err(|e|e.to_string())?; let sql=format!("UPDATE relay_codex_input_requests SET status=?3,{time_column}=?2,updated_at=?2 WHERE id=?1 AND status=?4"); let changed=tx.execute(&sql,params![id,&now,to,from]).map_err(|e|e.to_string())?; if changed==1{append_relay_event_in_transaction(&tx,&record.module_id,event,&format!("inputRequestId={id}; {detail}"))?;} tx.commit().map_err(|e|e.to_string())?;Ok(changed==1)}
 
 #[tauri::command]
 fn list_relay_codex_input_requests(module_id: String, state: State<'_, AppState>) -> Result<Vec<RelayCodexInputRequestRecord>, String> {
     let connection = state.connection.lock().map_err(|_| "数据库锁已损坏。".to_string())?;
     list_relay_codex_input_requests_in(&connection, &module_id)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexInputAnswerInput { question_id: String, answer: String }
+
+#[tauri::command]
+fn submit_relay_codex_input(input_request_id: String, answers: Vec<RelayCodexInputAnswerInput>, app: AppHandle) -> Result<RelayCodexInputRequestRecord, String> {
+    let state=app.state::<AppState>();
+    let submission=relay_codex_input::RelayCodexInputSubmission { answers: answers.into_iter().map(|answer|(answer.question_id,answer.answer)).collect() };
+    let record = { let mut connection=state.connection.lock().map_err(|_|"数据库锁已损坏。".to_string())?; let record=relay_codex_input_record_by_id(&connection,&input_request_id)?.ok_or_else(||"未找到 Codex 输入请求。".to_string())?; if record.status=="ANSWERED" { return Ok(record); } let questions:Vec<relay_codex_input::RelayCodexInputQuestion>=serde_json::from_str(&record.questions_json).map_err(|_|"输入问题数据无效。".to_string())?; let request=relay_codex_input::RelayCodexInputRequest { request_id:serde_json::from_str(&record.app_server_request_id_json).map_err(|_|"请求 ID 数据无效。".to_string())?,params:relay_codex_input::RelayCodexInputRequestParams {thread_id:record.codex_thread_id.clone(),turn_id:record.codex_turn_id.clone(),item_id:String::new(),is_blocking:record.is_blocking,auto_resolution_ms:record.auto_resolution_ms,questions,compatibility:serde_json::from_str(&record.request_compatibility_json).unwrap_or_default()} }; relay_codex_input::validate_submission(&request,submission.clone())?; claim_relay_codex_input_request_in(&mut connection,&input_request_id,&submission.answers)? };
+    let session=state.relay_codex.lock().map_err(|_|"Codex 会话锁已损坏。".to_string())?.clone().filter(|session|session.module_id==record.module_id).ok_or_else(||"Codex 输入请求对应的运行时不可用。".to_string())?;
+    let (sender,receiver)=std_mpsc::channel(); if session.commands.send(RelayCodexCommand::AnswerInput{input_request_id:input_request_id.clone(),submission,acknowledgement:sender}).is_err() { let mut connection=state.connection.lock().map_err(|_|"数据库锁已损坏。".to_string())?; let _=interrupt_relay_codex_input_request_in(&mut connection,&input_request_id,"Codex 运行时已中断，答案不会自动重发。"); return Err("Codex 运行时已中断，答案不会自动重发。".into()); }
+    match receiver.recv_timeout(std::time::Duration::from_secs(5)) { Ok(RelayCodexInputAnswerResult::ResponseSent)=>{}, Ok(RelayCodexInputAnswerResult::Expired(reason))=>return Err(reason), Ok(RelayCodexInputAnswerResult::TransportFailure(_))|Err(_)=>{let mut connection=state.connection.lock().map_err(|_|"数据库锁已损坏。".to_string())?;let _=interrupt_relay_codex_input_request_in(&mut connection,&input_request_id,"Codex 答案送达未确认，不会自动重发。");return Err("Codex 答案送达未确认，不会自动重发。".into());} }
+    let connection=state.connection.lock().map_err(|_|"数据库锁已损坏。".to_string())?; relay_codex_input_record_by_id(&connection,&input_request_id)?.ok_or_else(||"输入请求不可读取。".into())
 }
 
 #[derive(Debug, Serialize)]
@@ -3970,6 +3989,21 @@ fn relay_codex_worker(
                         pending_turn = Some((cycle_id, prompt));
                     }
                 }
+                RelayCodexCommand::AnswerInput { input_request_id, submission, acknowledgement } => {
+                    let result = (|| -> Result<(), String> {
+                        let state = app.state::<AppState>();
+                        let mut connection = state.connection.lock().map_err(|_| "数据库锁已损坏。".to_string())?;
+                        let record = relay_codex_input_record_by_id(&connection, &input_request_id)?.ok_or_else(|| "未找到 Codex 输入请求。".to_string())?;
+                        if record.module_id != module_id || record.status != "ANSWERING" || thread_id.as_deref() != Some(record.codex_thread_id.as_str()) { return Err("Codex 输入请求已失效或不属于当前对话。".into()); }
+                        let questions: Vec<relay_codex_input::RelayCodexInputQuestion> = serde_json::from_str(&record.questions_json).map_err(|_| "输入问题数据无效。".to_string())?;
+                        let request = relay_codex_input::RelayCodexInputRequest { request_id: serde_json::from_str(&record.app_server_request_id_json).map_err(|_| "请求 ID 数据无效。".to_string())?, params: relay_codex_input::RelayCodexInputRequestParams { thread_id: record.codex_thread_id.clone(), turn_id: record.codex_turn_id.clone(), item_id: String::new(), is_blocking: record.is_blocking, auto_resolution_ms: record.auto_resolution_ms, questions, compatibility: serde_json::from_str(&record.request_compatibility_json).unwrap_or_default() } };
+                        let response = relay_codex_input::build_request_user_input_response(&request, submission)?;
+                        send_rpc(&mut stdin, response)?;
+                        mark_relay_codex_input_response_sent_in(&connection, &input_request_id)?;
+                        Ok(())
+                    })();
+                    let _ = acknowledgement.send(match result { Ok(()) => RelayCodexInputAnswerResult::ResponseSent, Err(error) => RelayCodexInputAnswerResult::TransportFailure(error) });
+                }
                 RelayCodexCommand::Release { acknowledgement } => {
                     if active_cycle_id.is_some() || pending_turn.is_some() {
                         let _ = acknowledgement.send(Err(
@@ -4080,6 +4114,26 @@ fn relay_codex_worker(
                     }
                     Some(_) => {}
                     None => {}
+                }
+                if message.get("method").and_then(Value::as_str) == Some("item/tool/requestUserInput") {
+                    if let (Ok(request), Some(cycle_id), Some(thread)) = (relay_codex_input::parse_request(&message), active_cycle_id.as_deref(), thread_id.as_deref()) {
+                        if request.params.thread_id == thread {
+                            let state = app.state::<AppState>();
+                            if let Ok(mut connection) = state.connection.lock() {
+                                if insert_relay_codex_input_request_in(&mut connection, &module_id, cycle_id, &request).is_ok() { let _ = app.emit("relay-codex", json!({"moduleId":module_id,"cycleId":cycle_id})); }
+                            };
+                        }
+                    }
+                }
+                if message.get("method").and_then(Value::as_str) == Some("serverRequest/resolved") {
+                    if let Ok(resolved) = relay_codex_input::parse_server_request_resolved(&message) {
+                        let state = app.state::<AppState>();
+                        if let Ok(mut connection) = state.connection.lock() {
+                            let request_json = serde_json::to_string(&resolved.request_id).unwrap_or_default();
+                            let id = connection.query_row("SELECT id FROM relay_codex_input_requests WHERE module_id=?1 AND codex_thread_id=?2 AND app_server_request_id_json=?3 AND status IN ('PENDING','ANSWERING')",params![&module_id,&resolved.thread_id,&request_json],|row|row.get::<_,String>(0)).optional().ok().flatten();
+                            if let Some(id)=id { let changed=if relay_codex_input_record_by_id(&connection,&id).ok().flatten().is_some_and(|r|r.status=="PENDING") { expire_relay_codex_input_request_in(&mut connection,&id).unwrap_or(false) } else { resolve_relay_codex_input_request_in(&mut connection,&id).unwrap_or(false) }; if changed { let _=app.emit("relay-codex",json!({"moduleId":module_id,"inputRequestId":id})); } }
+                        };
+                    }
                 }
                 if message.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
                 {
@@ -5359,6 +5413,7 @@ mod tests {
                 .send(Ok(()))
                 .expect("acknowledge idle release"),
             RelayCodexCommand::StartTurn { .. } => panic!("release must not start a turn"),
+            RelayCodexCommand::AnswerInput { .. } => panic!("release must not answer input"),
         });
 
         release_relay_codex_session(
@@ -5450,6 +5505,7 @@ mod tests {
                 .send(Ok(()))
                 .expect("acknowledge failed-turn release"),
             RelayCodexCommand::StartTurn { .. } => panic!("failed turn must only schedule release"),
+            RelayCodexCommand::AnswerInput { .. } => panic!("failed turn must not answer input"),
         });
         release_relay_codex_session(
             &sessions,
@@ -5990,6 +6046,7 @@ mod tests {
                 assert_eq!(received_prompt, prompt);
             }
             RelayCodexCommand::Release { .. } => panic!("follow-up feedback must not release worker"),
+            RelayCodexCommand::AnswerInput { .. } => panic!("follow-up feedback must not answer input"),
         }
         assert!(session.turn_active.load(Ordering::SeqCst));
         let module: (String, Option<String>, i64) = connection
@@ -7452,6 +7509,7 @@ pub fn run() {
             list_relay_messages,
             list_relay_codex_cycles,
             list_relay_codex_input_requests,
+            submit_relay_codex_input,
             get_relay_channel_snapshot,
             list_relay_recovery_messages,
             queue_relay_message,
