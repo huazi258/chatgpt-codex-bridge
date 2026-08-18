@@ -17,7 +17,13 @@ export function CodexHumanInputPanel({ request, stopAfterTurn, onSubmit }: { req
   const metadata = <p><small>Cycle {request.cycleNumber ?? '—'} · Thread {request.codexThreadId} · Turn {request.codexTurnId} · 状态：{request.status}</small></p>;
   if (!questions) return <section className="form-section codex-human-input"><h3>Codex 输入请求</h3>{metadata}<p>输入请求数据无效，无法安全提交。请检查 Codex 运行状态。</p></section>;
   if (request.status === 'ANSWERED') return <section className="form-section codex-human-input"><h3>Codex 输入已确认</h3>{metadata}<p>Codex 已确认收到答案。</p></section>;
-  if (request.status !== 'PENDING') return <section className="form-section codex-human-input"><h3>Codex 输入请求</h3>{metadata}<p>{request.errorText || (request.status === 'ANSWERING' ? '答案已发送，正在等待 Codex 确认' : '该输入请求已不可提交。')}</p></section>;
+  if (request.status !== 'PENDING') {
+    const message = request.errorText
+      || (request.status === 'ANSWERING' ? '答案已发送，正在等待 Codex 确认'
+        : request.status === 'EXPIRED' ? 'Codex App Server 已不再接受此输入请求。'
+          : '输入请求因应用或运行时中断，请检查模块恢复状态。');
+    return <section className="form-section codex-human-input"><h3>Codex 输入请求</h3>{metadata}<p>{message}</p></section>;
+  }
   const safeQuestions = questions;
   function submit() {
     const outgoing = safeQuestions.map((question) => ({ questionId: question.id, answer: answers[question.id] ?? '' }));

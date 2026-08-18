@@ -590,7 +590,8 @@ fn expire_relay_codex_input_request_in(
     }
     let now = Utc::now().to_rfc3339();
     let tx = connection.transaction().map_err(|e| e.to_string())?;
-    let changed=tx.execute("UPDATE relay_codex_input_requests SET status='EXPIRED',expired_at=?2,updated_at=?2 WHERE id=?1 AND status IN ('PENDING','ANSWERING')",params![id,&now]).map_err(|e|e.to_string())?;
+    let reason = "Codex App Server 已不再接受此输入请求。";
+    let changed=tx.execute("UPDATE relay_codex_input_requests SET status='EXPIRED',error_text=?2,expired_at=?3,updated_at=?3 WHERE id=?1 AND status IN ('PENDING','ANSWERING')",params![id,reason,&now]).map_err(|e|e.to_string())?;
     if changed == 1 {
         append_relay_event_in_transaction(
             &tx,
@@ -4816,13 +4817,28 @@ fn relay_codex_worker(
                     if status == "completed" {
                         if let Some(input) = active_input.take() {
                             if let Ok(mut connection) = app.state::<AppState>().connection.lock() {
-                                if expire_relay_codex_input_request_in(
-                                    &mut connection,
-                                    &input.input_request_id,
-                                )
-                                .unwrap_or(false)
-                                {
-                                    let _=app.emit("relay-codex",json!({"moduleId":module_id,"inputRequestId":input.input_request_id,"status":"EXPIRED"}));
+                                let (changed, input_status) = if input.response_sent {
+                                    (
+                                        interrupt_relay_codex_input_request_in(
+                                            &mut connection,
+                                            &input.input_request_id,
+                                            "Codex 回合结束前未确认答案送达，不会自动重发。",
+                                        )
+                                        .unwrap_or(false),
+                                        "INTERRUPTED",
+                                    )
+                                } else {
+                                    (
+                                        expire_relay_codex_input_request_in(
+                                            &mut connection,
+                                            &input.input_request_id,
+                                        )
+                                        .unwrap_or(false),
+                                        "EXPIRED",
+                                    )
+                                };
+                                if changed {
+                                    let _=app.emit("relay-codex",json!({"moduleId":module_id,"inputRequestId":input.input_request_id,"status":input_status}));
                                 }
                             }
                         }
@@ -4845,13 +4861,28 @@ fn relay_codex_worker(
                     } else {
                         if let Some(input) = active_input.take() {
                             if let Ok(mut connection) = app.state::<AppState>().connection.lock() {
-                                if expire_relay_codex_input_request_in(
-                                    &mut connection,
-                                    &input.input_request_id,
-                                )
-                                .unwrap_or(false)
-                                {
-                                    let _=app.emit("relay-codex",json!({"moduleId":module_id,"inputRequestId":input.input_request_id,"status":"EXPIRED"}));
+                                let (changed, input_status) = if input.response_sent {
+                                    (
+                                        interrupt_relay_codex_input_request_in(
+                                            &mut connection,
+                                            &input.input_request_id,
+                                            "Codex 回合结束前未确认答案送达，不会自动重发。",
+                                        )
+                                        .unwrap_or(false),
+                                        "INTERRUPTED",
+                                    )
+                                } else {
+                                    (
+                                        expire_relay_codex_input_request_in(
+                                            &mut connection,
+                                            &input.input_request_id,
+                                        )
+                                        .unwrap_or(false),
+                                        "EXPIRED",
+                                    )
+                                };
+                                if changed {
+                                    let _=app.emit("relay-codex",json!({"moduleId":module_id,"inputRequestId":input.input_request_id,"status":input_status}));
                                 }
                             }
                         }
@@ -8335,6 +8366,35 @@ Copy code"#;
                     .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn relay_codex_input_response_sent_without_resolution_is_interrupted_not_expired() {
+        let mut connection = relay_connection();
+        insert_relay_module(&connection, "module", "模块");
+        connection.execute("INSERT INTO relay_codex_cycles (id,module_id,cycle_number,status,prompt_text,created_at,updated_at) VALUES ('cycle','module',1,'CODEX_RUNNING','p','now','now')", []).unwrap();
+        let request = relay_codex_input::parse_request(&json!({"id":"request","method":"item/tool/requestUserInput","params":{"threadId":"thread","turnId":"turn","itemId":"item","isBlocking":true,"questions":[{"id":"question","header":"Q","question":"Q","options":null}]}})).unwrap();
+        let record =
+            insert_relay_codex_input_request_in(&mut connection, "module", "cycle", &request)
+                .unwrap();
+        claim_relay_codex_input_request_in(
+            &mut connection,
+            &record.id,
+            &[("question".into(), "answer".into())],
+        )
+        .unwrap();
+        mark_relay_codex_input_response_sent_in(&connection, &record.id).unwrap();
+        assert!(
+            interrupt_relay_codex_input_request_in(&mut connection, &record.id, "turn ended")
+                .unwrap()
+        );
+        assert_eq!(
+            relay_codex_input_record_by_id(&connection, &record.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "INTERRUPTED"
         );
     }
 }

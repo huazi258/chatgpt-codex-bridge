@@ -364,8 +364,8 @@ describe('Codex 人工输入面板', () => {
 
   it.each([
     ['ANSWERING', '答案已发送，正在等待 Codex 确认'],
-    ['EXPIRED', '该输入请求已不可提交。'],
-    ['INTERRUPTED', '该输入请求已不可提交。'],
+    ['EXPIRED', 'Codex App Server 已不再接受此输入请求。'],
+    ['INTERRUPTED', '输入请求因应用或运行时中断，请检查模块恢复状态。'],
   ] as const)('%s 请求不可重复提交', (status, text) => {
     render(<CodexHumanInputPanel request={{ ...pendingRequest, status }} stopAfterTurn={false} onSubmit={async () => undefined} />);
     expect(screen.getByText(text)).toBeTruthy();
