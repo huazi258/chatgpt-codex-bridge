@@ -938,6 +938,18 @@ fn mark_relay_runtime_budget_reached_in(
     Ok(changed == 1)
 }
 
+fn check_relay_runtime_budget_for_active_turn_in(
+    connection: &Connection,
+    module_id: &str,
+    has_active_turn: bool,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    if !has_active_turn {
+        return Ok(false);
+    }
+    mark_relay_runtime_budget_reached_in(connection, module_id, now)
+}
+
 fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String> {
     let message_ids: Vec<String> = connection
         .prepare(
@@ -4383,7 +4395,12 @@ fn relay_codex_worker(
     let mut deferred_command: Option<RelayCodexCommand> = None;
     'worker: loop {
         if let Ok(connection) = app.state::<AppState>().connection.lock() {
-            let _ = mark_relay_runtime_budget_reached_in(&connection, &module_id, Utc::now());
+            let _ = check_relay_runtime_budget_for_active_turn_in(
+                &connection,
+                &module_id,
+                active_cycle_id.is_some() && active_turn_id.is_some(),
+                Utc::now(),
+            );
         }
         // stdout has priority over a newly submitted answer.  In particular, an already
         // queued `serverRequest/resolved` must expire the request before we can write a
@@ -8305,23 +8322,59 @@ Copy code"#;
         let connection = relay_connection();
         insert_relay_module(&connection, "module", "模块");
         connection.execute("UPDATE relay_modules SET phase='CODEX_RUNNING',module_started_at='2026-08-01T00:00:00Z',max_runtime_minutes=1 WHERE id='module'",[]).unwrap();
-        assert!(mark_relay_runtime_budget_reached_in(
+        assert!(check_relay_runtime_budget_for_active_turn_in(
             &connection,
             "module",
+            true,
             DateTime::parse_from_rfc3339("2026-08-01T00:02:00Z")
                 .unwrap()
                 .with_timezone(&Utc)
         )
         .unwrap());
-        assert!(!mark_relay_runtime_budget_reached_in(
+        assert!(!check_relay_runtime_budget_for_active_turn_in(
             &connection,
             "module",
+            true,
             DateTime::parse_from_rfc3339("2026-08-01T00:03:00Z")
                 .unwrap()
                 .with_timezone(&Utc)
         )
         .unwrap());
         assert_eq!(connection.query_row("SELECT COUNT(*) FROM relay_events WHERE module_id='module' AND event_type='RUNTIME_BUDGET_REACHED'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn relay_runtime_budget_tick_ignores_idle_resident_worker() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module", "模块");
+        connection.execute("UPDATE relay_modules SET phase='READY',module_started_at='2026-08-01T00:00:00Z',max_runtime_minutes=1 WHERE id='module'",[]).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-08-01T00:02:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            !check_relay_runtime_budget_for_active_turn_in(&connection, "module", false, now)
+                .unwrap()
+        );
+        let module = get_relay_module(&connection, "module").unwrap().unwrap();
+        assert!(!module.stop_after_turn);
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM relay_events WHERE module_id='module' AND event_type='RUNTIME_BUDGET_REACHED'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase='WAITING_FOR_ACCEPTANCE' WHERE id='module'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !check_relay_runtime_budget_for_active_turn_in(&connection, "module", false, now)
+                .unwrap()
+        );
+        assert_eq!(
+            get_relay_module(&connection, "module")
+                .unwrap()
+                .unwrap()
+                .phase,
+            "WAITING_FOR_ACCEPTANCE"
+        );
     }
 
     #[test]
@@ -8414,6 +8467,75 @@ Copy code"#;
                 .unwrap()
                 .status,
             "INTERRUPTED"
+        );
+    }
+
+    #[test]
+    fn relay_codex_worker_input_fixture_prioritizes_resolved_and_preserves_identity() {
+        let mut connection = relay_connection();
+        insert_relay_module(&connection, "module", "模块");
+        connection.execute("INSERT INTO relay_codex_cycles (id,module_id,cycle_number,status,prompt_text,codex_thread_id,codex_turn_id,created_at,updated_at) VALUES ('cycle','module',1,'CODEX_RUNNING','p','thread','turn','now','now')", []).unwrap();
+        let request = |id: &str, question: &str| {
+            relay_codex_input::parse_request(&json!({"id":id,"method":"item/tool/requestUserInput","params":{"threadId":"thread","turnId":"turn","itemId":format!("item-{id}"),"isBlocking":true,"questions":[{"id":question,"header":"Q","question":"Q","options":null}]}})).unwrap()
+        };
+        let first = request("request-1", "q1");
+        let first_record =
+            insert_relay_codex_input_request_in(&mut connection, "module", "cycle", &first)
+                .unwrap();
+        // A queued resolved event wins over a simultaneous local claim: no response frame is built.
+        assert!(expire_relay_codex_input_request_in(&mut connection, &first_record.id).unwrap());
+        assert_eq!(
+            relay_codex_input_record_by_id(&connection, &first_record.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "EXPIRED"
+        );
+        let second = request("request-2", "q2");
+        let second_record =
+            insert_relay_codex_input_request_in(&mut connection, "module", "cycle", &second)
+                .unwrap();
+        claim_relay_codex_input_request_in(
+            &mut connection,
+            &second_record.id,
+            &[("q2".into(), "answer".into())],
+        )
+        .unwrap();
+        let response = relay_codex_input::build_request_user_input_response(
+            &second,
+            relay_codex_input::RelayCodexInputSubmission {
+                answers: vec![("q2".into(), "answer".into())],
+            },
+        )
+        .unwrap();
+        assert_eq!(response["id"], "request-2");
+        assert!(response.get("method").is_none());
+        mark_relay_codex_input_response_sent_in(&connection, &second_record.id).unwrap();
+        assert!(!resolve_relay_codex_input_request_in(&mut connection, &first_record.id).unwrap());
+        assert!(resolve_relay_codex_input_request_in(&mut connection, &second_record.id).unwrap());
+        assert_eq!(
+            relay_codex_input_record_by_id(&connection, &second_record.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "ANSWERED"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT started_cycles FROM relay_modules WHERE id='module'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 }
