@@ -97,9 +97,9 @@ Connection loss, page refresh, application restart, or a delivery result whose o
 
 ## App Server permissions and input
 
-The middleware runs Codex with the configured default of full execution access. When an App Server user-input request arrives for the active turn, the middleware persists it and directly displays its questions to the user. The user supplies free-text answers in the middleware, which responds to the same original App Server request without involving ChatGPT. This does not start another Codex turn, cycle, or thread; options supplied by App Server are reference-only.
+The middleware runs Codex with the configured default of full execution access. When an App Server user-input request arrives for the active turn, the middleware persists its full question metadata and directly displays its questions to the user. The user supplies free-text answers in the middleware, which responds to the same original App Server request without involving ChatGPT. UI order is presentation-only: the response maps each App Server `question.id` to that question's answers list, never to its display text, header, or array position. Empty answers are represented by an empty list; options are reference-only. `isSecret` answers are used only in memory for the original response and are never persisted or logged. This does not start another Codex turn, cycle, or thread.
 
-The request is actionable only while it remains pending in the active runtime. On application or runtime restart it is marked interrupted and the module enters recovery; the middleware never automatically restores or resends it. If App Server has already resolved or cleared it, the request is expired and cannot accept a late answer.
+Writing the response only moves the request to an answering state. It is answered only after the matching App Server `serverRequest/resolved` event; a resolved request before submission is expired and cannot accept a late answer. On application or runtime restart, or if a sent response cannot be confirmed, it is marked interrupted and the module enters recovery; the middleware never automatically restores or resends it. `autoResolutionMs`, when supplied, is presentation metadata rather than a local expiration authority.
 
 ## User experience and observability
 
