@@ -28,6 +28,7 @@ const EXECUTION_CONTROL_SCHEMA: &str = include_str!("../migrations/003_execution
 const CONVERSATION_RELAY_SCHEMA: &str = include_str!("../migrations/004_conversation_relay_v2.sql");
 const CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA: &str =
     include_str!("../migrations/005_codex_communication_observability.sql");
+const CODEX_HUMAN_INPUT_SCHEMA: &str = include_str!("../migrations/006_codex_human_input.sql");
 
 struct AppState {
     connection: Mutex<Connection>,
@@ -389,6 +390,28 @@ struct RelayCodexCycleRecord {
     block_reason: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexInputRequestRecord {
+    id: String, module_id: String, cycle_id: String, codex_thread_id: String, codex_turn_id: String,
+    app_server_request_id_json: String, questions_json: String, answers_json: Option<String>,
+    secret_answer_status_json: String, is_blocking: bool, auto_resolution_ms: Option<i64>, status: String,
+    error_text: Option<String>, created_at: String, submitted_at: Option<String>, answered_at: Option<String>,
+    interrupted_at: Option<String>, expired_at: Option<String>, updated_at: String,
+}
+
+fn list_relay_codex_input_requests_in(connection: &Connection, module_id: &str) -> Result<Vec<RelayCodexInputRequestRecord>, String> {
+    let mut statement = connection.prepare("SELECT id,module_id,cycle_id,codex_thread_id,codex_turn_id,app_server_request_id_json,questions_json,answers_json,secret_answer_status_json,is_blocking,auto_resolution_ms,status,error_text,created_at,submitted_at,answered_at,interrupted_at,expired_at,updated_at FROM relay_codex_input_requests WHERE module_id=?1 ORDER BY created_at DESC").map_err(|e| e.to_string())?;
+    let records = statement.query_map([module_id], |r| Ok(RelayCodexInputRequestRecord { id:r.get(0)?, module_id:r.get(1)?, cycle_id:r.get(2)?, codex_thread_id:r.get(3)?, codex_turn_id:r.get(4)?, app_server_request_id_json:r.get(5)?, questions_json:r.get(6)?, answers_json:r.get(7)?, secret_answer_status_json:r.get(8)?, is_blocking:r.get::<_,i64>(9)? != 0, auto_resolution_ms:r.get(10)?, status:r.get(11)?, error_text:r.get(12)?, created_at:r.get(13)?, submitted_at:r.get(14)?, answered_at:r.get(15)?, interrupted_at:r.get(16)?, expired_at:r.get(17)?, updated_at:r.get(18)? })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())?;
+    Ok(records)
+}
+
+#[tauri::command]
+fn list_relay_codex_input_requests(module_id: String, state: State<'_, AppState>) -> Result<Vec<RelayCodexInputRequestRecord>, String> {
+    let connection = state.connection.lock().map_err(|_| "数据库锁已损坏。".to_string())?;
+    list_relay_codex_input_requests_in(&connection, &module_id)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayChatGptChannelSnapshot {
@@ -457,7 +480,18 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
         .map_err(|error| {
             format!("could not initialize Codex communication observability storage: {error}")
         })?;
+    connection.execute_batch(CODEX_HUMAN_INPUT_SCHEMA)
+        .map_err(|error| format!("could not initialize Codex human input storage: {error}"))?;
     Ok(connection)
+}
+
+fn interrupt_unfinished_relay_codex_input_requests(connection: &Connection) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    let changed = connection.execute("UPDATE relay_codex_input_requests SET status='INTERRUPTED', error_text='应用或运行时已重启，答案不会自动重发。', interrupted_at=?1, updated_at=?1 WHERE status IN ('PENDING','ANSWERING')", [&now]).map_err(|error| error.to_string())?;
+    if changed > 0 {
+        connection.execute("UPDATE relay_modules SET phase='RECOVERY_REQUIRED', updated_at=?1 WHERE id IN (SELECT DISTINCT module_id FROM relay_codex_input_requests WHERE status='INTERRUPTED')", [&now]).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String> {
@@ -5079,6 +5113,7 @@ mod tests {
         connection
             .execute_batch(CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA)
             .expect("Codex communication observability schema");
+        connection.execute_batch(CODEX_HUMAN_INPUT_SCHEMA).expect("Codex human input schema");
         connection
     }
 
@@ -7340,6 +7375,7 @@ pub fn run() {
             let connection = create_connection(app.handle())?;
             pause_unfinished_orchestrations(&connection)?;
             mark_uncertain_relay_deliveries(&connection)?;
+            interrupt_unfinished_relay_codex_input_requests(&connection)?;
             let chatgpt_bridge = Arc::new(ChatGptBridge::new());
             start_chatgpt_bridge(app.handle().clone(), chatgpt_bridge.clone())?;
             app.manage(AppState {
@@ -7366,6 +7402,7 @@ pub fn run() {
             list_relay_modules,
             list_relay_messages,
             list_relay_codex_cycles,
+            list_relay_codex_input_requests,
             get_relay_channel_snapshot,
             list_relay_recovery_messages,
             queue_relay_message,
