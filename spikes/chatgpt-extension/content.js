@@ -1,5 +1,5 @@
 (() => {
-const contentAdapterVersion = '1.3.1';
+const contentAdapterVersion = '1.3.2';
 const contentAdapterInstanceKey = '__chatgptCodexContentAdapterInstanceV3__';
 const previousAdapterInstance = globalThis[contentAdapterInstanceKey];
 
@@ -162,12 +162,17 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
       const protocolReply = requireProtocolJson
         ? changedReplies.find((reply) => Boolean(reply.protocolJson)) ?? replyOutsideBaseline
         : null;
-      const latestReply = protocolReply ?? latestAssistantReply();
+      const freshRelayMessage = !requireProtocolJson ? changedMessages.at(-1) ?? null : null;
+      const freshRelayReply = freshRelayMessage
+        ? replyFromAssistantMessage(freshRelayMessage)
+        : null;
+      const latestReply = protocolReply ?? freshRelayReply ?? latestAssistantReply();
       const signature = `${messageCount}\n${latestReply.text}`;
       const pendingProtocolCandidate = requireProtocolJson
         && changedMessages.some(hasPendingProtocolCandidate);
       const pendingRelayControlCandidate = !requireProtocolJson
-        && hasPendingRelayControlCandidate(latestReply.text);
+        && Boolean(freshRelayReply)
+        && hasPendingRelayControlCandidate(freshRelayReply.text);
       const deadlineMs = globalThis.protocolReplyDeadlineMs(
         requireProtocolJson,
         pendingProtocolCandidate,
@@ -177,7 +182,7 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
         const error = new Error(requireProtocolJson
           ? 'Timed out waiting for a complete structured protocol JSON reply.'
           : 'Timed out waiting for the ChatGPT reply to finish.');
-        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},baselineProtocolJson=${baselineProtocolJson.size},current=${messageCount},changed=${changedAssistantMessages.size},replyOutsideBaseline=${Boolean(replyOutsideBaseline)},pendingProtocolCandidate=${pendingProtocolCandidate},pendingRelayControlCandidate=${pendingRelayControlCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
+        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},baselineProtocolJson=${baselineProtocolJson.size},current=${messageCount},changed=${changedAssistantMessages.size},freshRelayCandidates=${changedMessages.length},freshRelayReply=${Boolean(freshRelayReply)},replyOutsideBaseline=${Boolean(replyOutsideBaseline)},pendingProtocolCandidate=${pendingProtocolCandidate},pendingRelayControlCandidate=${pendingRelayControlCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
         finish(error);
         return;
       }
@@ -188,7 +193,7 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
       }
 
       if ((requireProtocolJson && !protocolReply)
-        || (!requireProtocolJson && messageCount <= previousCount)
+        || (!requireProtocolJson && !freshRelayReply)
         || (!requireProtocolJson && isGenerating())
         || pendingRelayControlCandidate) {
         stableSince = 0;
