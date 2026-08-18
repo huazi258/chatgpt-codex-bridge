@@ -7,7 +7,7 @@ export interface RelayCodexInputQuestion {
 }
 
 export interface RelayCodexInputRequest {
-  id: string; cycleId: string; codexThreadId: string; codexTurnId: string;
+  id: string; cycleId: string; cycleNumber?: number; codexThreadId: string; codexTurnId: string;
   questionsJson: string; answersJson?: string | null; secretAnswerStatusJson: string;
   status: RelayCodexInputStatus; errorText?: string | null;
 }

@@ -4,7 +4,9 @@ import App from './App';
 import { CodexCommunicationPanel } from './components/CodexCommunicationPanel';
 import { CodexCycleCard } from './components/CodexCycleCard';
 import { GlobalChannelStatus } from './components/GlobalChannelStatus';
+import { CodexHumanInputPanel } from './components/CodexHumanInputPanel';
 import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
+import type { RelayCodexInputRequest } from './relay-codex-input';
 
 let modules = [
   { id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', stopAfterTurn: false, invalidReplyCount: 0, startedCycles: 0 },
@@ -328,5 +330,45 @@ describe('Codex 通讯可观测性组件', () => {
 
     rerender(<CodexCommunicationPanel cycles={[]} />);
     expect(screen.getByText('尚未开始 Codex 循环。')).toBeTruthy();
+  });
+});
+
+describe('Codex 人工输入面板', () => {
+  const pendingRequest: RelayCodexInputRequest = {
+    id: 'input-1', cycleId: 'cycle-1', cycleNumber: 1, codexThreadId: 'thread-1', codexTurnId: 'turn-1',
+    questionsJson: JSON.stringify([
+      { id: 'normal', header: '普通问题', question: '自由回答', options: [{ label: '仅供参考', description: '无需选择' }] },
+      { id: 'secret', header: '秘密问题', question: '输入密钥', options: null, isSecret: true },
+    ]),
+    secretAnswerStatusJson: '{}', status: 'PENDING',
+  };
+
+  afterEach(cleanup);
+
+  it('按存储顺序展示自由文本问题，提交空答案并立即清除秘密输入', async () => {
+    let resolveSubmit: (() => void) | undefined;
+    const onSubmit = vi.fn(() => new Promise<void>((resolve) => { resolveSubmit = resolve; }));
+    render(<CodexHumanInputPanel request={pendingRequest} stopAfterTurn onSubmit={onSubmit} />);
+    expect(screen.getByText('普通问题')).toBeTruthy();
+    expect(screen.getByText('参考选项：仅供参考')).toBeTruthy();
+    const normal = document.querySelector('textarea') as HTMLTextAreaElement;
+    fireEvent.change(normal, { target: { value: '自由文本' } });
+    const secret = document.querySelector('input[type="password"]') as HTMLInputElement;
+    fireEvent.change(secret, { target: { value: 'SECRET_SENTINEL_DO_NOT_PERSIST' } });
+    fireEvent.click(screen.getByRole('button', { name: '提交给 Codex' }));
+    expect(onSubmit).toHaveBeenCalledWith([{ questionId: 'normal', answer: '自由文本' }, { questionId: 'secret', answer: 'SECRET_SENTINEL_DO_NOT_PERSIST' }]);
+    expect(secret.value).toBe('');
+    expect(screen.getByText('模块已请求终止；可完成当前 Codex 输入，回合结束后停止。')).toBeTruthy();
+    resolveSubmit?.();
+  });
+
+  it.each([
+    ['ANSWERING', '答案已发送，正在等待 Codex 确认'],
+    ['EXPIRED', '该输入请求已不可提交。'],
+    ['INTERRUPTED', '该输入请求已不可提交。'],
+  ] as const)('%s 请求不可重复提交', (status, text) => {
+    render(<CodexHumanInputPanel request={{ ...pendingRequest, status }} stopAfterTurn={false} onSubmit={async () => undefined} />);
+    expect(screen.getByText(text)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '提交给 Codex' })).toBeNull();
   });
 });

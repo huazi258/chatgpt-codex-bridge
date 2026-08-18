@@ -103,7 +103,8 @@ export default function App() {
       void refreshModules().catch(() => undefined); void refreshMessages().catch(() => undefined); void refreshRecoveryMessages().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
     }).then((unsubscribe) => { stopControl = unsubscribe; });
     void listen<{ moduleId: string }>('relay-codex', () => {
-      void refreshCodexCycles().catch(() => undefined); void refreshCodexInputRequests().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined); void refreshModules().catch(() => undefined);
+      void Promise.all([refreshCodexCycles(), refreshCodexInputRequests(), refreshChannelSnapshot(), refreshModules()])
+        .catch((error) => setNotice(`无法刷新 Codex 输入状态：${String(error)}`));
     }).then((unsubscribe) => { stopCodex = unsubscribe; });
     return () => { stopStatus?.(); stopControl?.(); stopCodex?.(); };
   }, [selectedId]);

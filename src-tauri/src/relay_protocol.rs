@@ -60,9 +60,7 @@ mod tests {
     #[test]
     fn terminal_prompt_keeps_body_verbatim() {
         assert_eq!(
-            parse_terminal_control_block(
-                "说明\n@@@CODEX_PROMPT@@@\n做事\n@@@END_CODEX_PROMPT@@@",
-            ),
+            parse_terminal_control_block("说明\n@@@CODEX_PROMPT@@@\n做事\n@@@END_CODEX_PROMPT@@@",),
             Ok(ControlBlock::CodexPrompt("做事".into()))
         );
     }
@@ -81,10 +79,11 @@ mod tests {
     }
     #[test]
     fn retired_input_control_block_is_invalid() {
-        assert!(parse_terminal_control_block(
-            "@@@CODEX_INPUT@@@\n1. 是\n2. 否\n@@@END_CODEX_INPUT@@@"
-        )
-        .is_err(), "the retired public control block must be an ordinary invalid reply");
+        assert!(
+            parse_terminal_control_block("@@@CODEX_INPUT@@@\n1. 是\n2. 否\n@@@END_CODEX_INPUT@@@")
+                .is_err(),
+            "the retired public control block must be an ordinary invalid reply"
+        );
     }
     #[test]
     fn rejects_multiple_terminal_blocks() {
