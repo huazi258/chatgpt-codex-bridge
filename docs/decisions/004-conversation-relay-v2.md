@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-16
-- Decision: Reframe the desktop middleware as a controlled text-relay system between one ChatGPT conversation and one middleware-owned Codex thread. It does not manage engineering work.
+- Decision: Reframe the desktop middleware as a controlled text-relay system between one ChatGPT conversation and one Codex thread acquired and controlled by the middleware for the active module. It does not manage engineering work.
 
 ## Supersession
 
@@ -40,11 +40,11 @@ All outbound messages are serialized in strict first-in, first-out order. A Code
 
 A module is a user-visible work phase, not a single engineering task. An engineering task may span many message-relay cycles.
 
-A valid `CODEX_PROMPT` begins one relay cycle and one Codex turn. The first valid prompt for a module starts the module timer, launches a middleware-owned local App Server in the user-selected Codex working directory, and creates a new Codex thread. The middleware sends every later prompt to that same thread unchanged and keeps the App Server process alive until the module ends.
+A valid `CODEX_PROMPT` begins one relay cycle and one Codex turn. When creating a module, the user explicitly chooses either a new Codex conversation or an existing Codex thread to continue. Both choices are lazy: the first valid prompt launches the local App Server and either starts a new thread or acquires the selected one with `thread/resume`; only a successful `turn/start` starts the module timer and consumes a cycle. The middleware sends later prompts to that same acquired thread unchanged and keeps the App Server process alive until the module ends.
 
 The Codex working directory is an environment selection only. The middleware does not parse, validate, select, switch, or otherwise manage the repository and branch. Project-level instructions are discovered by Codex from the selected working directory.
 
-On module completion or termination, the middleware closes its App Server process and releases, but does not delete, the thread. A released middleware-owned thread may later be listed and resumed through the middleware. The middleware must not promise that an arbitrary Codex Desktop conversation is writable: it may be listed and read, but is usable only if `thread/resume` acquires its writer successfully.
+Existing threads can originate from Codex Desktop, CLI, VS Code, App Server, or Bridge; Bridge neither imports nor copies them. The first version lists only idle/notLoaded threads for the explicitly selected Codex cwd and never takes over an external active turn. On module completion or termination, Bridge closes its App Server and attempts release but does not delete the thread. Terminal module state alone does not prove safe release: ownership/reservation and unknown outcomes are explicitly recorded. Any existing thread is writable only after `thread/resume` succeeds.
 
 ## ChatGPT control-block protocol
 
@@ -105,18 +105,18 @@ The desktop UI is Chinese by default. Every action immediately enters a visible 
 
 ## V2 acceptance criteria
 
-1. After the user manually creates an automation request, a terminal valid `CODEX_PROMPT` starts one turn in a middleware-owned Codex thread; a second valid prompt continues the same thread.
+1. After the user manually creates an automation request, a terminal valid `CODEX_PROMPT` starts one turn in the module’s newly created or explicitly resumed Codex thread; a second valid prompt continues the same thread.
 2. Manual replies that contain control-looking text never start Codex work.
 3. A Codex final reply is delivered to ChatGPT in FIFO order behind all pre-existing manual messages.
 4. A malformed eligible reply triggers one configured retry, then a Chinese user-actionable failure.
 5. `MODULE_DONE` waits for explicit user acceptance, and feedback from that screen can resume automation.
 6. Restart and uncertain delivery preserve state and require an explicit user decision before any resend or continuation.
-7. A completed module releases its middleware-owned thread; a later module can resume that released thread only when `thread/resume` succeeds.
+7. A later module can explicitly resume an eligible existing Codex thread only when `thread/resume` succeeds; unknown side-effect outcomes are never retried automatically.
 
 ## Implementation status
 
 The first V2 implementation slice is in progress. It replaces the desktop view with a Chinese relay workspace, persists relay modules and full text-message history separately from the historical V1 tables, serializes ChatGPT sends, and distinguishes manual replies from automation replies. A restart changes an unresolved outgoing send to `UNKNOWN` and requires later explicit recovery rather than silently resending it. All global `UNKNOWN` blockers are visible in the relay workspace; for each, the user must explicitly choose either to resend that message or to continue without resending it. The latter records the decision without transmitting the old message, and dispatch resumes only after every `UNKNOWN` has been resolved.
 
-Plain-text terminal control-block parsing, one configured retry, `MODULE_DONE`, and `BLOCKED` are wired into the relay persistence layer. A valid `CODEX_PROMPT` now starts or continues one middleware-owned local App Server process and keeps its created thread alive for later prompts; Codex final text is appended to the same FIFO ChatGPT queue without modification.
+Plain-text terminal control-block parsing, one configured retry, `MODULE_DONE`, and `BLOCKED` are wired into the relay persistence layer. A valid `CODEX_PROMPT` now starts or continues one middleware-controlled local App Server process and keeps its acquired thread alive for later prompts; Codex final text is appended to the same FIFO ChatGPT queue without modification.
 
-The remaining V2 work includes released-thread resume, browser-history synchronization, and end-to-end browser pilot evidence. App Server `requestUserInput` interaction is not a V2 middleware feature; future agent-level plain-text rules may address it separately. None of those incomplete paths may be presented as completed automation.
+The remaining V2 work includes existing Codex thread resume, browser-history synchronization, and final browser E2E/status/docs evidence. App Server `requestUserInput` interaction is not a V2 middleware feature; future agent-level plain-text rules may address it separately. None of those incomplete paths may be presented as completed automation.

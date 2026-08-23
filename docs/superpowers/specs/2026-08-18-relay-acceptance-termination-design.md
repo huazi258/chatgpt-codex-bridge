@@ -220,4 +220,4 @@ React 自动化测试至少覆盖：
 8. 后端拒绝显示明确中文错误；
 9. 终止后 completed Codex cycle 显示「模块已由用户终止，结果未回传 ChatGPT」，且 ChatGPT 时间线不新增伪造 lifecycle 消息。
 
-本设计不扩展到 Codex 人工输入流程、released-thread resume、browser-history sync、多 Codex 并发、强杀 turn、删除 Codex thread、新 ChatGPT 控制块、新 browser adapter 协议或任意队列管理 UI。
+本设计不扩展到 Codex 人工输入流程、existing Codex thread resume、browser-history sync、多 Codex 并发、强杀 turn、删除 Codex thread、新 ChatGPT 控制块、新 browser adapter 协议或任意队列管理 UI。
