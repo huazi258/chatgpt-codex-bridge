@@ -40,11 +40,11 @@ All outbound messages are serialized in strict first-in, first-out order. A Code
 
 A module is a user-visible work phase, not a single engineering task. An engineering task may span many message-relay cycles.
 
-A valid `CODEX_PROMPT` begins one relay cycle and one Codex turn. When creating a module, the user explicitly chooses either a new Codex conversation or an existing Codex thread to continue. Both choices are lazy: the first valid prompt launches the local App Server and either starts a new thread or acquires the selected one with `thread/resume`; only a successful `turn/start` starts the module timer and consumes a cycle. The middleware sends later prompts to that same acquired thread unchanged and keeps the App Server process alive until the module ends.
+A valid `CODEX_PROMPT` is persisted as one relay cycle in `WAITING_TO_SEND_CODEX`; accepting the prompt is not a started Codex turn. When creating a module, the user explicitly chooses either a new Codex conversation or an existing Codex thread to continue. Both choices are lazy: the first valid prompt launches the local App Server and either starts a new thread or acquires the selected one with `thread/resume`. Neither successful `thread/start` nor successful `thread/resume` starts a turn by itself. Only confirmed `turn/start` begins the Codex turn, changes that cycle to `CODEX_RUNNING`, starts the module timer when it is the first turn, and consumes a cycle. The middleware sends later prompts to that same acquired thread unchanged and keeps the App Server process alive until the module ends.
 
 The Codex working directory is an environment selection only. The middleware does not parse, validate, select, switch, or otherwise manage the repository and branch. Project-level instructions are discovered by Codex from the selected working directory.
 
-Existing threads can originate from Codex Desktop, CLI, VS Code, App Server, or Bridge; Bridge neither imports nor copies them. The first version lists only idle/notLoaded threads for the explicitly selected Codex cwd and never takes over an external active turn. On module completion or termination, Bridge closes its App Server and attempts release but does not delete the thread. Terminal module state alone does not prove safe release: ownership/reservation and unknown outcomes are explicitly recorded. Any existing thread is writable only after `thread/resume` succeeds.
+Existing threads are discovered with an explicit `thread/list` source filter of `cli`, `vscode`, and `appServer`; Bridge neither imports nor copies them. This avoids the App Server default source filter, which does not discover App Server-created threads. Execution, sub-agent, and review source kinds are not ordinary existing-conversation candidates in the first version. For the explicitly selected Codex cwd, `idle` and `notLoaded` threads are selectable; `active` and `systemError` threads remain visible but disabled, with an actionable Chinese reason. Bridge never takes over an external active turn. On module completion or termination, Bridge closes its App Server and attempts release but does not delete the thread. Terminal module state alone does not prove safe release: ownership/reservation and unknown outcomes are explicitly recorded. Any existing thread is writable only after `thread/resume` succeeds.
 
 ## ChatGPT control-block protocol
 
@@ -105,7 +105,7 @@ The desktop UI is Chinese by default. Every action immediately enters a visible 
 
 ## V2 acceptance criteria
 
-1. After the user manually creates an automation request, a terminal valid `CODEX_PROMPT` starts one turn in the module’s newly created or explicitly resumed Codex thread; a second valid prompt continues the same thread.
+1. After the user manually creates an automation request, a terminal valid `CODEX_PROMPT` persists one pending relay cycle for the module’s newly created or explicitly resumed Codex thread; only confirmed `turn/start` starts that turn, and a second valid prompt continues the same acquired thread.
 2. Manual replies that contain control-looking text never start Codex work.
 3. A Codex final reply is delivered to ChatGPT in FIFO order behind all pre-existing manual messages.
 4. A malformed eligible reply triggers one configured retry, then a Chinese user-actionable failure.

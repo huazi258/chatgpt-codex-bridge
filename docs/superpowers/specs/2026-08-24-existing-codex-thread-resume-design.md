@@ -28,7 +28,21 @@ The UI calls `working_directory` **Codex 工作目录**. It is Codex cwd/environ
 
 ## Discovery: explicit, metadata-only refresh
 
-Refresh is a read-only, user-initiated operation. Bridge starts a temporary App Server, performs `initialize`, exhausts paginated `thread/list`, filters to the selected cwd and `archived = false`, sorts by `updated_at`/`recency_at` descending, then closes that App Server.
+Refresh is a read-only, user-initiated operation. Bridge starts a temporary App Server, performs `initialize`, exhausts paginated `thread/list`, filters to the selected cwd and `archived = false`, sorts by `updated_at`/`recency_at` descending, then closes that App Server. The first version explicitly requests `sourceKinds: ["cli", "vscode", "appServer"]`: omitting `sourceKinds` (or sending `[]`) uses the App Server default that discovers only interactive CLI and VS Code threads, so it cannot be relied on to find App Server-created durable threads after an unknown `thread/start` outcome.
+
+The conceptual refresh request is:
+
+```text
+thread/list({
+  cwd: selected_cwd,
+  archived: false,
+  sourceKinds: ["cli", "vscode", "appServer"],
+  sortKey: "recency_at" or "updated_at",
+  sortDirection: "desc"
+})
+```
+
+Bridge exhausts its pagination. `exec`, `subAgent`, `subAgentReview`, `subAgentCompact`, `subAgentThreadSpawn`, and `subAgentOther` are not ordinary **继续现有 Codex 对话** candidates in the first version. The design does not assume a separate `desktop` source kind; candidate cards display the source metadata actually returned by Codex.
 
 It must not reuse the execution App Server or introduce a discovery service. It must not call `thread/resume`, `thread/start`, `turn/start`, acquire ownership, or reserve a thread.
 
@@ -40,7 +54,7 @@ Creation-time discovery must not call `thread/read(includeTurns=true)`, render a
 
 Full UUIDs, origin URLs, commit SHAs, cwd repeats, and historical turns are not default card content.
 
-Candidates from Desktop, VS Code, CLI, App Server, Bridge, or any other returned interactive source are eligible. Only `idle` and `notLoaded` are selectable. `active` and `systemError` remain visible but disabled; `active` says “当前正在运行，暂不可选择”. Bridge never takes over an external active turn or attaches it to a module cycle.
+Candidates from the requested `cli`, `vscode`, and `appServer` sources are shown when they match the selected cwd. Only `idle` and `notLoaded` are selectable. `active` and `systemError` remain visible but disabled; `active` says “当前正在运行，暂不可选择”, while `systemError` displays its returned actionable unavailable reason. Bridge never takes over an external active turn or attaches it to a module cycle.
 
 ## Creation-time validation and reservation
 
@@ -101,9 +115,11 @@ All recovery states reuse module `RECOVERY_REQUIRED`; cycle status remains the e
 | Resume succeeds, turn/start explicit error | T1 stays `ACTIVE`; retain P1; no cycle count/timer. | Retry turn start, terminate. |
 | turn/start outcome unknown | P1 might execute; T1 unavailable; retain cycle. | No automatic resend or thread switch; explicit recovery/terminate only. |
 | New-thread start explicit error | retain P1; no thread/counter/timer. | Explicit retry new-thread start or terminate. |
-| New-thread start unknown | a thread may exist but ID is unknown; retain P1. | Explicitly refresh/select a possible thread, explicitly create a new thread, or terminate; no automatic second thread. |
+| New-thread start unknown | a thread may exist but ID is unknown; retain P1. | Explicitly select an eligible discovered thread, explicitly create a new thread, or terminate; no automatic second thread. |
 
-The recovery command is a single backend-validated `recover_relay_codex(module_id, action)` interface. Actions are `RETRY_RESUME`, `REACQUIRE_THREAD`, `START_NEW_THREAD`, and `RETRY_TURN_START`; persisted recovery reason is authoritative. `THREAD_RESUME_FAILED` permits retry/start-new; unknown resume permits only reacquire; explicit turn-start failure permits retry; unknown turn-start prohibits retry. Existing `terminate_relay_module` remains the termination action.
+The recovery command is a single backend-validated `recover_relay_codex(module_id, action)` interface. Actions are `RETRY_RESUME`, `REACQUIRE_THREAD`, `START_NEW_THREAD`, `RETRY_TURN_START`, and `SELECT_EXISTING_THREAD(thread_id)`; persisted recovery reason is authoritative. `THREAD_RESUME_FAILED` permits retry/start-new; unknown resume permits only reacquire; explicit turn-start failure permits retry; unknown turn-start prohibits retry. `THREAD_START_UNKNOWN` permits only the user-selected `SELECT_EXISTING_THREAD(thread_id)`, user-selected `START_NEW_THREAD`, or termination; it must never cause an automatic second `thread/start`. Existing `terminate_relay_module` remains the termination action.
+
+`SELECT_EXISTING_THREAD(thread_id)` is not import or copy. It changes the current module’s intended target only after the backend confirms that the persisted recovery reason permits this action (the first-version required case is `THREAD_START_UNKNOWN`) and then revalidates that the selected thread still exists, has `cwd == Module.working_directory`, is `idle` or `notLoaded`, belongs to a requested candidate source/category, has no registry `RESERVED`/`ACTIVE`/`UNAVAILABLE` blocker, and is not owned or reserved by another nonterminal module. The backend atomically sets `Module.resume_thread_id = T1`, leaves `Module.codex_thread_id = NULL`, and reserves `T1` as `RESERVED(owner_module_id = current Module)`. It retains the original pending cycle and P1 verbatim, does not increment `started_cycles`, does not start the timer, and does not immediately call `thread/resume`. A later explicit execution/recovery action follows the normal existing-thread resume preflight. If reservation loses a race, Bridge neither chooses another thread nor starts one; it leaves the module in recovery and requires a refresh followed by another explicit selection.
 
 On restart, `RESERVED` remains reserved and causes no automatic resume. Old `ACTIVE` becomes `UNAVAILABLE` and its module becomes `RECOVERY_REQUIRED`. No side-effecting request or prompt is replayed automatically.
 
