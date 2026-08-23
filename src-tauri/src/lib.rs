@@ -27,6 +27,8 @@ const EXECUTION_CONTROL_SCHEMA: &str = include_str!("../migrations/003_execution
 const CONVERSATION_RELAY_SCHEMA: &str = include_str!("../migrations/004_conversation_relay_v2.sql");
 const CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA: &str =
     include_str!("../migrations/005_codex_communication_observability.sql");
+const EXISTING_CODEX_THREAD_RESUME_SCHEMA: &str =
+    include_str!("../migrations/006_existing_codex_thread_resume.sql");
 
 struct AppState {
     connection: Mutex<Connection>,
@@ -391,6 +393,61 @@ struct RelayCodexCycleRecord {
     block_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexThreadState {
+    Reserved,
+    Active,
+    Released,
+    Unavailable,
+}
+
+impl RelayCodexThreadState {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Reserved => "RESERVED",
+            Self::Active => "ACTIVE",
+            Self::Released => "RELEASED",
+            Self::Unavailable => "UNAVAILABLE",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, String> {
+        match value {
+            "RESERVED" => Ok(Self::Reserved),
+            "ACTIVE" => Ok(Self::Active),
+            "RELEASED" => Ok(Self::Released),
+            "UNAVAILABLE" => Ok(Self::Unavailable),
+            _ => Err(format!("未知的 Codex 对话登记状态：{value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexThreadRecord {
+    thread_id: String,
+    working_directory: String,
+    state: RelayCodexThreadState,
+    owner_module_id: Option<String>,
+    last_module_id: Option<String>,
+    reservation_previous_state: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexRecoveryReason {
+    ThreadResumeFailed,
+    ThreadResumeUnknown,
+    ThreadReacquireRequired,
+    TurnStartFailed,
+    TurnStartUnknown,
+    ThreadStartFailed,
+    ThreadStartUnknown,
+    ThreadBecameActiveBeforeResume,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayChatGptChannelSnapshot {
@@ -459,7 +516,48 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
         .map_err(|error| {
             format!("could not initialize Codex communication observability storage: {error}")
         })?;
+    apply_existing_codex_thread_resume_schema(&connection)?;
     Ok(connection)
+}
+
+fn apply_existing_codex_thread_resume_schema(connection: &Connection) -> Result<(), String> {
+    const VERSION: &str = "006_existing_codex_thread_resume";
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("无法开始 Codex 对话迁移：{error}"))?;
+    let result = (|| {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL
+             )",
+        )?;
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                [VERSION],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            connection.execute_batch(EXISTING_CODEX_THREAD_RESUME_SCHEMA)?;
+            connection.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![VERSION, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok::<_, rusqlite::Error>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(|error| format!("无法提交 Codex 对话迁移：{error}")),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(format!("无法迁移 Codex 对话登记：{error}"))
+        }
+    }
 }
 
 fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String> {
@@ -1519,6 +1617,111 @@ fn get_relay_module(
         [id],
         relay_row_to_module,
     ).optional().map_err(|error| format!("无法读取传话模块：{error}"))
+}
+
+fn relay_codex_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayCodexThreadRecord> {
+    let state: String = row.get(2)?;
+    RelayCodexThreadState::from_db(&state).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    Ok(RelayCodexThreadRecord {
+        thread_id: row.get(0)?,
+        working_directory: row.get(1)?,
+        state: RelayCodexThreadState::from_db(&state).expect("validated registry state"),
+        owner_module_id: row.get(3)?,
+        last_module_id: row.get(4)?,
+        reservation_previous_state: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+const RELAY_CODEX_THREAD_SELECT: &str = "SELECT thread_id, working_directory, state,
+    owner_module_id, last_module_id, reservation_previous_state, updated_at
+ FROM relay_codex_threads";
+
+fn get_relay_codex_thread(
+    connection: &Connection,
+    thread_id: &str,
+) -> Result<Option<RelayCodexThreadRecord>, String> {
+    connection
+        .query_row(
+            &format!("{RELAY_CODEX_THREAD_SELECT} WHERE thread_id = ?1"),
+            [thread_id],
+            relay_codex_thread_row,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 对话登记：{error}"))
+}
+
+fn list_relay_codex_threads(
+    connection: &Connection,
+) -> Result<Vec<RelayCodexThreadRecord>, String> {
+    connection
+        .prepare(&format!("{RELAY_CODEX_THREAD_SELECT} ORDER BY thread_id"))
+        .map_err(|error| format!("无法准备 Codex 对话登记查询：{error}"))?
+        .query_map([], relay_codex_thread_row)
+        .map_err(|error| format!("无法查询 Codex 对话登记：{error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("无法读取 Codex 对话登记：{error}"))
+}
+
+fn upsert_relay_codex_thread(
+    connection: &Connection,
+    record: &RelayCodexThreadRecord,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO relay_codex_threads (
+                thread_id, working_directory, state, owner_module_id, last_module_id,
+                reservation_previous_state, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(thread_id) DO UPDATE SET
+                working_directory = excluded.working_directory,
+                state = excluded.state,
+                owner_module_id = excluded.owner_module_id,
+                last_module_id = excluded.last_module_id,
+                reservation_previous_state = excluded.reservation_previous_state,
+                updated_at = excluded.updated_at",
+            params![
+                &record.thread_id,
+                &record.working_directory,
+                record.state.as_db(),
+                &record.owner_module_id,
+                &record.last_module_id,
+                &record.reservation_previous_state,
+                &record.updated_at,
+            ],
+        )
+        .map_err(|error| format!("无法保存 Codex 对话登记：{error}"))?;
+    Ok(())
+}
+
+fn set_relay_codex_thread_state(
+    connection: &Connection,
+    thread_id: &str,
+    state: RelayCodexThreadState,
+    owner_module_id: Option<&str>,
+    reservation_previous_state: Option<&str>,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE relay_codex_threads
+             SET state = ?2, owner_module_id = ?3, reservation_previous_state = ?4, updated_at = ?5
+             WHERE thread_id = ?1",
+            params![
+                thread_id,
+                state.as_db(),
+                owner_module_id,
+                reservation_previous_state,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| format!("无法更新 Codex 对话登记：{error}"))?;
+    Ok(())
 }
 
 fn next_relay_sequence(connection: &Connection, module_id: &str) -> Result<i64, String> {
@@ -5086,7 +5289,121 @@ mod tests {
         connection
             .execute_batch(CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA)
             .expect("Codex communication observability schema");
+        apply_existing_codex_thread_resume_schema(&connection)
+            .expect("existing Codex thread resume schema");
         connection
+    }
+
+    #[test]
+    fn relay_codex_thread_migration_is_gated_and_backfills_conservatively() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(CONVERSATION_RELAY_SCHEMA)
+            .expect("relay schema");
+        connection
+            .execute_batch(CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA)
+            .expect("Codex communication observability schema");
+
+        for (id, phase, thread_id) in [
+            ("released", "COMPLETED", "thread-released"),
+            ("running", "CODEX_RUNNING", "thread-running"),
+            ("failed-release", "STOPPED", "thread-failed-release"),
+            ("duplicate-one", "COMPLETED", "thread-duplicate"),
+            ("duplicate-two", "STOPPED", "thread-duplicate"),
+        ] {
+            connection.execute(
+                "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, invalid_reply_count, started_cycles, created_at, updated_at)
+                 VALUES (?1, ?1, 'G:\\workspace', 12, 240, 'retry', ?2, ?3, 0, 0, '2026-08-17T00:00:00Z', ?1)",
+                params![id, phase, thread_id],
+            ).expect("legacy module");
+        }
+        for (module_id, event_type, created_at) in [
+            ("released", "CODEX_THREAD_RELEASED", "2026-08-17T01:00:00Z"),
+            (
+                "failed-release",
+                "CODEX_THREAD_RELEASED",
+                "2026-08-17T01:00:00Z",
+            ),
+            (
+                "failed-release",
+                "CODEX_THREAD_RELEASE_FAILED",
+                "2026-08-17T02:00:00Z",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO relay_events (id, module_id, event_type, detail, created_at)
+                 VALUES (?1, ?2, ?3, 'legacy audit', ?4)",
+                    params![
+                        format!("event-{module_id}-{event_type}"),
+                        module_id,
+                        event_type,
+                        created_at
+                    ],
+                )
+                .expect("legacy event");
+        }
+
+        apply_existing_codex_thread_resume_schema(&connection).expect("apply migration");
+        apply_existing_codex_thread_resume_schema(&connection).expect("migration is idempotent");
+
+        let state_for = |thread_id: &str| -> String {
+            connection
+                .query_row(
+                    "SELECT state FROM relay_codex_threads WHERE thread_id = ?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .expect("registry state")
+        };
+        assert_eq!(state_for("thread-released"), "RELEASED");
+        assert_eq!(state_for("thread-running"), "UNAVAILABLE");
+        assert_eq!(state_for("thread-failed-release"), "UNAVAILABLE");
+        assert_eq!(state_for("thread-duplicate"), "UNAVAILABLE");
+        assert_eq!(connection.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = '006_existing_codex_thread_resume'",
+            [],
+            |row| row.get(0),
+        ).expect("migration row"), 1);
+    }
+
+    #[test]
+    fn relay_codex_thread_registry_enforces_owner_and_reservation_provenance() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "owner-a", "所有者 A");
+        insert_relay_module(&connection, "owner-b", "所有者 B");
+
+        let reserved = RelayCodexThreadRecord {
+            thread_id: "thread-a".into(),
+            working_directory: r"G:\workspace".into(),
+            state: RelayCodexThreadState::Reserved,
+            owner_module_id: Some("owner-a".into()),
+            last_module_id: Some("owner-a".into()),
+            reservation_previous_state: Some("NONE".into()),
+            updated_at: "2026-08-17T00:00:00Z".into(),
+        };
+        upsert_relay_codex_thread(&connection, &reserved).expect("reserve no-row thread");
+        assert_eq!(
+            get_relay_codex_thread(&connection, "thread-a")
+                .expect("read registry")
+                .expect("thread row")
+                .reservation_previous_state
+                .as_deref(),
+            Some("NONE")
+        );
+
+        let second_reservation = RelayCodexThreadRecord {
+            thread_id: "thread-b".into(),
+            state: RelayCodexThreadState::Reserved,
+            owner_module_id: Some("owner-a".into()),
+            ..reserved.clone()
+        };
+        assert!(upsert_relay_codex_thread(&connection, &second_reservation).is_err());
+        assert!(connection.execute(
+            "INSERT INTO relay_codex_threads (thread_id, working_directory, state, owner_module_id, updated_at)
+             VALUES ('bad-release', 'G:\\workspace', 'RELEASED', 'owner-b', '2026-08-17T00:00:00Z')",
+            [],
+        ).is_err());
     }
 
     fn insert_relay_module(connection: &Connection, id: &str, name: &str) {
