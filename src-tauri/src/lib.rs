@@ -6802,7 +6802,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_acceptance_feedback_follow_up_prompt_reuses_worker_and_increments_cycles() {
+    fn relay_acceptance_feedback_follow_up_prompt_counts_only_after_turn_confirmation() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-a", "模块 A");
         connection
@@ -6858,7 +6858,18 @@ mod tests {
             .expect("module after follow-up prompt");
         assert_eq!(module.0, "CODEX_STARTING");
         assert_eq!(module.1.as_deref(), Some("thread-a"));
-        assert_eq!(module.2, 2);
+        assert_eq!(module.2, 1);
+
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-b"))
+            .expect("confirmed follow-up turn");
+        let started_cycles: i64 = connection
+            .query_row(
+                "SELECT started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("confirmed cycle count");
+        assert_eq!(started_cycles, 2);
     }
 
     #[test]
