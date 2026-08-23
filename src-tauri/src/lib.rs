@@ -4753,6 +4753,223 @@ fn send_rpc(stdin: &mut impl Write, message: Value) -> Result<(), String> {
         .map_err(|error| format!("could not flush App Server request: {error}"))
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexThreadCandidate {
+    thread_id: String,
+    name: Option<String>,
+    source: String,
+    status: String,
+    branch: Option<String>,
+    recency_at: Option<String>,
+    selectable: bool,
+    disabled_reason: Option<String>,
+}
+
+const RELAY_CODEX_THREAD_ACTIVE_REASON: &str = "当前正在运行，暂不可选择";
+const RELAY_CODEX_THREAD_SYSTEM_ERROR_REASON: &str =
+    "Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。";
+const RELAY_CODEX_THREAD_REGISTRY_REASON: &str = "该 Codex 对话当前由本地传话模块占用或待恢复。";
+
+fn relay_codex_thread_status(thread: &Value) -> Option<&str> {
+    thread
+        .pointer("/status/type")
+        .and_then(Value::as_str)
+        .or_else(|| thread.get("status").and_then(Value::as_str))
+}
+
+fn relay_codex_thread_candidate_from_value(
+    thread: &Value,
+    working_directory: &str,
+    registry: &[RelayCodexThreadRecord],
+) -> Option<RelayCodexThreadCandidate> {
+    let thread_id = thread.get("id")?.as_str()?.to_string();
+    if thread.get("cwd").and_then(Value::as_str)? != working_directory {
+        return None;
+    }
+    let source = thread.get("source")?.as_str()?.to_string();
+    if !matches!(source.as_str(), "cli" | "vscode" | "appServer") {
+        return None;
+    }
+    let status = relay_codex_thread_status(thread)?.to_string();
+    let registry_blocked = registry.iter().any(|record| {
+        record.thread_id == thread_id
+            && matches!(
+                record.state,
+                RelayCodexThreadState::Reserved
+                    | RelayCodexThreadState::Active
+                    | RelayCodexThreadState::Unavailable
+            )
+    });
+    let disabled_reason = if registry_blocked {
+        Some(RELAY_CODEX_THREAD_REGISTRY_REASON.to_string())
+    } else {
+        match status.as_str() {
+            "idle" | "notLoaded" => None,
+            "active" => Some(RELAY_CODEX_THREAD_ACTIVE_REASON.to_string()),
+            "systemError" => Some(RELAY_CODEX_THREAD_SYSTEM_ERROR_REASON.to_string()),
+            _ => Some("Codex 对话当前状态暂不可选择；请刷新后重试。".to_string()),
+        }
+    };
+    Some(RelayCodexThreadCandidate {
+        thread_id,
+        name: thread
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        source,
+        status,
+        branch: thread
+            .pointer("/gitInfo/branch")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        recency_at: thread
+            .get("recencyAt")
+            .or_else(|| thread.get("updatedAt"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        selectable: disabled_reason.is_none(),
+        disabled_reason,
+    })
+}
+
+fn read_relay_codex_rpc_response(
+    source: &mut impl BufRead,
+    request_id: i64,
+) -> Result<Value, String> {
+    for line in source.lines() {
+        let line = line.map_err(|error| format!("无法读取 Codex 对话列表：{error}"))?;
+        let message: Value = serde_json::from_str(&line)
+            .map_err(|error| format!("Codex 对话列表不是 JSON：{error}"))?;
+        if message.get("id").and_then(Value::as_i64) != Some(request_id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            let detail = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            return Err(format!("Codex 对话列表请求失败：{detail}"));
+        }
+        return Ok(message);
+    }
+    Err("Codex App Server 在返回对话列表前已关闭。".into())
+}
+
+fn discover_relay_codex_threads_from_json_lines(
+    mut source: impl BufRead,
+    sink: &mut impl Write,
+    working_directory: &str,
+    registry: &[RelayCodexThreadRecord],
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    send_rpc(
+        sink,
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": { "clientInfo": {
+                "name": "chatgpt-codex-middleware",
+                "title": "ChatGPT × Codex Middleware",
+                "version": env!("CARGO_PKG_VERSION")
+            }}
+        }),
+    )?;
+    read_relay_codex_rpc_response(&mut source, 1)?;
+    send_rpc(sink, json!({ "method": "initialized", "params": {} }))?;
+
+    let mut candidates = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut request_id = 2;
+    loop {
+        let mut params = json!({
+            "cwd": working_directory,
+            "archived": false,
+            "sourceKinds": ["cli", "vscode", "appServer"],
+            "sortKey": "recency_at",
+            "sortDirection": "desc"
+        });
+        if let Some(next_cursor) = cursor.as_deref() {
+            params["cursor"] = Value::String(next_cursor.to_string());
+        }
+        send_rpc(
+            sink,
+            json!({ "method": "thread/list", "id": request_id, "params": params }),
+        )?;
+        let response = read_relay_codex_rpc_response(&mut source, request_id)?;
+        let result = response.get("result").unwrap_or(&Value::Null);
+        let threads = result
+            .get("data")
+            .or_else(|| result.get("threads"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Codex 对话列表响应缺少 data。".to_string())?;
+        candidates.extend(threads.iter().filter_map(|thread| {
+            relay_codex_thread_candidate_from_value(thread, working_directory, registry)
+        }));
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+        request_id += 1;
+    }
+    Ok(candidates)
+}
+
+fn discover_relay_codex_threads_for_cwd(
+    working_directory: &str,
+    registry: &[RelayCodexThreadRecord],
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    if !Path::new(working_directory).is_dir() {
+        return Err("所选 Codex 工作目录不存在。".into());
+    }
+    let command = codex_command();
+    let mut child = Command::new(&command)
+        .arg("app-server")
+        .current_dir(working_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("无法启动临时 Codex App Server：{error}"))?;
+    let result = (|| {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "临时 Codex App Server 没有可用输入流。".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "临时 Codex App Server 没有可用输出流。".to_string())?;
+        discover_relay_codex_threads_from_json_lines(
+            BufReader::new(stdout),
+            &mut stdin,
+            working_directory,
+            registry,
+        )
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+#[tauri::command]
+fn list_relay_codex_threads_for_cwd(
+    state: State<'_, AppState>,
+    working_directory: String,
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    let working_directory = working_directory.trim().to_string();
+    let registry = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        list_relay_codex_threads(&connection)?
+    };
+    discover_relay_codex_threads_for_cwd(&working_directory, &registry)
+}
+
 fn process_app_server_turn(
     app: &AppHandle,
     module: &ModuleRecord,
@@ -5546,6 +5763,65 @@ mod tests {
             RelayCodexThreadTargetInput::default(),
             RelayCodexThreadTargetInput::New
         ));
+    }
+
+    #[test]
+    fn relay_codex_thread_discovery_is_paginated_metadata_only_and_read_only() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "owner", "所有者");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "reserved".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("owner".into()),
+                last_module_id: Some("owner".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: "2026-08-24T00:00:00Z".into(),
+            },
+        )
+        .expect("persist registry blocker");
+        let script = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"data\":[",
+            "{\"id\":\"idle\",\"cwd\":\"G:\\\\workspace\",\"name\":null,\"source\":\"cli\",\"status\":{\"type\":\"idle\"},\"updatedAt\":\"2026-08-24T02:00:00Z\",\"preview\":\"must not escape\"},",
+            "{\"id\":\"active\",\"cwd\":\"G:\\\\workspace\",\"name\":\"active\",\"source\":\"vscode\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"updatedAt\":\"2026-08-24T01:00:00Z\"},",
+            "{\"id\":\"wrong-cwd\",\"cwd\":\"G:\\\\other\",\"source\":\"cli\",\"status\":{\"type\":\"idle\"}}],\"nextCursor\":\"page-2\"}}\n",
+            "{\"id\":3,\"result\":{\"data\":[",
+            "{\"id\":\"system\",\"cwd\":\"G:\\\\workspace\",\"source\":\"appServer\",\"status\":{\"type\":\"systemError\"}},",
+            "{\"id\":\"reserved\",\"cwd\":\"G:\\\\workspace\",\"source\":\"cli\",\"status\":{\"type\":\"idle\"}},",
+            "{\"id\":\"unsupported\",\"cwd\":\"G:\\\\workspace\",\"source\":\"exec\",\"status\":{\"type\":\"idle\"}}]}}\n"
+        );
+        let mut output = Vec::new();
+        let candidates = discover_relay_codex_threads_from_json_lines(
+            std::io::Cursor::new(script.as_bytes()),
+            &mut output,
+            r"G:\workspace",
+            &list_relay_codex_threads(&connection).expect("registry"),
+        )
+        .expect("discovery");
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates
+            .iter()
+            .any(|item| item.thread_id == "idle" && item.selectable));
+        assert!(candidates.iter().any(|item| item.thread_id == "active"
+            && item.disabled_reason.as_deref() == Some("当前正在运行，暂不可选择")));
+        assert!(candidates.iter().any(|item| item.thread_id == "system"
+            && item.disabled_reason.as_deref()
+                == Some("Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。")));
+        assert!(candidates
+            .iter()
+            .any(|item| item.thread_id == "reserved" && !item.selectable));
+        let frames = String::from_utf8(output).expect("JSON lines");
+        assert!(frames.contains("\"method\":\"thread/list\""));
+        assert!(frames.contains("\"sourceKinds\":[\"cli\",\"vscode\",\"appServer\"]"));
+        assert!(frames.contains("\"sortKey\":\"recency_at\""));
+        assert!(frames.contains("\"cursor\":\"page-2\""));
+        assert!(!frames.contains("thread/read"));
+        assert!(!frames.contains("thread/resume"));
+        assert!(!frames.contains("thread/start"));
+        assert!(!frames.contains("turn/start"));
     }
 
     fn insert_relay_module(connection: &Connection, id: &str, name: &str) {
@@ -7830,6 +8106,7 @@ pub fn run() {
             get_chatgpt_pairing,
             send_chatgpt_message,
             create_relay_module,
+            list_relay_codex_threads_for_cwd,
             accept_relay_module,
             terminate_relay_module,
             submit_relay_acceptance_feedback,
