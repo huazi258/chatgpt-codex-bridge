@@ -1,4 +1,8 @@
-# Conversation Relay V2：Codex 人工输入请求设计
+# Conversation Relay V2：Codex 人工输入请求设计（历史记录）
+
+> Status: Superseded / Cancelled
+>
+> 此 middleware Human Input 设计已撤销。V2 不再实现 Codex App Server `requestUserInput` 交互链路，也不增加相关协议、状态、UI 或持久化。Codex 需要决策或补充信息时，未来将通过 agent-level 普通文本规则处理；具体替代规则不属于本次决定，后续单独设计。本文仅保留为历史设计记录。
 
 - 日期：2026-08-18
 - 状态：设计规格

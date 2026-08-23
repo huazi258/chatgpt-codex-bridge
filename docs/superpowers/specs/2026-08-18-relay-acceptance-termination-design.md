@@ -10,7 +10,7 @@
 
 本设计保持以下既有边界：
 
-- 不改变 `CODEX_PROMPT`、`MODULE_DONE` 或 `BLOCKED` 控制块语法；Codex 人工输入由 middleware 直接处理，不经过 ChatGPT 控制块；
+- 不改变 `CODEX_PROMPT`、`MODULE_DONE` 或 `BLOCKED` 控制块语法；V2 不支持 Codex App Server 人工输入交互，也不恢复 ChatGPT `CODEX_INPUT` 控制块；
 - 所有 ChatGPT 出站消息继续进入现有全局严格 FIFO，且最多一个回复在途；
 - `UNKNOWN` 不自动重发，且只能由用户现有的明确恢复动作解决；
 - 仅允许一个 middleware-owned Codex runtime/active turn；
@@ -116,7 +116,7 @@ dispatcher 的候选查询必须 join `relay_modules` 并排除 `phase IN ('COMP
 
 如果 turn 实际以 App Server error/non-completed status 结束，cycle 仍可为 `FAILED`，因为这是实际 Codex 执行失败；模块随后仍收尾为 `STOPPED`，不恢复自动化。
 
-Codex 人工输入不在本轮实现范围内。若终止请求已写入而当前 turn 正等待必要 input，直接用户输入流程只可完成该同一 App Server request 必需的回答；不得创建新 turn，完成后遵循上图保存但不回传并停止。
+Codex App Server 人工输入交互不属于 V2 middleware 功能。终止语义不依赖该功能，也不定义替代的 agent-level 规则。
 
 ## thread release 最小接口
 

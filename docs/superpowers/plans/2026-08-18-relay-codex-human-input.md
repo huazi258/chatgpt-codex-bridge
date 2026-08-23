@@ -1,5 +1,7 @@
 # Codex Human Input Implementation Plan
 
+> Status: Superseded / Cancelled. 本计划对应的 middleware Human Input 功能已撤销，不再是当前执行计划；保留仅作历史记录。未来 agent-level 普通文本替代规则另行设计。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 当运行中的 Codex turn 发出 App Server 用户输入请求时，由 middleware 直接向用户展示并回答原 request；保持相同 cycle/thread/turn，不经过 ChatGPT。

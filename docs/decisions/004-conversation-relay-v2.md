@@ -78,7 +78,7 @@ This is not final completion. The middleware enters `WAITING_FOR_ACCEPTANCE`. Th
 
 The middleware shows a Chinese intervention card. The user enters a reply in the middleware; it is sent to ChatGPT as an automation message and the workflow continues from ChatGPT's next eligible reply.
 
-No reply may contain more than one control block. Codex App Server user-input requests are not ChatGPT control blocks: they follow the direct middleware-to-user flow defined below.
+No reply may contain more than one control block. `@@@CODEX_INPUT@@@` is not a V2 control block and remains invalid.
 
 ## Retry, errors, and runtime control
 
@@ -89,17 +89,15 @@ The module has only two configured budgets:
 - total module runtime, starting when the first Codex turn starts;
 - maximum started `CODEX_PROMPT` cycles.
 
-Retries, direct Codex human-input exchanges, and manual messages do not increment the cycle count, but all elapsed time after module start counts toward the runtime budget. When a budget is reached, the active Codex turn is allowed to finish before termination.
+Retries and manual messages do not increment the cycle count, but all elapsed time after module start counts toward the runtime budget. When a budget is reached, the active Codex turn is allowed to finish before termination.
 
-If the user requests termination while a Codex turn is running, the middleware allows that turn to finish. If it is waiting for required Codex input, the user may answer the current original App Server request only to finish that same turn. The final result is not sent to ChatGPT and no additional Codex prompt begins.
+If the user requests termination while a Codex turn is running, the middleware allows that turn to finish. The final result is not sent to ChatGPT and no additional Codex prompt begins.
 
 Connection loss, page refresh, application restart, or a delivery result whose outcome is unknown must never trigger automatic resend. The middleware preserves history, queue records, module/thread references, and the last known state; after reconnection the user chooses to inspect and continue or to resend explicitly.
 
 ## App Server permissions and input
 
-The middleware runs Codex with the configured default of full execution access. When an App Server user-input request arrives for the active turn, the middleware persists its full question metadata and directly displays its questions to the user. The user supplies free-text answers in the middleware, which responds to the same original App Server request without involving ChatGPT. UI order is presentation-only: the response maps each App Server `question.id` to that question's answers list, never to its display text, header, or array position. Empty answers are represented by an empty list; options are reference-only. `isSecret` answers are used only in memory for the original response and are never persisted or logged. This does not start another Codex turn, cycle, or thread.
-
-Writing the response only moves the request to an answering state. It is answered only after the matching App Server `serverRequest/resolved` event; a resolved request before submission is expired and cannot accept a late answer. On application or runtime restart, or if a sent response cannot be confirmed, it is marked interrupted and the module enters recovery; the middleware never automatically restores or resends it. `autoResolutionMs`, when supplied, is presentation metadata rather than a local expiration authority.
+The middleware runs Codex with the configured default of full execution access. V2 does not support Codex App Server `requestUserInput` human interaction: it adds no middleware protocol, state, UI, persistence, or response path for it. This does not restore the retired ChatGPT `@@@CODEX_INPUT@@@` control block. If Codex needs a decision or more information, future agent-level plain-text rules will define the behavior; this decision does not define those rules.
 
 ## User experience and observability
 
@@ -111,10 +109,9 @@ The desktop UI is Chinese by default. Every action immediately enters a visible 
 2. Manual replies that contain control-looking text never start Codex work.
 3. A Codex final reply is delivered to ChatGPT in FIFO order behind all pre-existing manual messages.
 4. A malformed eligible reply triggers one configured retry, then a Chinese user-actionable failure.
-5. A pending App Server input request is displayed and answered directly by the user through the middleware to the same App Server request, without creating another Codex cycle, thread, or turn and without involving ChatGPT.
-6. `MODULE_DONE` waits for explicit user acceptance, and feedback from that screen can resume automation.
-7. Restart and uncertain delivery preserve state and require an explicit user decision before any resend or continuation.
-8. A completed module releases its middleware-owned thread; a later module can resume that released thread only when `thread/resume` succeeds.
+5. `MODULE_DONE` waits for explicit user acceptance, and feedback from that screen can resume automation.
+6. Restart and uncertain delivery preserve state and require an explicit user decision before any resend or continuation.
+7. A completed module releases its middleware-owned thread; a later module can resume that released thread only when `thread/resume` succeeds.
 
 ## Implementation status
 
@@ -122,4 +119,4 @@ The first V2 implementation slice is in progress. It replaces the desktop view w
 
 Plain-text terminal control-block parsing, one configured retry, `MODULE_DONE`, and `BLOCKED` are wired into the relay persistence layer. A valid `CODEX_PROMPT` now starts or continues one middleware-owned local App Server process and keeps its created thread alive for later prompts; Codex final text is appended to the same FIFO ChatGPT queue without modification.
 
-The remaining V2 work includes the direct human App Server input-response flow, released-thread resume, browser-history synchronization, and end-to-end browser pilot evidence. None of those incomplete paths may be presented as completed automation.
+The remaining V2 work includes released-thread resume, browser-history synchronization, and end-to-end browser pilot evidence. App Server `requestUserInput` interaction is not a V2 middleware feature; future agent-level plain-text rules may address it separately. None of those incomplete paths may be presented as completed automation.
