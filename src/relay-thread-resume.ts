@@ -14,3 +14,17 @@ export interface RelayCodexThreadCandidate {
 export type RelayCodexThreadTarget =
   | { mode: 'NEW' }
   | { mode: 'EXISTING'; threadId: string };
+
+export interface RelayModuleCreationInput {
+  name: string;
+  workingDirectory: string;
+  maxCycles: number;
+  maxRuntimeMinutes: number;
+  retryTemplate: string;
+  codexThreadTarget: RelayCodexThreadTarget;
+}
+
+export interface RelayThreadResumeModuleFields {
+  resumeThreadId?: string | null;
+  codexRecoveryReason?: string | null;
+}

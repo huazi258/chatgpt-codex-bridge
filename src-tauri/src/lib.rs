@@ -2450,15 +2450,28 @@ fn emit_relay_codex_changed(app: &AppHandle, module_id: &str, cycle_id: &str, st
     );
 }
 
-#[tauri::command]
-fn create_relay_module(
-    state: State<'_, AppState>,
-    input: RelayModuleInput,
+fn create_relay_module_in(
+    connection: &Connection,
+    input: &RelayModuleInput,
+    revalidated_candidates: &[RelayCodexThreadCandidate],
 ) -> Result<RelayModuleRecord, String> {
     validate_relay_module(&input)?;
-    if !Path::new(input.working_directory.trim()).is_dir() {
-        return Err("所选 Codex 工作目录不存在。".into());
-    }
+    let resume_thread_id = match &input.codex_thread_target {
+        RelayCodexThreadTargetInput::New => None,
+        RelayCodexThreadTargetInput::Existing { thread_id } => {
+            let thread_id = thread_id.trim();
+            let valid = revalidated_candidates.iter().any(|candidate| {
+                candidate.thread_id == thread_id
+                    && candidate.selectable
+                    && matches!(candidate.status.as_str(), "idle" | "notLoaded")
+                    && matches!(candidate.source.as_str(), "cli" | "vscode" | "appServer")
+            });
+            if !valid {
+                return Err("所选 Codex 对话已变化或不可用；请刷新对话后重新选择。".into());
+            }
+            Some(thread_id.to_string())
+        }
+    };
     let now = Utc::now().to_rfc3339();
     let module = RelayModuleRecord {
         id: Uuid::new_v4().to_string(),
@@ -2469,36 +2482,104 @@ fn create_relay_module(
         retry_template: input.retry_template.trim().to_string(),
         phase: "READY".into(),
         codex_thread_id: None,
-        resume_thread_id: match &input.codex_thread_target {
-            RelayCodexThreadTargetInput::New => None,
-            RelayCodexThreadTargetInput::Existing { thread_id } => {
-                Some(thread_id.trim().to_string())
-            }
-        },
+        resume_thread_id: resume_thread_id.clone(),
         codex_recovery_reason: None,
         module_started_at: None,
         stop_after_turn: false,
         invalid_reply_count: 0,
         started_cycles: 0,
         created_at: now.clone(),
-        updated_at: now,
+        updated_at: now.clone(),
+    };
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始创建传话模块事务：{error}"))?;
+    transaction.execute(
+        "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, resume_thread_id, codex_recovery_reason, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL, 0, 0, 0, ?9, ?9)",
+        params![&module.id, &module.name, &module.working_directory, module.max_cycles, module.max_runtime_minutes, &module.retry_template, &module.phase, &module.resume_thread_id, &module.created_at],
+    ).map_err(|error| format!("无法创建传话模块：{error}"))?;
+    if let Some(thread_id) = resume_thread_id.as_deref() {
+        let existing = transaction
+            .query_row(
+                &format!("{RELAY_CODEX_THREAD_SELECT} WHERE thread_id = ?1"),
+                [thread_id],
+                relay_codex_thread_row,
+            )
+            .optional()
+            .map_err(|error| format!("无法检查 Codex 对话登记：{error}"))?;
+        match existing {
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO relay_codex_threads (
+                        thread_id, working_directory, state, owner_module_id, last_module_id,
+                        reservation_previous_state, updated_at
+                     ) VALUES (?1, ?2, 'RESERVED', ?3, ?3, 'NONE', ?4)",
+                        params![thread_id, &module.working_directory, &module.id, &now],
+                    )
+                    .map_err(|_| {
+                        "所选 Codex 对话已被其他模块占用；请刷新对话后重新选择。".to_string()
+                    })?;
+            }
+            Some(record) if record.state == RelayCodexThreadState::Released => {
+                let changed = transaction
+                    .execute(
+                        "UPDATE relay_codex_threads
+                     SET state = 'RESERVED', owner_module_id = ?2, last_module_id = ?2,
+                         reservation_previous_state = 'RELEASED', updated_at = ?3
+                     WHERE thread_id = ?1 AND state = 'RELEASED' AND owner_module_id IS NULL",
+                        params![thread_id, &module.id, &now],
+                    )
+                    .map_err(|error| format!("无法保留 Codex 对话：{error}"))?;
+                if changed != 1 {
+                    return Err("所选 Codex 对话已被其他模块占用；请刷新对话后重新选择。".into());
+                }
+            }
+            Some(_) => {
+                return Err("所选 Codex 对话已被其他模块占用或待恢复；请刷新后重新选择。".into());
+            }
+        }
+    }
+    append_relay_event_in_transaction(
+        &transaction,
+        &module.id,
+        "CREATED",
+        "已创建传话模块，尚未开始自动化。",
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交传话模块创建事务：{error}"))?;
+    Ok(module)
+}
+
+#[tauri::command]
+fn create_relay_module(
+    state: State<'_, AppState>,
+    input: RelayModuleInput,
+) -> Result<RelayModuleRecord, String> {
+    validate_relay_module(&input)?;
+    if !Path::new(input.working_directory.trim()).is_dir() {
+        return Err("所选 Codex 工作目录不存在。".into());
+    }
+    let candidates = match &input.codex_thread_target {
+        RelayCodexThreadTargetInput::New => Vec::new(),
+        RelayCodexThreadTargetInput::Existing { .. } => {
+            let registry = {
+                let connection = state
+                    .connection
+                    .lock()
+                    .map_err(|_| "数据库锁已损坏。".to_string())?;
+                list_relay_codex_threads(&connection)?
+            };
+            discover_relay_codex_threads_for_cwd(input.working_directory.trim(), &registry)?
+        }
     };
     let connection = state
         .connection
         .lock()
         .map_err(|_| "数据库锁已损坏。".to_string())?;
-    connection.execute(
-        "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, resume_thread_id, codex_recovery_reason, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL, 0, 0, 0, ?9, ?9)",
-        params![&module.id, &module.name, &module.working_directory, module.max_cycles, module.max_runtime_minutes, &module.retry_template, &module.phase, &module.resume_thread_id, &module.created_at],
-    ).map_err(|error| format!("无法创建传话模块：{error}"))?;
-    append_relay_event(
-        &connection,
-        &module.id,
-        "CREATED",
-        "已创建传话模块，尚未开始自动化。",
-    )?;
-    Ok(module)
+    create_relay_module_in(&connection, &input, &candidates)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5822,6 +5903,109 @@ mod tests {
         assert!(!frames.contains("thread/resume"));
         assert!(!frames.contains("thread/start"));
         assert!(!frames.contains("turn/start"));
+    }
+
+    fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {
+        RelayModuleInput {
+            name: "继续模块".into(),
+            working_directory: r"G:\workspace".into(),
+            max_cycles: 12,
+            max_runtime_minutes: 240,
+            retry_template: "retry".into(),
+            codex_thread_target: target,
+        }
+    }
+
+    fn selectable_thread(thread_id: &str) -> RelayCodexThreadCandidate {
+        RelayCodexThreadCandidate {
+            thread_id: thread_id.into(),
+            name: Some("已存在对话".into()),
+            source: "cli".into(),
+            status: "idle".into(),
+            branch: None,
+            recency_at: None,
+            selectable: true,
+            disabled_reason: None,
+        }
+    }
+
+    #[test]
+    fn create_relay_module_keeps_new_lazy_and_reserves_existing_atomically() {
+        let connection = relay_connection();
+        let new_module = create_relay_module_in(
+            &connection,
+            &relay_module_input(RelayCodexThreadTargetInput::New),
+            &[],
+        )
+        .expect("create new target");
+        assert_eq!(new_module.resume_thread_id, None);
+        assert_eq!(new_module.codex_thread_id, None);
+
+        let existing_module = create_relay_module_in(
+            &connection,
+            &relay_module_input(RelayCodexThreadTargetInput::Existing {
+                thread_id: "thread-existing".into(),
+            }),
+            &[selectable_thread("thread-existing")],
+        )
+        .expect("reserve eligible existing thread");
+        assert_eq!(
+            existing_module.resume_thread_id.as_deref(),
+            Some("thread-existing")
+        );
+        assert_eq!(existing_module.codex_thread_id, None);
+        let registry = get_relay_codex_thread(&connection, "thread-existing")
+            .expect("registry")
+            .expect("reservation");
+        assert_eq!(registry.state, RelayCodexThreadState::Reserved);
+        assert_eq!(
+            registry.owner_module_id.as_deref(),
+            Some(existing_module.id.as_str())
+        );
+        assert_eq!(registry.reservation_previous_state.as_deref(), Some("NONE"));
+        let counts: (i64, i64, Option<String>) = connection
+            .query_row(
+                "SELECT started_cycles, (SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = relay_modules.id), module_started_at
+                 FROM relay_modules WHERE id = ?1",
+                [&existing_module.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("lazy module facts");
+        assert_eq!(counts, (0, 0, None));
+    }
+
+    #[test]
+    fn create_relay_module_rejects_stale_or_racing_existing_targets_without_partial_module() {
+        let connection = relay_connection();
+        let target = RelayCodexThreadTargetInput::Existing {
+            thread_id: "thread-race".into(),
+        };
+        assert!(
+            create_relay_module_in(&connection, &relay_module_input(target.clone()), &[]).is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_modules", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no stale module"),
+            0
+        );
+        create_relay_module_in(
+            &connection,
+            &relay_module_input(target.clone()),
+            &[selectable_thread("thread-race")],
+        )
+        .expect("first contender");
+        assert!(create_relay_module_in(
+            &connection,
+            &relay_module_input(target),
+            &[selectable_thread("thread-race")],
+        )
+        .is_err());
+        let modules: i64 = connection
+            .query_row("SELECT COUNT(*) FROM relay_modules", [], |row| row.get(0))
+            .expect("one winning module");
+        assert_eq!(modules, 1);
     }
 
     fn insert_relay_module(connection: &Connection, id: &str, name: &str) {
