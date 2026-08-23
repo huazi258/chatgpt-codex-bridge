@@ -301,6 +301,19 @@ struct CodexTurnResult {
     turn_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexThreadTargetInput {
+    New,
+    Existing { thread_id: String },
+}
+
+impl Default for RelayCodexThreadTargetInput {
+    fn default() -> Self {
+        Self::New
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayModuleInput {
@@ -309,6 +322,8 @@ struct RelayModuleInput {
     max_cycles: i64,
     max_runtime_minutes: i64,
     retry_template: String,
+    #[serde(default)]
+    codex_thread_target: RelayCodexThreadTargetInput,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -322,6 +337,8 @@ struct RelayModuleRecord {
     retry_template: String,
     phase: String,
     codex_thread_id: Option<String>,
+    resume_thread_id: Option<String>,
+    codex_recovery_reason: Option<String>,
     module_started_at: Option<String>,
     stop_after_turn: bool,
     invalid_reply_count: i64,
@@ -1584,6 +1601,11 @@ fn validate_relay_module(input: &RelayModuleInput) -> Result<(), String> {
     if input.retry_template.trim().is_empty() {
         return Err("请填写 ChatGPT 协议重试模板。".into());
     }
+    if let RelayCodexThreadTargetInput::Existing { thread_id } = &input.codex_thread_target {
+        if thread_id.trim().is_empty() {
+            return Err("请选择要继续的 Codex 对话。".into());
+        }
+    }
     Ok(())
 }
 
@@ -1603,6 +1625,8 @@ fn relay_row_to_module(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayModuleR
         started_cycles: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+        resume_thread_id: row.get(14)?,
+        codex_recovery_reason: row.get(15)?,
     })
 }
 
@@ -1612,7 +1636,8 @@ fn get_relay_module(
 ) -> Result<Option<RelayModuleRecord>, String> {
     connection.query_row(
         "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
-                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                resume_thread_id, codex_recovery_reason
          FROM relay_modules WHERE id = ?1",
         [id],
         relay_row_to_module,
@@ -2146,6 +2171,15 @@ fn mark_relay_codex_turn_started(
             params![cycle_id, thread_id, turn_id, &now],
         )
         .map_err(|error| format!("无法记录 Codex 回合启动：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE relay_modules
+             SET phase = 'CODEX_RUNNING', started_cycles = started_cycles + 1,
+                 module_started_at = COALESCE(module_started_at, ?2), updated_at = ?2
+             WHERE id = ?1",
+            params![&module_id, &now],
+        )
+        .map_err(|error| format!("无法更新 Codex 回合计数：{error}"))?;
     append_relay_event_in_transaction(
         &transaction,
         &module_id,
@@ -2435,6 +2469,13 @@ fn create_relay_module(
         retry_template: input.retry_template.trim().to_string(),
         phase: "READY".into(),
         codex_thread_id: None,
+        resume_thread_id: match &input.codex_thread_target {
+            RelayCodexThreadTargetInput::New => None,
+            RelayCodexThreadTargetInput::Existing { thread_id } => {
+                Some(thread_id.trim().to_string())
+            }
+        },
+        codex_recovery_reason: None,
         module_started_at: None,
         stop_after_turn: false,
         invalid_reply_count: 0,
@@ -2447,9 +2488,9 @@ fn create_relay_module(
         .lock()
         .map_err(|_| "数据库锁已损坏。".to_string())?;
     connection.execute(
-        "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 0, 0, 0, ?8, ?8)",
-        params![&module.id, &module.name, &module.working_directory, module.max_cycles, module.max_runtime_minutes, &module.retry_template, &module.phase, &module.created_at],
+        "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, resume_thread_id, codex_recovery_reason, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL, 0, 0, 0, ?9, ?9)",
+        params![&module.id, &module.name, &module.working_directory, module.max_cycles, module.max_runtime_minutes, &module.retry_template, &module.phase, &module.resume_thread_id, &module.created_at],
     ).map_err(|error| format!("无法创建传话模块：{error}"))?;
     append_relay_event(
         &connection,
@@ -2490,7 +2531,8 @@ fn accept_relay_module_in(
     let module = transaction
         .query_row(
             "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
-                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                    resume_thread_id, codex_recovery_reason
              FROM relay_modules WHERE id = ?1",
             [module_id],
             relay_row_to_module,
@@ -2603,7 +2645,8 @@ fn terminate_relay_module_with_active_turn_in(
     let module = transaction
         .query_row(
             "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
-                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                    resume_thread_id, codex_recovery_reason
              FROM relay_modules WHERE id = ?1",
             [module_id],
             relay_row_to_module,
@@ -2728,7 +2771,8 @@ fn submit_relay_acceptance_feedback_in(
     let module = transaction
         .query_row(
             "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
-                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                    resume_thread_id, codex_recovery_reason
              FROM relay_modules WHERE id = ?1",
             [module_id],
             relay_row_to_module,
@@ -2987,7 +3031,8 @@ fn list_relay_modules(state: State<'_, AppState>) -> Result<Vec<RelayModuleRecor
         .map_err(|_| "数据库锁已损坏。".to_string())?;
     let mut statement = connection.prepare(
         "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
-                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                resume_thread_id, codex_recovery_reason
          FROM relay_modules ORDER BY updated_at DESC",
     ).map_err(|error| format!("无法查询传话模块：{error}"))?;
     let modules = statement
@@ -3855,11 +3900,55 @@ fn mark_relay_codex_turn_starting_in(
     let now = Utc::now().to_rfc3339();
     connection
         .execute(
-            "UPDATE relay_modules SET phase = 'CODEX_STARTING', started_cycles = started_cycles + 1,
-             module_started_at = COALESCE(module_started_at, ?2), updated_at = ?2 WHERE id = ?1",
+            "UPDATE relay_modules SET phase = 'CODEX_STARTING', updated_at = ?2 WHERE id = ?1",
             params![module_id, now],
         )
         .map_err(|error| format!("无法启动 Codex 回合：{error}"))?;
+    Ok(())
+}
+
+fn set_relay_codex_pending_cycle_error(
+    connection: &Connection,
+    cycle_id: &str,
+    error_text: &str,
+) -> Result<(), String> {
+    let changed = connection
+        .execute(
+            "UPDATE relay_codex_cycles
+             SET error_text = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'WAITING_TO_SEND_CODEX'",
+            params![cycle_id, error_text, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法保存待启动 Codex 回合的恢复原因：{error}"))?;
+    if changed != 1 {
+        return Err("Codex 通讯循环不是待启动状态，不能保存恢复原因。".into());
+    }
+    Ok(())
+}
+
+fn set_relay_codex_recovery_reason(
+    connection: &Connection,
+    module_id: &str,
+    reason: Option<RelayCodexRecoveryReason>,
+) -> Result<(), String> {
+    let reason = reason.map(|reason| match reason {
+        RelayCodexRecoveryReason::ThreadResumeFailed => "THREAD_RESUME_FAILED",
+        RelayCodexRecoveryReason::ThreadResumeUnknown => "THREAD_RESUME_UNKNOWN",
+        RelayCodexRecoveryReason::ThreadReacquireRequired => "THREAD_REACQUIRE_REQUIRED",
+        RelayCodexRecoveryReason::TurnStartFailed => "TURN_START_FAILED",
+        RelayCodexRecoveryReason::TurnStartUnknown => "TURN_START_UNKNOWN",
+        RelayCodexRecoveryReason::ThreadStartFailed => "THREAD_START_FAILED",
+        RelayCodexRecoveryReason::ThreadStartUnknown => "THREAD_START_UNKNOWN",
+        RelayCodexRecoveryReason::ThreadBecameActiveBeforeResume => {
+            "THREAD_BECAME_ACTIVE_BEFORE_RESUME"
+        }
+    });
+    connection
+        .execute(
+            "UPDATE relay_modules SET codex_recovery_reason = ?2, updated_at = ?3 WHERE id = ?1",
+            params![module_id, reason, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法保存 Codex 回合恢复原因：{error}"))?;
     Ok(())
 }
 
@@ -4340,12 +4429,6 @@ fn relay_codex_turn_started(
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
         mark_relay_codex_turn_started(&connection, cycle_id, thread_id, turn_id)?;
-        connection
-            .execute(
-                "UPDATE relay_modules SET phase = 'CODEX_RUNNING', updated_at = ?2 WHERE id = ?1",
-                params![module_id, Utc::now().to_rfc3339()],
-            )
-            .map_err(|error| format!("无法更新 Codex 运行状态：{error}"))?;
     }
     emit_relay_codex_changed(app, module_id, cycle_id, "CODEX_RUNNING");
     let _ = app.emit(
@@ -5404,6 +5487,65 @@ mod tests {
              VALUES ('bad-release', 'G:\\workspace', 'RELEASED', 'owner-b', '2026-08-17T00:00:00Z')",
             [],
         ).is_err());
+    }
+
+    #[test]
+    fn relay_codex_cycle_accounting_starts_only_after_confirmed_turn() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "保持原始提示词")
+            .expect("persist pending cycle");
+        let before: (i64, Option<String>) = connection
+            .query_row(
+                "SELECT started_cycles, module_started_at FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("module before confirmation");
+        assert_eq!(before, (0, None));
+        mark_relay_codex_turn_starting_in(&connection, "module-a").expect("rpc write pending");
+        let still_pending: (i64, Option<String>) = connection
+            .query_row(
+                "SELECT started_cycles, module_started_at FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("module after rpc write");
+        assert_eq!(still_pending, (0, None));
+        set_relay_codex_pending_cycle_error(&connection, &cycle.id, "等待恢复")
+            .expect("persist P1 block reason");
+
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("confirmed turn start");
+        let after: (i64, Option<String>, String) = connection
+            .query_row(
+                "SELECT started_cycles, module_started_at, phase FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after confirmation");
+        assert_eq!(after.0, 1);
+        assert!(after.1.is_some());
+        assert_eq!(after.2, "CODEX_RUNNING");
+    }
+
+    #[test]
+    fn relay_codex_thread_target_rejects_blank_existing_id() {
+        let invalid = RelayModuleInput {
+            name: "模块".into(),
+            working_directory: r"G:\workspace".into(),
+            max_cycles: 1,
+            max_runtime_minutes: 1,
+            retry_template: "retry".into(),
+            codex_thread_target: RelayCodexThreadTargetInput::Existing {
+                thread_id: "  ".into(),
+            },
+        };
+        assert!(validate_relay_module(&invalid).is_err());
+        assert!(matches!(
+            RelayCodexThreadTargetInput::default(),
+            RelayCodexThreadTargetInput::New
+        ));
     }
 
     fn insert_relay_module(connection: &Connection, id: &str, name: &str) {
