@@ -54,7 +54,7 @@ Creation-time discovery must not call `thread/read(includeTurns=true)`, render a
 
 Full UUIDs, origin URLs, commit SHAs, cwd repeats, and historical turns are not default card content.
 
-Candidates from the requested `cli`, `vscode`, and `appServer` sources are shown when they match the selected cwd. Only `idle` and `notLoaded` are selectable. `active` and `systemError` remain visible but disabled; `active` says “当前正在运行，暂不可选择”, while `systemError` displays its returned actionable unavailable reason. Bridge never takes over an external active turn or attaches it to a module cycle.
+Candidates from the requested `cli`, `vscode`, and `appServer` sources are shown when they match the selected cwd. Only `idle` and `notLoaded` are selectable. `active` and `systemError` remain visible but disabled. Bridge renders `active` as “当前正在运行，暂不可选择” and renders `systemError` as “Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。” These are fixed Bridge status explanations; `ThreadStatus.systemError` supplies no detailed error reason. Bridge never takes over an external active turn or attaches it to a module cycle.
 
 ## Creation-time validation and reservation
 
