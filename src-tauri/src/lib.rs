@@ -33,6 +33,8 @@ const CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA: &str =
     include_str!("../migrations/005_codex_communication_observability.sql");
 const EXISTING_CODEX_THREAD_RESUME_SCHEMA: &str =
     include_str!("../migrations/006_existing_codex_thread_resume.sql");
+const CODEX_THREAD_RECOVERY_PROVENANCE_SCHEMA: &str =
+    include_str!("../migrations/007_codex_thread_recovery_provenance.sql");
 
 struct AppState {
     connection: Mutex<Connection>,
@@ -475,16 +477,21 @@ fn recover_relay_codex_thread_registry_on_restart_in(
         if registry_changed != 1 {
             continue;
         }
-        let module_changed = transaction
-            .execute(
-                "UPDATE relay_modules
-                 SET phase = 'RECOVERY_REQUIRED', codex_recovery_reason = 'THREAD_REACQUIRE_REQUIRED',
-                     updated_at = ?2
-                 WHERE id = ?1 AND phase NOT IN ('STOPPED', 'COMPLETED')",
-                params![module_id, Utc::now().to_rfc3339()],
-            )
-            .map_err(|error| format!("无法标记模块为 Codex 对话恢复状态：{error}"))?;
-        if module_changed == 1 {
+        let module = get_relay_module(&transaction, &module_id)?
+            .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if !matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+            if module.phase != "RECOVERY_REQUIRED" {
+                transaction
+                    .execute(
+                        "UPDATE relay_modules
+                         SET phase = 'RECOVERY_REQUIRED',
+                             codex_recovery_reason = 'THREAD_REACQUIRE_REQUIRED',
+                             codex_recovery_previous_phase = ?2, updated_at = ?3
+                         WHERE id = ?1",
+                        params![module_id, module.phase, Utc::now().to_rfc3339()],
+                    )
+                    .map_err(|error| format!("无法标记模块为 Codex 对话恢复状态：{error}"))?;
+            }
             append_relay_event(
                 &transaction,
                 &module_id,
@@ -1188,7 +1195,42 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
             format!("could not initialize Codex communication observability storage: {error}")
         })?;
     apply_existing_codex_thread_resume_schema(&connection)?;
+    apply_codex_thread_recovery_provenance_schema(&connection)?;
     Ok(connection)
+}
+
+fn apply_codex_thread_recovery_provenance_schema(connection: &Connection) -> Result<(), String> {
+    const VERSION: &str = "007_codex_thread_recovery_provenance";
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("无法开始 Codex 对话恢复来源迁移：{error}"))?;
+    let result = (|| {
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                [VERSION],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            connection.execute_batch(CODEX_THREAD_RECOVERY_PROVENANCE_SCHEMA)?;
+            connection.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![VERSION, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok::<_, rusqlite::Error>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(|error| format!("无法提交 Codex 对话恢复来源迁移：{error}")),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(format!("无法迁移 Codex 对话恢复来源：{error}"))
+        }
+    }
 }
 
 fn apply_existing_codex_thread_resume_schema(connection: &Connection) -> Result<(), String> {
@@ -4729,6 +4771,9 @@ fn allowed_relay_codex_recovery_actions_in(
             && record.owner_module_id.is_none()
             && record.last_module_id.as_deref() == Some(module.id.as_str())
     });
+    if unavailable_from_module {
+        return Ok(vec![RelayCodexRecoveryAllowedAction::ReacquireThread]);
+    }
     let actions = match reason {
         "THREAD_START_FAILED" => vec![RelayCodexRecoveryAllowedAction::StartNewThread],
         "THREAD_START_UNKNOWN" if reserved_by_module => {
@@ -4744,9 +4789,6 @@ fn allowed_relay_codex_recovery_actions_in(
                 RelayCodexRecoveryAllowedAction::StartNewThread,
             ]
         }
-        "THREAD_RESUME_UNKNOWN" if unavailable_from_module => {
-            vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
-        }
         "THREAD_RESUME_UNKNOWN"
             if runtime == RelayCodexRecoveryRuntimeState::CurrentIdle
                 && active_by_module
@@ -4755,14 +4797,8 @@ fn allowed_relay_codex_recovery_actions_in(
         {
             vec![RelayCodexRecoveryAllowedAction::RetryTurnStart]
         }
-        "THREAD_REACQUIRE_REQUIRED" if unavailable_from_module => {
-            vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
-        }
         "TURN_START_FAILED" if active_by_module && pending_p1 => {
             vec![RelayCodexRecoveryAllowedAction::RetryTurnStart]
-        }
-        "TURN_START_UNKNOWN" if unavailable_from_module => {
-            vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
         }
         _ => Vec::new(),
     };
@@ -5167,13 +5203,18 @@ fn recover_relay_codex(
         if !relay_codex_recovery_action_is_allowed(&allowed, &action) {
             return Err("当前恢复动作未获安全授权，未执行任何操作。".into());
         }
-        let cycle = pending_relay_codex_cycle_in(&connection, &module_id)?;
+        let cycle = if matches!(action, RelayCodexRecoveryAction::ReacquireThread) {
+            None
+        } else {
+            Some(pending_relay_codex_cycle_in(&connection, &module_id)?)
+        };
         (module, cycle, allowed)
     };
     debug_assert!(relay_codex_recovery_action_is_allowed(&allowed, &action));
 
     match action {
         RelayCodexRecoveryAction::RetryResume => {
+            let cycle = cycle.as_ref().expect("authorized retry resume has P1");
             let thread_id = module
                 .resume_thread_id
                 .clone()
@@ -5194,6 +5235,7 @@ fn recover_relay_codex(
             )?;
         }
         RelayCodexRecoveryAction::StartNewThread => {
+            let cycle = cycle.as_ref().expect("authorized new thread has P1");
             {
                 let connection = state
                     .connection
@@ -5225,7 +5267,7 @@ fn recover_relay_codex(
             launch_relay_codex_recovery_worker(
                 &app,
                 &module,
-                &cycle.id,
+                cycle.as_ref().map(|cycle| cycle.id.as_str()).unwrap_or(""),
                 RelayCodexExecutionMode::ReacquireOnly {
                     thread_id,
                     origin_recovery_reason,
@@ -5235,6 +5277,7 @@ fn recover_relay_codex(
         }
         RelayCodexRecoveryAction::RetryTurnStart => match runtime {
             RelayCodexRecoveryRuntimeState::CurrentIdle => {
+                let cycle = cycle.as_ref().expect("authorized turn retry has P1");
                 let sessions = state
                     .relay_codex
                     .lock()
@@ -5247,6 +5290,7 @@ fn recover_relay_codex(
                     .map_err(|_| "Codex 空闲会话已退出，未重发回合。".to_string())?;
             }
             RelayCodexRecoveryRuntimeState::None => {
+                let cycle = cycle.as_ref().expect("authorized turn retry has P1");
                 let thread_id = module
                     .codex_thread_id
                     .clone()
@@ -5279,8 +5323,11 @@ fn recover_relay_codex(
                     .map_err(|_| "数据库锁已损坏。".to_string())?;
                 list_relay_codex_threads(&connection)?
             };
-            let candidates =
-                discover_relay_codex_threads_for_cwd(&module.working_directory, &registry)?;
+            let candidates = discover_relay_codex_threads_for_cwd_guarded(
+                &state.relay_codex,
+                &module.working_directory,
+                &registry,
+            )?;
             if !candidates
                 .iter()
                 .any(|candidate| candidate.thread_id == thread_id && candidate.selectable)
@@ -5299,7 +5346,15 @@ fn recover_relay_codex(
             )?;
         }
     }
-    emit_relay_codex_changed(&app, &module_id, &cycle.id, "RECOVERY_ACTION_APPLIED");
+    emit_relay_codex_changed(
+        &app,
+        &module_id,
+        cycle
+            .as_ref()
+            .map(|cycle| cycle.id.as_str())
+            .unwrap_or_default(),
+        "RECOVERY_ACTION_APPLIED",
+    );
     Ok(())
 }
 
@@ -5973,6 +6028,38 @@ fn confirm_relay_codex_thread_acquisition_in(
             ],
         )
         .map_err(|error| format!("无法保存获取的 Codex 对话：{error}"))?;
+    if matches!(kind, RelayCodexAcquisitionKind::ReacquireUnavailable)
+        && module.codex_recovery_reason.as_deref() == Some("THREAD_REACQUIRE_REQUIRED")
+    {
+        let unresolved: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM relay_codex_cycles
+                 WHERE module_id = ?1 AND status IN ('CODEX_RUNNING', 'WAITING_TO_SEND_CODEX')",
+                [module_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("无法检查 Codex 对话恢复循环：{error}"))?;
+        if unresolved == 0 {
+            let previous_phase: Option<String> = transaction
+                .query_row(
+                    "SELECT codex_recovery_previous_phase FROM relay_modules WHERE id = ?1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("无法读取 Codex 对话恢复来源：{error}"))?;
+            if let Some(previous_phase) = previous_phase {
+                transaction
+                    .execute(
+                        "UPDATE relay_modules
+                         SET phase = ?2, codex_recovery_reason = NULL,
+                             codex_recovery_previous_phase = NULL, updated_at = ?3
+                         WHERE id = ?1 AND phase = 'RECOVERY_REQUIRED'",
+                        params![module_id, previous_phase, Utc::now().to_rfc3339()],
+                    )
+                    .map_err(|error| format!("无法恢复 Codex 对话重启前模块状态：{error}"))?;
+            }
+        }
+    }
     let event = match kind {
         RelayCodexAcquisitionKind::ReservedResume
         | RelayCodexAcquisitionKind::ResumeKnownActive => "CODEX_THREAD_RESUMED",
@@ -6575,6 +6662,21 @@ fn discover_relay_codex_threads_for_cwd(
     result
 }
 
+fn discover_relay_codex_threads_for_cwd_guarded(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    working_directory: &str,
+    registry: &[RelayCodexThreadRecord],
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    let runtime = sessions
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+    if runtime.is_some() {
+        return Err("当前已有 Codex 对话运行或被保留，不能同时发现对话。".into());
+    }
+    // Keep the one-runtime guard through temporary App Server shutdown.
+    discover_relay_codex_threads_for_cwd(working_directory, registry)
+}
+
 #[tauri::command]
 fn list_relay_codex_threads_for_cwd(
     state: State<'_, AppState>,
@@ -6588,7 +6690,7 @@ fn list_relay_codex_threads_for_cwd(
             .map_err(|_| "数据库锁已损坏。".to_string())?;
         list_relay_codex_threads(&connection)?
     };
-    discover_relay_codex_threads_for_cwd(&working_directory, &registry)
+    discover_relay_codex_threads_for_cwd_guarded(&state.relay_codex, &working_directory, &registry)
 }
 
 fn process_app_server_turn(
@@ -7213,6 +7315,8 @@ mod tests {
             .expect("Codex communication observability schema");
         apply_existing_codex_thread_resume_schema(&connection)
             .expect("existing Codex thread resume schema");
+        apply_codex_thread_recovery_provenance_schema(&connection)
+            .expect("Codex thread recovery provenance schema");
         connection
     }
 
@@ -8629,6 +8733,23 @@ mod tests {
     }
 
     #[test]
+    fn relay_codex_discovery_guard_rejects_an_occupied_runtime_before_process_launch() {
+        let (sender, _receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(AtomicBool::new(false)),
+        }));
+        let error = discover_relay_codex_threads_for_cwd_guarded(
+            &sessions,
+            r"G:\definitely-not-a-working-directory",
+            &[],
+        )
+        .expect_err("occupied runtime rejects discovery");
+        assert!(error.contains("不能同时发现对话"));
+    }
+
+    #[test]
     fn relay_codex_recovery_target_mutations_preserve_p1_and_counter_facts() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-a", "恢复模块");
@@ -8849,6 +8970,61 @@ mod tests {
                 .expect("idempotent restart recovery"),
             0
         );
+    }
+
+    #[test]
+    fn relay_codex_restart_reacquire_needs_no_pending_p1_and_restores_previous_phase() {
+        for previous_phase in ["READY", "WAITING_FOR_CHATGPT", "WAITING_FOR_ACCEPTANCE"] {
+            let connection = relay_connection();
+            insert_relay_module(&connection, "module-a", "恢复模块");
+            connection
+                .execute(
+                    "UPDATE relay_modules
+                     SET phase = 'RECOVERY_REQUIRED', codex_thread_id = 'thread-a',
+                         codex_recovery_reason = 'THREAD_REACQUIRE_REQUIRED',
+                         codex_recovery_previous_phase = ?1
+                     WHERE id = 'module-a'",
+                    [previous_phase],
+                )
+                .expect("seed restart recovery");
+            upsert_relay_codex_thread(
+                &connection,
+                &RelayCodexThreadRecord {
+                    thread_id: "thread-a".into(),
+                    working_directory: r"G:\workspace".into(),
+                    state: RelayCodexThreadState::Unavailable,
+                    owner_module_id: None,
+                    last_module_id: Some("module-a".into()),
+                    reservation_previous_state: None,
+                    updated_at: Utc::now().to_rfc3339(),
+                },
+            )
+            .expect("seed unavailable registry");
+            let module = get_relay_module(&connection, "module-a")
+                .expect("read module")
+                .expect("module exists");
+            assert_eq!(
+                allowed_relay_codex_recovery_actions_in(
+                    &connection,
+                    &module,
+                    RelayCodexRecoveryRuntimeState::None,
+                )
+                .expect("authorize no-P1 reacquire"),
+                vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
+            );
+            confirm_relay_codex_thread_acquisition_in(
+                &connection,
+                "module-a",
+                "thread-a",
+                RelayCodexAcquisitionKind::ReacquireUnavailable,
+            )
+            .expect("confirm reacquire");
+            let restored = get_relay_module(&connection, "module-a")
+                .expect("read restored module")
+                .expect("module exists");
+            assert_eq!(restored.phase, previous_phase);
+            assert_eq!(restored.codex_recovery_reason, None);
+        }
     }
 
     #[test]
