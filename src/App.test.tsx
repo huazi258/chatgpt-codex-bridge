@@ -175,7 +175,7 @@ describe('Codex 对话创建选择', () => {
     relayMessages = [];
     createError = null;
     threadCandidates = [
-      { threadId: 'thread-selectable-123456', name: '可继续的对话', source: 'cli', status: 'idle', branch: 'main', recencyAt: 1724457600000, selectable: true },
+      { threadId: 'thread-selectable-123456', name: '可继续的对话', source: 'cli', status: 'idle', branch: 'main', recencyAt: 1724457600, selectable: true },
       { threadId: 'thread-unnamed-123456', name: null, source: 'vscode', status: 'notLoaded', branch: null, recencyAt: null, selectable: true },
       { threadId: 'thread-active-123456', name: '正在运行', source: 'appServer', status: 'active', branch: null, recencyAt: null, selectable: false, disabledReason: '当前正在运行，暂不可选择' },
       { threadId: 'thread-error-123456', name: '系统错误', source: 'cli', status: 'systemError', branch: null, recencyAt: null, selectable: false, disabledReason: 'Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。' },
@@ -222,6 +222,8 @@ describe('Codex 对话创建选择', () => {
     expect(await screen.findByText('可继续的对话')).toBeTruthy();
     expect(screen.getByText('来源：cli · 状态：idle')).toBeTruthy();
     expect(screen.getByText(/^分支：main/)).toBeTruthy();
+    expect(screen.getByText(/更新时间：2024/)).toBeTruthy();
+    expect(screen.queryByText(/更新时间：1970/)).toBeNull();
     expect(screen.getByText('未命名 Codex 对话')).toBeTruthy();
     expect(screen.getByText('当前正在运行，暂不可选择')).toBeTruthy();
     expect(screen.getByText('Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。')).toBeTruthy();

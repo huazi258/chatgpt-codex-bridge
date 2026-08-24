@@ -13,7 +13,7 @@ function shortThreadId(threadId: string) {
 
 function recencyLabel(recencyAt: number | null) {
   if (recencyAt === null) return '更新时间：未知';
-  const date = new Date(recencyAt);
+  const date = new Date(recencyAt * 1000);
   return Number.isNaN(date.getTime()) ? '更新时间：未知' : `更新时间：${date.toLocaleString('zh-CN')}`;
 }
 
