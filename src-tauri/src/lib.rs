@@ -4555,7 +4555,7 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                             host.failed(
                                 module_id,
                                 active_cycle_id.as_deref(),
-                                format!("Codex 请求响应无法确认：{error}"),
+                                relay_codex_unknown_outstanding_reason(Some(&rpc), error),
                             );
                             break;
                         }
