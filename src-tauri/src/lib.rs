@@ -165,6 +165,36 @@ enum RelayCodexCommand {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayCodexExecutionMode {
+    NewThenTurn,
+    ResumeReservedThenTurn {
+        thread_id: String,
+    },
+    ResumeKnownThreadThenTurn {
+        thread_id: String,
+    },
+    ReacquireOnly {
+        thread_id: String,
+        origin_recovery_reason: String,
+    },
+}
+
+impl RelayCodexExecutionMode {
+    fn resume_thread_id(&self) -> Option<&str> {
+        match self {
+            Self::NewThenTurn => None,
+            Self::ResumeReservedThenTurn { thread_id }
+            | Self::ResumeKnownThreadThenTurn { thread_id }
+            | Self::ReacquireOnly { thread_id, .. } => Some(thread_id),
+        }
+    }
+
+    fn starts_turn_after_acquisition(&self) -> bool {
+        !matches!(self, Self::ReacquireOnly { .. })
+    }
+}
+
 /// The worker owns App Server I/O; its host owns durable relay side effects.
 /// Keeping this boundary narrow lets the protocol loop be exercised without a
 /// Tauri application or SQLite connection.
@@ -4698,13 +4728,17 @@ fn relay_codex_worker(
         }
     };
     let mut host = TauriRelayCodexWorkerHost::new(app.clone(), working_directory.clone());
+    let execution_mode = match resume_thread_id {
+        Some(thread_id) => RelayCodexExecutionMode::ResumeReservedThenTurn { thread_id },
+        None => RelayCodexExecutionMode::NewThenTurn,
+    };
     let release_acknowledgement = run_relay_codex_worker_core(
         &mut transport,
         &mut host,
         &module_id,
         &initial_cycle_id,
         &working_directory,
-        resume_thread_id.as_deref(),
+        &execution_mode,
         &commands,
         &turn_active,
     );
@@ -4741,7 +4775,7 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
     module_id: &str,
     initial_cycle_id: &str,
     working_directory: &str,
-    resume_thread_id: Option<&str>,
+    execution_mode: &RelayCodexExecutionMode,
     commands: &std_mpsc::Receiver<RelayCodexCommand>,
     turn_active: &Arc<AtomicBool>,
 ) -> Option<std_mpsc::Sender<Result<(), String>>> {
@@ -4870,7 +4904,7 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                                     break;
                                 }
                                 let (method, params, rpc) =
-                                    if let Some(thread_id) = resume_thread_id {
+                                    if let Some(thread_id) = execution_mode.resume_thread_id() {
                                         (
                                             "thread/list",
                                             relay_codex_thread_list_params(working_directory, None),
@@ -5018,15 +5052,16 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                                     host.failed(module_id, active_cycle_id.as_deref(), error);
                                     break;
                                 }
-                                if let Some((cycle_id, prompt)) = pending_turn.take() {
-                                    outstanding = Some((
-                                        next_request_id,
-                                        RelayCodexOutstandingRpc::TurnStart {
-                                            cycle_id: cycle_id.clone(),
-                                            thread_id: thread.to_string(),
-                                        },
-                                    ));
-                                    if let Err(error) = transport.send_json(
+                                if execution_mode.starts_turn_after_acquisition() {
+                                    if let Some((cycle_id, prompt)) = pending_turn.take() {
+                                        outstanding = Some((
+                                            next_request_id,
+                                            RelayCodexOutstandingRpc::TurnStart {
+                                                cycle_id: cycle_id.clone(),
+                                                thread_id: thread.to_string(),
+                                            },
+                                        ));
+                                        if let Err(error) = transport.send_json(
                                             json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
                                         ) {
                                             host.failed(
@@ -5036,8 +5071,9 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                                             );
                                             break;
                                         }
-                                    next_request_id += 1;
-                                    final_summary.clear();
+                                        next_request_id += 1;
+                                        final_summary.clear();
+                                    }
                                 }
                             }
                             RelayCodexOutstandingRpc::TurnStart {
@@ -5078,20 +5114,24 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                                         break;
                                     }
                                 }
-                                if let Some((cycle_id, prompt)) = pending_turn.take() {
-                                    outstanding = Some((
-                                        next_request_id,
-                                        RelayCodexOutstandingRpc::TurnStart {
-                                            cycle_id: cycle_id.clone(),
-                                            thread_id: thread_id.clone().expect("confirmed resume"),
-                                        },
-                                    ));
-                                    if let Err(error) = transport.send_json(json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread_id, "input": [{ "type": "text", "text": prompt }] } })) {
+                                if execution_mode.starts_turn_after_acquisition() {
+                                    if let Some((cycle_id, prompt)) = pending_turn.take() {
+                                        outstanding = Some((
+                                            next_request_id,
+                                            RelayCodexOutstandingRpc::TurnStart {
+                                                cycle_id: cycle_id.clone(),
+                                                thread_id: thread_id
+                                                    .clone()
+                                                    .expect("confirmed resume"),
+                                            },
+                                        ));
+                                        if let Err(error) = transport.send_json(json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread_id, "input": [{ "type": "text", "text": prompt }] } })) {
                                         host.failed(module_id, Some(cycle_id.as_str()), format!("Codex turn/start 送达结果未知：{error}"));
                                         break;
                                     }
-                                    next_request_id += 1;
-                                    final_summary.clear();
+                                        next_request_id += 1;
+                                        final_summary.clear();
+                                    }
                                 }
                             }
                         },
@@ -6874,7 +6914,7 @@ mod tests {
             "module-a",
             "cycle-a",
             r"G:\workspace",
-            None,
+            &RelayCodexExecutionMode::NewThenTurn,
             &receiver,
             &turn_active,
         );
@@ -6922,7 +6962,7 @@ mod tests {
             "module-a",
             "cycle-a",
             r"G:\workspace",
-            None,
+            &RelayCodexExecutionMode::NewThenTurn,
             &receiver,
             &turn_active,
         );
@@ -6961,7 +7001,7 @@ mod tests {
             "module-a",
             "cycle-a",
             r"G:\workspace",
-            None,
+            &RelayCodexExecutionMode::NewThenTurn,
             &receiver,
             &turn_active,
         );
@@ -6996,7 +7036,7 @@ mod tests {
             "module-a",
             "cycle-a",
             r"G:\workspace",
-            None,
+            &RelayCodexExecutionMode::NewThenTurn,
             &receiver,
             &turn_active,
         );
@@ -7098,7 +7138,9 @@ mod tests {
             "module-a",
             "cycle-a",
             r"G:\workspace",
-            Some("thread-a"),
+            &RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            },
             &receiver,
             &turn_active,
         );
@@ -7146,7 +7188,9 @@ mod tests {
             "module-a",
             "cycle-a",
             r"G:\workspace",
-            Some("thread-a"),
+            &RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            },
             &receiver,
             &turn_active,
         );
@@ -7221,7 +7265,9 @@ mod tests {
             "module-a",
             "cycle-a",
             r"G:\workspace",
-            Some("thread-a"),
+            &RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            },
             &receiver,
             &turn_active,
         );
@@ -7242,6 +7288,51 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn relay_codex_reacquire_only_confirms_thread_without_sending_p1() {
+        let (sender, receiver) = std_mpsc::channel();
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "data": [{
+                    "id": "thread-a", "cwd": "G:\\workspace", "source": "cli",
+                    "status": { "type": "idle" }
+                }] } })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Closed("test complete".into()),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ReacquireOnly {
+                thread_id: "thread-a".into(),
+                origin_recovery_reason: "THREAD_RESUME_UNKNOWN".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "thread_resumed:module-a:thread-a"));
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|frame| frame.get("method").and_then(Value::as_str) == Some("turn/start")));
     }
 
     #[test]
