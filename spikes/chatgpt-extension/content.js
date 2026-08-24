@@ -1,5 +1,13 @@
 (() => {
-const contentAdapterVersion = '1.2.0';
+const contentAdapterVersion = '1.3.3';
+const contentAdapterInstanceKey = '__chatgptCodexContentAdapterInstanceV3__';
+const previousAdapterInstance = globalThis[contentAdapterInstanceKey];
+
+if (previousAdapterInstance?.version === contentAdapterVersion && previousAdapterInstance.active) return;
+if (previousAdapterInstance) previousAdapterInstance.active = false;
+const contentAdapterInstance = { version: contentAdapterVersion, active: true };
+globalThis[contentAdapterInstanceKey] = contentAdapterInstance;
+
 const assistantMessageSelector = '[data-message-author-role="assistant"]';
 const composerSelector = '#prompt-textarea';
 const sendButtonSelectors = [
@@ -10,6 +18,14 @@ const sendButtonSelectors = [
   'button[title*="发送"]'
 ];
 const stopButtonSelector = 'button[data-testid="stop-button"]';
+const relayWrappedControls = [
+  ['@@@CODEX_PROMPT@@@', '@@@END_CODEX_PROMPT@@@'],
+  ['@@@BLOCKED@@@', '@@@END_BLOCKED@@@'],
+];
+const relayControlMarkers = [
+  ...relayWrappedControls.flatMap(([start, end]) => [start, end]),
+  '@@@MODULE_DONE@@@',
+];
 
 function assistantMessages() {
   return [...document.querySelectorAll(assistantMessageSelector)];
@@ -55,6 +71,20 @@ function assistantDiagnosticsSummary(previousCount, baselineAssistantText, chang
 function hasPendingProtocolCandidate(message) {
   return Boolean(message.querySelector('pre, pre code'))
     || /"(?:state|module|reason)"\s*:/.test(message.innerText);
+}
+
+function hasPendingRelayControlCandidate(text) {
+  const current = text.trimEnd();
+  for (const [start, end] of relayWrappedControls) {
+    const startOffset = current.lastIndexOf(start);
+    if (startOffset >= 0 && !current.slice(startOffset + start.length).includes(end)) return true;
+  }
+  if (relayControlMarkers.some((marker) => current.endsWith(marker))) return false;
+  const markerOffset = current.lastIndexOf('@@@');
+  if (markerOffset < 0) return false;
+  const trailingMarker = current.slice(markerOffset);
+  return trailingMarker.length >= 3
+    && relayControlMarkers.some((marker) => marker !== trailingMarker && marker.startsWith(trailingMarker));
 }
 
 function textOfLatestAssistantMessage() {
@@ -131,10 +161,17 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
       const protocolReply = requireProtocolJson
         ? changedReplies.find((reply) => Boolean(reply.protocolJson)) ?? replyOutsideBaseline
         : null;
-      const latestReply = protocolReply ?? latestAssistantReply();
+      const freshRelayMessage = !requireProtocolJson ? changedMessages.at(-1) ?? null : null;
+      const freshRelayReply = freshRelayMessage
+        ? replyFromAssistantMessage(freshRelayMessage)
+        : null;
+      const latestReply = protocolReply ?? freshRelayReply ?? latestAssistantReply();
       const signature = `${messageCount}\n${latestReply.text}`;
       const pendingProtocolCandidate = requireProtocolJson
         && changedMessages.some(hasPendingProtocolCandidate);
+      const pendingRelayControlCandidate = !requireProtocolJson
+        && Boolean(freshRelayReply)
+        && hasPendingRelayControlCandidate(freshRelayReply.text);
       const deadlineMs = globalThis.protocolReplyDeadlineMs(
         requireProtocolJson,
         pendingProtocolCandidate,
@@ -144,7 +181,7 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
         const error = new Error(requireProtocolJson
           ? 'Timed out waiting for a complete structured protocol JSON reply.'
           : 'Timed out waiting for the ChatGPT reply to finish.');
-        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},baselineProtocolJson=${baselineProtocolJson.size},current=${messageCount},changed=${changedAssistantMessages.size},replyOutsideBaseline=${Boolean(replyOutsideBaseline)},pendingProtocolCandidate=${pendingProtocolCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
+        error.adapterDiagnostic = `baseline=${baselineAssistantText.size},baselineProtocolJson=${baselineProtocolJson.size},current=${messageCount},changed=${changedAssistantMessages.size},freshRelayCandidates=${changedMessages.length},freshRelayReply=${Boolean(freshRelayReply)},replyOutsideBaseline=${Boolean(replyOutsideBaseline)},pendingProtocolCandidate=${pendingProtocolCandidate},pendingRelayControlCandidate=${pendingRelayControlCandidate},deadlineMs=${deadlineMs}; ${assistantDiagnosticsSummary(previousCount, baselineAssistantText, changedAssistantMessages)}`;
         finish(error);
         return;
       }
@@ -154,7 +191,10 @@ function waitForCompletedAssistantReply(previousCount, baselineAssistantText, re
         stableSince = 0;
       }
 
-      if ((requireProtocolJson && !protocolReply) || (!requireProtocolJson && messageCount <= previousCount) || (!requireProtocolJson && isGenerating())) {
+      if ((requireProtocolJson && !protocolReply)
+        || (!requireProtocolJson && !freshRelayReply)
+        || (!requireProtocolJson && isGenerating())
+        || pendingRelayControlCandidate) {
         stableSince = 0;
         return;
       }
@@ -199,7 +239,7 @@ function setComposerText(composer, text) {
   throw new Error(`Unsupported composer element: <${composer.tagName.toLowerCase()}>`);
 }
 
-async function sendAndWait(text, includeProtocolJson = false) {
+async function sendAndWait(text, includeProtocolJson = false, onTrace = () => undefined) {
   let stage = 'locating composer';
   try {
     const composer = document.querySelector(composerSelector);
@@ -229,6 +269,7 @@ async function sendAndWait(text, includeProtocolJson = false) {
     }
     stage = 'clicking send button';
     sendButton.click();
+    onTrace('CHATGPT_SEND_CLICKED');
 
     stage = 'waiting for completed reply';
     const reply = await waitForCompletedAssistantReply(
@@ -238,6 +279,7 @@ async function sendAndWait(text, includeProtocolJson = false) {
       90_000,
       baselineProtocolJson
     );
+    onTrace('CHATGPT_REPLY_COMPLETED');
     return includeProtocolJson ? reply : reply.text;
   } catch (error) {
     error.message = `${stage}: ${error.message}`;
@@ -246,12 +288,14 @@ async function sendAndWait(text, includeProtocolJson = false) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === 'adapterStatusV2') {
+  if (!contentAdapterInstance.active) return;
+
+  if (message?.type === 'adapterStatusV3') {
     sendResponse({ ok: true, adapterVersion: contentAdapterVersion });
     return;
   }
 
-  if (message?.type === 'adapterProbeV3') {
+  if (message?.type === 'adapterProbeV4') {
     const reply = protocolReplySince(0) ?? latestAssistantReply();
     sendResponse({
       ok: true,
@@ -284,8 +328,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === 'sendMiddlewareMessage' || message?.type === 'sendMiddlewareMessageV2') {
-    sendAndWait(message.text, message.type === 'sendMiddlewareMessageV2')
+  if (message?.type === 'sendMiddlewareMessageV3') {
+    const requestId = typeof message.requestId === 'string' ? message.requestId : 'unknown';
+    console.info('[relay-trace]', { requestId, stage: 'CONTENT_RECEIVED' });
+    sendAndWait(message.text, message.includeProtocolJson === true, (stage) => {
+      console.info('[relay-trace]', { requestId, stage });
+    })
       .then((response) => sendResponse(typeof response === 'string'
         ? { ok: true, response }
         : {

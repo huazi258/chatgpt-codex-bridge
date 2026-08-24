@@ -43,7 +43,8 @@ When documents conflict, prefer the newest accepted decision record in `docs/dec
 3. Implement the smallest coherent slice.
 4. Run the relevant tests, build, or integration check.
 5. Update docs if contracts, state transitions, permissions, or operating behavior changed.
-6. Report changed files, verification, and remaining risks.
+6. For every code change, commit and push the verified change to GitHub unless the user explicitly instructs otherwise.
+7. Report changed files, verification, and remaining risks.
 
 ## Current delivery stage
 

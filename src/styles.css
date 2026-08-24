@@ -38,6 +38,8 @@ textarea:focus { border-color: #5379c7; box-shadow: 0 0 0 3px rgba(83, 121, 199,
 .danger { color: #a82f39; background: #ffeef0; }
 button:disabled { cursor: wait; opacity: .55; }
 nav { display: grid; gap: 9px; }
+.new-module-entry { width: 100%; padding: 11px 13px; border: 1px dashed #6e89bd; border-radius: 9px; color: #e6efff; background: rgba(94, 120, 170, .16); text-align: left; font-weight: 800; }
+.new-module-entry:hover, .new-module-entry.selected { border-style: solid; background: #26385d; }
 .module-card { display: grid; gap: 5px; width: 100%; padding: 13px; border: 1px solid transparent; border-radius: 9px; color: #dce6f6; background: transparent; text-align: left; }
 .module-card:hover, .module-card.selected { border-color: #5e78aa; background: #26385d; }
 .module-card strong { font-size: 14px; }
@@ -69,6 +71,32 @@ nav { display: grid; gap: 9px; }
 .connection-card { display: grid; gap: 15px; }
 .relay-summary { display: grid; gap: 10px; }
 .relay-summary h3, .conversation h3 { margin-bottom: 7px; }
+.relay-acceptance-panel, .relay-module-actions, .relay-terminal-notice { display: grid; gap: 13px; }
+.relay-acceptance-panel h3, .relay-module-actions h3, .relay-terminal-notice h3 { margin-bottom: 0; }
+.relay-feedback-form { display: grid; gap: 10px; padding-top: 14px; border-top: 1px solid #d9e1ec; }
+.relay-feedback-form label { margin: 0; }
+.relay-feedback-hint, .relay-action-warning { margin: 0; color: #7a5b12; font-size: 13px; font-weight: 700; line-height: 1.45; }
+.relay-action-warning { padding: 10px 12px; border: 1px solid #eadba9; border-radius: 8px; background: #fff9e8; }
+.relay-module-actions .danger { justify-self: start; }
+.stop-requested { margin: 0; padding: 11px 12px; border: 1px solid #eadba9; border-radius: 8px; color: #7a5b12; background: #fff9e8; font-size: 13px; font-weight: 800; line-height: 1.45; }
+.relay-terminal-notice { border-color: #cfe4d4; background: #f6fcf7; }
+.relay-terminal-notice h3 { color: #196340; }
+.global-channel-status, .codex-communication-panel { margin-bottom: 22px; padding: 22px 26px; border: 1px solid #d9e1ec; border-radius: 14px; background: #fff; box-shadow: 0 6px 20px rgba(24, 35, 60, .04); }
+.global-channel-status h3, .codex-communication-panel h3 { margin-bottom: 14px; }
+.global-channel-status-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.channel-card, .channel-status-card { padding: 14px; border: 1px solid #d9e1ec; border-radius: 10px; background: #f8fbff; }
+.channel-card h4, .channel-status-card h4 { margin: 0 0 10px; color: #273c5d; font-size: 14px; }
+.channel-card p, .channel-status-card p { margin: 5px 0; color: #52637d; font-size: 13px; line-height: 1.4; }
+.codex-communication { display: grid; gap: 12px; }
+.codex-cycle-card { margin-top: 12px; padding: 16px; border: 1px solid #d9e1ec; border-radius: 10px; background: #f8fbff; }
+.codex-cycle-card header { margin-bottom: 12px; }
+.codex-cycle-card h4, .codex-cycle-card h5 { margin: 0; color: #273c5d; }
+.codex-cycle-card h5 { margin-bottom: 7px; font-size: 12px; }
+.codex-cycle-card p { margin: 7px 0; color: #52637d; font-size: 13px; line-height: 1.45; }
+.codex-cycle-card section { margin-top: 12px; }
+.codex-cycle-card pre { margin: 0; padding: 10px; border: 1px solid #d9e1ec; border-radius: 8px; overflow-wrap: anywhere; white-space: pre-wrap; background: #fff; color: #273c5d; font: 12px/1.5 ui-monospace, Consolas, monospace; }
+.cycle-progress { color: #196340; font-weight: 800; }
+.cycle-block-reason { color: #7a5b12; }
 .conversation { display: grid; gap: 16px; }
 .message-history { display: grid; gap: 12px; min-height: 250px; max-height: 540px; overflow: auto; padding: 4px; }
 .message { padding: 14px; border: 1px solid #d9e1ec; border-radius: 10px; background: #f8fbff; }
@@ -78,8 +106,36 @@ nav { display: grid; gap: 9px; }
 .message header strong { color: #273c5d; }
 .message header span { color: #74839a; }
 .message pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.55 Inter, "Microsoft YaHei UI", system-ui, sans-serif; color: #273c5d; }
+.uncertain-delivery { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #d9e1ec; }
+.uncertain-delivery p { margin: 0; color: #7a5b12; font-size: 12px; line-height: 1.45; }
 .light { color: #71819a; }
 .composer { display: grid; gap: 12px; }
 .mode-switch { display: flex; gap: 8px; }
 .mode-switch button { padding: 8px 10px; border: 1px solid #cbd5e3; border-radius: 7px; color: #52637d; background: #fff; font-weight: 800; font-size: 13px; }
 .mode-switch button.selected { border-color: #5379c7; color: #284e9f; background: #edf3ff; }
+.codex-thread-target { display: grid; gap: 10px; margin: 0 0 17px; padding: 14px; border: 1px solid #d9e1ec; border-radius: 9px; }
+.codex-thread-target legend { padding: 0 5px; color: #47536a; font-size: 13px; font-weight: 800; }
+.codex-thread-target label { grid-template-columns: auto 1fr; align-items: start; margin: 0; }
+.codex-thread-target input { width: auto; margin-top: 3px; }
+.codex-thread-target span { grid-column: 2; color: #66738a; font-size: 12px; font-weight: 500; line-height: 1.45; }
+.codex-thread-picker { display: grid; gap: 12px; margin: -2px 0 17px; }
+.relay-thread-candidates { display: grid; gap: 10px; }
+.relay-thread-candidate { display: flex; align-items: start; justify-content: space-between; gap: 16px; padding: 14px; border: 1px solid #d9e1ec; border-radius: 9px; background: #f8fbff; }
+.relay-thread-candidate.selected { border-color: #5379c7; background: #edf3ff; }
+.relay-thread-candidate strong { color: #273c5d; font-size: 14px; }
+.relay-thread-candidate p { margin: 5px 0 0; color: #52637d; font-size: 12px; line-height: 1.4; }
+.relay-thread-candidate .relay-thread-disabled-reason { color: #a82f39; font-weight: 800; }
+.relay-codex-recovery-panel { display: grid; gap: 14px; }
+.relay-codex-recovery-panel h3, .relay-codex-recovery-panel h4 { margin-bottom: 0; }
+.recovery-details { display: grid; gap: 6px; }
+.recovery-details p { margin: 0; color: #52637d; font-size: 13px; }
+.recovery-thread-picker { padding-top: 14px; border-top: 1px solid #d9e1ec; }
+
+@media (max-width: 980px) {
+  body { min-width: 0; }
+  .shell { grid-template-columns: 1fr; }
+  .sidebar { gap: 18px; padding: 24px; }
+  .workspace { padding: 28px 22px 42px; }
+  .global-channel-status-cards { grid-template-columns: 1fr; }
+  .uncertain-delivery { align-items: flex-start; flex-direction: column; }
+}

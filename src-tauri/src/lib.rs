@@ -1,8 +1,12 @@
 mod orchestration;
+mod relay_codex_worker;
 mod relay_protocol;
 
 use chrono::{DateTime, Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
+use relay_codex_worker::{
+    RelayCodexProcessTransport, RelayCodexTransport, RelayCodexTransportEvent,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -11,7 +15,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{mpsc as std_mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc, Arc, Mutex,
+    },
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{net::TcpListener, sync::mpsc};
@@ -22,6 +29,12 @@ const INITIAL_SCHEMA: &str = include_str!("../migrations/001_initial.sql");
 const ORCHESTRATION_SCHEMA: &str = include_str!("../migrations/002_orchestration_runtime.sql");
 const EXECUTION_CONTROL_SCHEMA: &str = include_str!("../migrations/003_execution_control.sql");
 const CONVERSATION_RELAY_SCHEMA: &str = include_str!("../migrations/004_conversation_relay_v2.sql");
+const CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA: &str =
+    include_str!("../migrations/005_codex_communication_observability.sql");
+const EXISTING_CODEX_THREAD_RESUME_SCHEMA: &str =
+    include_str!("../migrations/006_existing_codex_thread_resume.sql");
+const CODEX_THREAD_RECOVERY_PROVENANCE_SCHEMA: &str =
+    include_str!("../migrations/007_codex_thread_recovery_provenance.sql");
 
 struct AppState {
     connection: Mutex<Connection>,
@@ -141,10 +154,753 @@ impl Drop for ManagedAppServer {
 struct RelayCodexSession {
     module_id: String,
     commands: std_mpsc::Sender<RelayCodexCommand>,
+    turn_active: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayCodexLiveRuntime {
+    module_id: String,
+    turn_active: bool,
 }
 
 enum RelayCodexCommand {
-    StartTurn(String),
+    StartTurn {
+        cycle_id: String,
+        prompt: String,
+    },
+    Release {
+        acknowledgement: std_mpsc::Sender<Result<(), String>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayCodexExecutionMode {
+    NewThenTurn,
+    ResumeReservedThenTurn {
+        thread_id: String,
+    },
+    ResumeKnownThreadThenTurn {
+        thread_id: String,
+    },
+    ReacquireOnly {
+        thread_id: String,
+        origin_recovery_reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCodexAcquisitionKind {
+    ReservedResume,
+    ReacquireUnavailable,
+    ResumeKnownActive,
+}
+
+impl RelayCodexExecutionMode {
+    fn resume_thread_id(&self) -> Option<&str> {
+        match self {
+            Self::NewThenTurn => None,
+            Self::ResumeReservedThenTurn { thread_id }
+            | Self::ResumeKnownThreadThenTurn { thread_id }
+            | Self::ReacquireOnly { thread_id, .. } => Some(thread_id),
+        }
+    }
+
+    fn starts_turn_after_acquisition(&self) -> bool {
+        !matches!(self, Self::ReacquireOnly { .. })
+    }
+
+    fn acquisition_kind(&self) -> Option<RelayCodexAcquisitionKind> {
+        match self {
+            Self::NewThenTurn => None,
+            Self::ResumeReservedThenTurn { .. } => Some(RelayCodexAcquisitionKind::ReservedResume),
+            Self::ResumeKnownThreadThenTurn { .. } => {
+                Some(RelayCodexAcquisitionKind::ResumeKnownActive)
+            }
+            Self::ReacquireOnly { .. } => Some(RelayCodexAcquisitionKind::ReacquireUnavailable),
+        }
+    }
+}
+
+/// The worker owns App Server I/O; its host owns durable relay side effects.
+/// Keeping this boundary narrow lets the protocol loop be exercised without a
+/// Tauri application or SQLite connection.
+trait RelayCodexWorkerHost {
+    fn thread_ready(&mut self, module_id: &str, thread_id: &str) -> Result<(), String>;
+    fn thread_acquired(
+        &mut self,
+        module_id: &str,
+        thread_id: &str,
+        kind: RelayCodexAcquisitionKind,
+    ) -> Result<(), String>;
+    fn turn_started(
+        &mut self,
+        module_id: &str,
+        cycle_id: &str,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<(), String>;
+    fn turn_completed(&mut self, module_id: &str, cycle_id: &str, summary: &str);
+    fn failed(&mut self, module_id: &str, cycle_id: Option<&str>, reason: String);
+    fn recovery_acquisition_failed(
+        &mut self,
+        module_id: &str,
+        origin_recovery_reason: &str,
+        detail: String,
+    );
+}
+
+fn report_relay_codex_worker_failure<H: RelayCodexWorkerHost>(
+    host: &mut H,
+    execution_mode: &RelayCodexExecutionMode,
+    acquisition_pending: bool,
+    module_id: &str,
+    cycle_id: Option<&str>,
+    detail: String,
+) {
+    if acquisition_pending {
+        if let RelayCodexExecutionMode::ReacquireOnly {
+            origin_recovery_reason,
+            ..
+        } = execution_mode
+        {
+            host.recovery_acquisition_failed(module_id, origin_recovery_reason, detail);
+            return;
+        }
+    }
+    host.failed(module_id, cycle_id, detail);
+}
+
+struct TauriRelayCodexWorkerHost {
+    app: AppHandle,
+    working_directory: String,
+}
+
+impl TauriRelayCodexWorkerHost {
+    fn new(app: AppHandle, working_directory: String) -> Self {
+        Self {
+            app,
+            working_directory,
+        }
+    }
+}
+
+impl RelayCodexWorkerHost for TauriRelayCodexWorkerHost {
+    fn thread_ready(&mut self, module_id: &str, thread_id: &str) -> Result<(), String> {
+        relay_codex_thread_ready(&self.app, module_id, thread_id, &self.working_directory)
+    }
+
+    fn thread_acquired(
+        &mut self,
+        module_id: &str,
+        thread_id: &str,
+        kind: RelayCodexAcquisitionKind,
+    ) -> Result<(), String> {
+        relay_codex_thread_acquired(&self.app, module_id, thread_id, kind)
+    }
+
+    fn turn_started(
+        &mut self,
+        module_id: &str,
+        cycle_id: &str,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<(), String> {
+        relay_codex_turn_started(&self.app, module_id, cycle_id, thread_id, turn_id)
+    }
+
+    fn turn_completed(&mut self, module_id: &str, cycle_id: &str, summary: &str) {
+        relay_codex_turn_completed(&self.app, module_id, cycle_id, summary);
+    }
+
+    fn failed(&mut self, module_id: &str, cycle_id: Option<&str>, reason: String) {
+        let state = self.app.state::<AppState>();
+        if let Ok(connection) = state.connection.lock() {
+            if persist_relay_codex_start_recovery_in(&connection, module_id, cycle_id, &reason)
+                .is_ok_and(|handled| handled)
+            {
+                emit_relay_codex_changed(
+                    &self.app,
+                    module_id,
+                    cycle_id.unwrap_or_default(),
+                    "FAILED",
+                );
+                return;
+            }
+        }
+        relay_codex_failed(&self.app, module_id, cycle_id, reason);
+    }
+
+    fn recovery_acquisition_failed(
+        &mut self,
+        module_id: &str,
+        origin_recovery_reason: &str,
+        detail: String,
+    ) {
+        let state = self.app.state::<AppState>();
+        if let Ok(connection) = state.connection.lock() {
+            if persist_relay_codex_reacquire_failure_in(
+                &connection,
+                module_id,
+                origin_recovery_reason,
+                &detail,
+            )
+            .is_ok()
+            {
+                emit_relay_codex_changed(&self.app, module_id, "", "FAILED");
+                return;
+            }
+        }
+        relay_codex_failed(&self.app, module_id, None, detail);
+    }
+}
+
+fn persist_relay_codex_start_recovery_in(
+    connection: &Connection,
+    module_id: &str,
+    cycle_id: Option<&str>,
+    reason: &str,
+) -> Result<bool, String> {
+    if let Some(recovery_reason) = relay_codex_start_recovery_reason(reason) {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| format!("无法开始 Codex 对话恢复事务：{error}"))?;
+        if recovery_reason == RelayCodexRecoveryReason::TurnStartUnknown
+            || recovery_reason == RelayCodexRecoveryReason::ThreadResumeUnknown
+        {
+            if let Some(module) = get_relay_module(&transaction, module_id)? {
+                if let Some(thread_id) = module
+                    .codex_thread_id
+                    .as_deref()
+                    .or(module.resume_thread_id.as_deref())
+                {
+                    set_relay_codex_thread_state(
+                        &transaction,
+                        thread_id,
+                        RelayCodexThreadState::Unavailable,
+                        None,
+                        None,
+                    )?;
+                }
+            }
+        }
+        set_relay_phase(&transaction, module_id, "RECOVERY_REQUIRED")?;
+        set_relay_codex_recovery_reason(&transaction, module_id, Some(recovery_reason))?;
+        if let Some(cycle_id) = cycle_id {
+            set_relay_codex_pending_cycle_error(&transaction, cycle_id, reason)?;
+        }
+        append_relay_event(
+            &transaction,
+            module_id,
+            "CODEX_THREAD_RECOVERY_REQUIRED",
+            reason,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交 Codex 对话恢复：{error}"))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn relay_codex_recovery_reason_from_db(value: &str) -> Option<RelayCodexRecoveryReason> {
+    match value {
+        "THREAD_RESUME_FAILED" => Some(RelayCodexRecoveryReason::ThreadResumeFailed),
+        "THREAD_RESUME_UNKNOWN" => Some(RelayCodexRecoveryReason::ThreadResumeUnknown),
+        "THREAD_REACQUIRE_REQUIRED" => Some(RelayCodexRecoveryReason::ThreadReacquireRequired),
+        "TURN_START_FAILED" => Some(RelayCodexRecoveryReason::TurnStartFailed),
+        "TURN_START_UNKNOWN" => Some(RelayCodexRecoveryReason::TurnStartUnknown),
+        "THREAD_START_FAILED" => Some(RelayCodexRecoveryReason::ThreadStartFailed),
+        "THREAD_START_UNKNOWN" => Some(RelayCodexRecoveryReason::ThreadStartUnknown),
+        "THREAD_BECAME_ACTIVE_BEFORE_RESUME" => {
+            Some(RelayCodexRecoveryReason::ThreadBecameActiveBeforeResume)
+        }
+        _ => None,
+    }
+}
+
+fn persist_relay_codex_reacquire_failure_in(
+    connection: &Connection,
+    module_id: &str,
+    origin_recovery_reason: &str,
+    detail: &str,
+) -> Result<(), String> {
+    let origin = relay_codex_recovery_reason_from_db(origin_recovery_reason)
+        .ok_or_else(|| "Codex 重新获取缺少有效原始恢复原因。".to_string())?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 重新获取失败事务：{error}"))?;
+    set_relay_phase(&transaction, module_id, "RECOVERY_REQUIRED")?;
+    set_relay_codex_recovery_reason(&transaction, module_id, Some(origin))?;
+    if let Some(cycle) = list_relay_codex_cycles_in(&transaction, module_id)?
+        .into_iter()
+        .find(|cycle| cycle.status == "WAITING_TO_SEND_CODEX")
+    {
+        set_relay_codex_pending_cycle_error(&transaction, &cycle.id, detail)?;
+    }
+    append_relay_event(
+        &transaction,
+        module_id,
+        "CODEX_THREAD_REACQUIRE_FAILED",
+        detail,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 重新获取失败：{error}"))?;
+    Ok(())
+}
+
+fn recover_relay_codex_thread_registry_on_restart_in(
+    connection: &Connection,
+) -> Result<usize, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 对话重启恢复事务：{error}"))?;
+    let active = transaction
+        .prepare(
+            "SELECT thread_id, owner_module_id
+             FROM relay_codex_threads
+             WHERE state = 'ACTIVE' AND owner_module_id IS NOT NULL",
+        )
+        .map_err(|error| format!("无法读取活动 Codex 对话登记：{error}"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("无法查询活动 Codex 对话登记：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取活动 Codex 对话登记：{error}"))?;
+    let now = Utc::now().to_rfc3339();
+    let mut changed = 0;
+    for (thread_id, module_id) in active {
+        let registry_changed = transaction
+            .execute(
+                "UPDATE relay_codex_threads
+                 SET state = 'UNAVAILABLE', owner_module_id = NULL,
+                     last_module_id = ?2, reservation_previous_state = NULL, updated_at = ?3
+                 WHERE thread_id = ?1 AND state = 'ACTIVE' AND owner_module_id = ?2",
+                params![thread_id, module_id, now],
+            )
+            .map_err(|error| format!("无法标记 Codex 对话为不确定：{error}"))?;
+        if registry_changed != 1 {
+            continue;
+        }
+        let module = get_relay_module(&transaction, &module_id)?
+            .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if !matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+            if module.phase != "RECOVERY_REQUIRED" {
+                transaction
+                    .execute(
+                        "UPDATE relay_modules
+                         SET phase = 'RECOVERY_REQUIRED',
+                             codex_recovery_reason = 'THREAD_REACQUIRE_REQUIRED',
+                             codex_recovery_previous_phase = ?2, updated_at = ?3
+                         WHERE id = ?1",
+                        params![module_id, module.phase, Utc::now().to_rfc3339()],
+                    )
+                    .map_err(|error| format!("无法标记模块为 Codex 对话恢复状态：{error}"))?;
+            }
+            append_relay_event(
+                &transaction,
+                &module_id,
+                "CODEX_THREAD_REACQUIRE_REQUIRED",
+                "应用重启后无法确认此前 Codex 对话占用状态，未自动恢复。",
+            )?;
+            changed += 1;
+        }
+    }
+
+    let stale_running_cycles = transaction
+        .prepare(
+            "SELECT id, module_id FROM relay_codex_cycles
+             WHERE status = 'CODEX_RUNNING'",
+        )
+        .map_err(|error| format!("无法读取重启中断的 Codex 回合：{error}"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("无法查询重启中断的 Codex 回合：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取重启中断的 Codex 回合：{error}"))?;
+    for (cycle_id, module_id) in stale_running_cycles {
+        let detail = "APP_RESTART_INTERRUPTED：应用重启后无法确认此前 Codex 回合的最终结果；该回合未自动重放。";
+        let cycle_changed = transaction
+            .execute(
+                "UPDATE relay_codex_cycles
+                 SET status = 'FAILED', error_text = ?2, updated_at = ?3
+                 WHERE id = ?1 AND status = 'CODEX_RUNNING'",
+                params![cycle_id, detail, &now],
+            )
+            .map_err(|error| format!("无法标记重启中断的 Codex 回合：{error}"))?;
+        if cycle_changed != 1 {
+            continue;
+        }
+        let module = get_relay_module(&transaction, &module_id)?
+            .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if !matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+            if module.phase != "RECOVERY_REQUIRED" {
+                transaction
+                    .execute(
+                        "UPDATE relay_modules
+                         SET phase = 'RECOVERY_REQUIRED',
+                             codex_recovery_reason = 'THREAD_REACQUIRE_REQUIRED',
+                             codex_recovery_previous_phase = ?2, updated_at = ?3
+                         WHERE id = ?1",
+                        params![module_id, module.phase, &now],
+                    )
+                    .map_err(|error| format!("无法标记重启中断模块为恢复状态：{error}"))?;
+                changed += 1;
+            }
+        }
+        append_relay_event(
+            &transaction,
+            &module_id,
+            "CODEX_TURN_RESTART_INTERRUPTED",
+            &format!("cycleId={cycle_id}; {detail}"),
+        )?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 对话重启恢复：{error}"))?;
+    Ok(changed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayCodexOutstandingRpc {
+    Initialize,
+    ThreadStart,
+    ThreadListForResume {
+        thread_id: String,
+        cursor: Option<String>,
+    },
+    ThreadResume {
+        thread_id: String,
+    },
+    TurnStart {
+        cycle_id: String,
+        thread_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayCodexRpcOutcome {
+    MatchingSuccess,
+    MatchingExplicitError(String),
+    MatchingMalformed(String),
+    Unrelated,
+}
+
+fn classify_relay_codex_rpc_response(message: &Value, request_id: i64) -> RelayCodexRpcOutcome {
+    if message.get("id").and_then(Value::as_i64) != Some(request_id) {
+        return RelayCodexRpcOutcome::Unrelated;
+    }
+    if let Some(detail) = message
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        RelayCodexRpcOutcome::MatchingExplicitError(detail.to_string())
+    } else if message.get("result").is_some() {
+        RelayCodexRpcOutcome::MatchingSuccess
+    } else {
+        RelayCodexRpcOutcome::MatchingMalformed("匹配响应缺少 result。".into())
+    }
+}
+
+fn relay_codex_unknown_outstanding_reason(
+    outstanding: Option<&RelayCodexOutstandingRpc>,
+    detail: impl std::fmt::Display,
+) -> String {
+    match outstanding {
+        Some(RelayCodexOutstandingRpc::ThreadStart) => {
+            format!("Codex thread/start 送达结果未知：{detail}")
+        }
+        Some(RelayCodexOutstandingRpc::ThreadResume { .. }) => {
+            format!("Codex thread/resume 送达结果未知：{detail}")
+        }
+        Some(RelayCodexOutstandingRpc::ThreadListForResume { .. }) => {
+            format!("Codex 恢复前对话检查失败：{detail}")
+        }
+        Some(RelayCodexOutstandingRpc::TurnStart { .. }) => {
+            format!("Codex turn/start 送达结果未知：{detail}")
+        }
+        _ => detail.to_string(),
+    }
+}
+
+fn relay_codex_rpc_name(rpc: &RelayCodexOutstandingRpc) -> &'static str {
+    match rpc {
+        RelayCodexOutstandingRpc::Initialize => "initialize",
+        RelayCodexOutstandingRpc::ThreadStart => "thread/start",
+        RelayCodexOutstandingRpc::ThreadListForResume { .. } => "thread/list",
+        RelayCodexOutstandingRpc::ThreadResume { .. } => "thread/resume",
+        RelayCodexOutstandingRpc::TurnStart { .. } => "turn/start",
+    }
+}
+
+fn relay_codex_thread_list_params(working_directory: &str, cursor: Option<&str>) -> Value {
+    let mut params = json!({
+        "cwd": working_directory,
+        "archived": false,
+        "sourceKinds": ["cli", "vscode", "appServer"],
+        "sortKey": "recency_at",
+        "sortDirection": "desc"
+    });
+    if let Some(cursor) = cursor {
+        params["cursor"] = Value::String(cursor.to_string());
+    }
+    params
+}
+
+enum RelayCodexResumePreflight {
+    Eligible,
+    Active,
+    Invalid(String),
+    Missing,
+}
+
+fn inspect_relay_codex_resume_page(
+    result: &Value,
+    expected_thread_id: &str,
+    working_directory: &str,
+) -> Result<(RelayCodexResumePreflight, Option<String>), String> {
+    let threads = result
+        .get("data")
+        .or_else(|| result.get("threads"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Codex 对话列表响应缺少 data。".to_string())?;
+    let outcome = threads
+        .iter()
+        .find(|thread| thread.get("id").and_then(Value::as_str) == Some(expected_thread_id))
+        .map(|thread| {
+            if thread.get("cwd").and_then(Value::as_str) != Some(working_directory) {
+                return RelayCodexResumePreflight::Invalid("目标对话工作目录已变化。".into());
+            }
+            let source = thread.get("source").and_then(Value::as_str);
+            if !matches!(source, Some("cli" | "vscode" | "appServer")) {
+                return RelayCodexResumePreflight::Invalid("目标对话来源不受支持。".into());
+            }
+            match relay_codex_thread_status(thread) {
+                Some("idle" | "notLoaded") => RelayCodexResumePreflight::Eligible,
+                Some("active") => RelayCodexResumePreflight::Active,
+                Some("systemError") => {
+                    RelayCodexResumePreflight::Invalid("目标对话处于系统错误状态。".into())
+                }
+                _ => RelayCodexResumePreflight::Invalid("目标对话当前状态不可继续。".into()),
+            }
+        })
+        .unwrap_or(RelayCodexResumePreflight::Missing);
+    Ok((
+        outcome,
+        result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    ))
+}
+
+fn relay_codex_start_recovery_reason(reason: &str) -> Option<RelayCodexRecoveryReason> {
+    match reason {
+        value if value.starts_with("Codex 恢复前对话检查发现目标正在运行") => {
+            Some(RelayCodexRecoveryReason::ThreadBecameActiveBeforeResume)
+        }
+        value if value.starts_with("Codex 恢复前对话检查失败") => {
+            Some(RelayCodexRecoveryReason::ThreadResumeFailed)
+        }
+        value if value.starts_with("Codex thread/start 明确失败") => {
+            Some(RelayCodexRecoveryReason::ThreadStartFailed)
+        }
+        value if value.starts_with("Codex thread/start 送达结果未知") => {
+            Some(RelayCodexRecoveryReason::ThreadStartUnknown)
+        }
+        value if value.starts_with("Codex turn/start 明确失败") => {
+            Some(RelayCodexRecoveryReason::TurnStartFailed)
+        }
+        value if value.starts_with("Codex turn/start 送达结果未知") => {
+            Some(RelayCodexRecoveryReason::TurnStartUnknown)
+        }
+        value if value.starts_with("Codex thread/resume 明确失败") => {
+            Some(RelayCodexRecoveryReason::ThreadResumeFailed)
+        }
+        value if value.starts_with("Codex thread/resume 送达结果未知") => {
+            Some(RelayCodexRecoveryReason::ThreadResumeUnknown)
+        }
+        _ => None,
+    }
+}
+
+fn release_relay_codex_session(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    module_id: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let commands = {
+        let sessions = sessions
+            .lock()
+            .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+        let Some(session) = sessions.as_ref() else {
+            return Ok(());
+        };
+        if session.module_id != module_id {
+            return Ok(());
+        }
+        if session.turn_active.load(Ordering::SeqCst) {
+            return Err("当前 Codex 回合仍在运行，不能释放 Codex 对话。".into());
+        }
+        session.commands.clone()
+    };
+
+    let (acknowledgement_sender, acknowledgement_receiver) = std_mpsc::channel();
+    commands
+        .send(RelayCodexCommand::Release {
+            acknowledgement: acknowledgement_sender,
+        })
+        .map_err(|_| "Codex 对话已经退出，无法确认释放。".to_string())?;
+    acknowledgement_receiver
+        .recv_timeout(timeout)
+        .map_err(|error| format!("等待 Codex 对话释放确认超时：{error}"))?
+}
+
+fn clear_relay_codex_session_if_matches(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    module_id: &str,
+) -> bool {
+    let Ok(mut sessions) = sessions.lock() else {
+        return false;
+    };
+    if sessions
+        .as_ref()
+        .is_some_and(|session| session.module_id == module_id)
+    {
+        *sessions = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn mark_relay_codex_session_turn_inactive(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    module_id: &str,
+) -> bool {
+    let Ok(sessions) = sessions.lock() else {
+        return false;
+    };
+    let Some(session) = sessions.as_ref() else {
+        return false;
+    };
+    if session.module_id != module_id {
+        return false;
+    }
+    session.turn_active.store(false, Ordering::SeqCst);
+    true
+}
+
+fn release_relay_codex_runtime(app: &AppHandle, module_id: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    release_relay_codex_session(
+        &state.relay_codex,
+        module_id,
+        std::time::Duration::from_secs(5),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCodexThreadReleaseOutcome {
+    Persisted,
+    NoOwnedActiveThread,
+}
+
+fn persist_relay_codex_thread_release_outcome_in(
+    connection: &Connection,
+    module_id: &str,
+    confirmed: bool,
+    detail: &str,
+) -> Result<RelayCodexThreadReleaseOutcome, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 对话释放结果事务：{error}"))?;
+    let module =
+        get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    let Some(thread_id) = module.codex_thread_id.as_deref() else {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交 Codex 对话释放结果事务：{error}"))?;
+        return Ok(RelayCodexThreadReleaseOutcome::NoOwnedActiveThread);
+    };
+    let state = if confirmed { "RELEASED" } else { "UNAVAILABLE" };
+    let changed = transaction
+        .execute(
+            "UPDATE relay_codex_threads
+             SET state = ?3, owner_module_id = NULL, last_module_id = ?2,
+                 reservation_previous_state = NULL, updated_at = ?4
+             WHERE thread_id = ?1 AND state = 'ACTIVE' AND owner_module_id = ?2",
+            params![thread_id, module_id, state, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法登记 Codex 对话释放结果：{error}"))?;
+    if changed != 1 {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交 Codex 对话释放结果事务：{error}"))?;
+        return Ok(RelayCodexThreadReleaseOutcome::NoOwnedActiveThread);
+    }
+    append_relay_event(
+        &transaction,
+        module_id,
+        if confirmed {
+            "CODEX_THREAD_RELEASED"
+        } else {
+            "CODEX_THREAD_RELEASE_FAILED"
+        },
+        detail,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 对话释放结果事务：{error}"))?;
+    Ok(RelayCodexThreadReleaseOutcome::Persisted)
+}
+
+fn rollback_relay_codex_reservation_on_terminal_in(
+    connection: &Connection,
+    module: &RelayModuleRecord,
+) -> Result<(), String> {
+    if module.codex_thread_id.is_some() {
+        return Ok(());
+    }
+    let Some(thread_id) = module.resume_thread_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(record) = get_relay_codex_thread(connection, thread_id)? else {
+        return Ok(());
+    };
+    if record.state != RelayCodexThreadState::Reserved
+        || record.owner_module_id.as_deref() != Some(module.id.as_str())
+    {
+        return Ok(());
+    }
+    match record.reservation_previous_state.as_deref() {
+        Some("NONE") => {
+            connection
+                .execute(
+                    "DELETE FROM relay_codex_threads
+                     WHERE thread_id = ?1 AND state = 'RESERVED' AND owner_module_id = ?2",
+                    params![thread_id, &module.id],
+                )
+                .map_err(|error| format!("无法撤销 Codex 对话保留：{error}"))?;
+        }
+        Some("RELEASED") => {
+            connection
+                .execute(
+                    "UPDATE relay_codex_threads
+                     SET state = 'RELEASED', owner_module_id = NULL,
+                         reservation_previous_state = NULL, updated_at = ?3
+                     WHERE thread_id = ?1 AND state = 'RESERVED' AND owner_module_id = ?2
+                       AND reservation_previous_state = 'RELEASED'",
+                    params![thread_id, &module.id, Utc::now().to_rfc3339()],
+                )
+                .map_err(|error| format!("无法恢复 Codex 对话保留：{error}"))?;
+        }
+        _ => return Err("Codex 对话保留来源无效，不能终止模块。".into()),
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +967,22 @@ struct CodexTurnResult {
     turn_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexThreadTargetInput {
+    New,
+    Existing {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+    },
+}
+
+impl Default for RelayCodexThreadTargetInput {
+    fn default() -> Self {
+        Self::New
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayModuleInput {
@@ -219,6 +991,8 @@ struct RelayModuleInput {
     max_cycles: i64,
     max_runtime_minutes: i64,
     retry_template: String,
+    #[serde(default)]
+    codex_thread_target: RelayCodexThreadTargetInput,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -232,6 +1006,8 @@ struct RelayModuleRecord {
     retry_template: String,
     phase: String,
     codex_thread_id: Option<String>,
+    resume_thread_id: Option<String>,
+    codex_recovery_reason: Option<String>,
     module_started_at: Option<String>,
     stop_after_turn: bool,
     invalid_reply_count: i64,
@@ -270,6 +1046,186 @@ struct RelayMessageRecord {
     delivered_at: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayRecoveryRecord {
+    message_id: String,
+    module_id: String,
+    module_name: String,
+    sequence_number: i64,
+    kind: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexCycleRecord {
+    id: String,
+    module_id: String,
+    cycle_number: i64,
+    status: String,
+    prompt_text: String,
+    codex_thread_id: Option<String>,
+    codex_turn_id: Option<String>,
+    result_text: Option<String>,
+    outbound_chatgpt_message_id: Option<String>,
+    error_text: Option<String>,
+    created_at: String,
+    codex_started_at: Option<String>,
+    codex_completed_at: Option<String>,
+    relay_queued_at: Option<String>,
+    relay_delivered_at: Option<String>,
+    updated_at: String,
+    block_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexThreadState {
+    Reserved,
+    Active,
+    Released,
+    Unavailable,
+}
+
+impl RelayCodexThreadState {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Reserved => "RESERVED",
+            Self::Active => "ACTIVE",
+            Self::Released => "RELEASED",
+            Self::Unavailable => "UNAVAILABLE",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, String> {
+        match value {
+            "RESERVED" => Ok(Self::Reserved),
+            "ACTIVE" => Ok(Self::Active),
+            "RELEASED" => Ok(Self::Released),
+            "UNAVAILABLE" => Ok(Self::Unavailable),
+            _ => Err(format!("未知的 Codex 对话登记状态：{value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexThreadRecord {
+    thread_id: String,
+    working_directory: String,
+    state: RelayCodexThreadState,
+    owner_module_id: Option<String>,
+    last_module_id: Option<String>,
+    reservation_previous_state: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexRecoveryReason {
+    ThreadResumeFailed,
+    ThreadResumeUnknown,
+    ThreadReacquireRequired,
+    TurnStartFailed,
+    TurnStartUnknown,
+    ThreadStartFailed,
+    ThreadStartUnknown,
+    ThreadBecameActiveBeforeResume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexRecoveryAction {
+    RetryResume,
+    ReacquireThread,
+    StartNewThread,
+    RetryTurnStart,
+    SelectExistingThread {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexRecoveryAllowedAction {
+    RetryResume,
+    ReacquireThread,
+    StartNewThread,
+    RetryTurnStart,
+    SelectExistingThread,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCodexRecoveryRuntimeState {
+    None,
+    CurrentIdle,
+    CurrentTurnActive,
+    OtherModule,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexThreadRecoveryCycleSnapshot {
+    id: String,
+    cycle_number: i64,
+    status: String,
+    prompt_text: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexThreadStateSnapshot {
+    module_id: String,
+    working_directory: String,
+    intended_thread_id: Option<String>,
+    acquired_thread_id: Option<String>,
+    registry: Option<RelayCodexThreadRecord>,
+    recovery_reason: Option<String>,
+    pending_cycle: Option<RelayCodexThreadRecoveryCycleSnapshot>,
+    summary: String,
+    allowed_actions: Vec<RelayCodexRecoveryAllowedAction>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayChatGptChannelSnapshot {
+    status: String,
+    active_module_id: Option<String>,
+    active_module_name: Option<String>,
+    active_message_id: Option<String>,
+    active_kind: Option<String>,
+    active_phase: Option<String>,
+    recovery_blocker_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexChannelSnapshot {
+    status: String,
+    active_module_id: Option<String>,
+    active_module_name: Option<String>,
+    cycle_number: Option<i64>,
+    codex_thread_id: Option<String>,
+    codex_turn_id: Option<String>,
+    cycle_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayChannelSnapshot {
+    chatgpt: RelayChatGptChannelSnapshot,
+    codex: RelayCodexChannelSnapshot,
+}
+
+enum RelayDispatchClaim {
+    RecoveryBlocked(i64),
+    InFlight,
+    Empty,
+    Message(RelayMessageRecord),
+}
+
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
     let data_dir = app
         .path()
@@ -295,10 +1251,101 @@ fn create_connection(app: &AppHandle) -> Result<Connection, String> {
     connection
         .execute_batch(CONVERSATION_RELAY_SCHEMA)
         .map_err(|error| format!("could not initialize conversation-relay storage: {error}"))?;
+    connection
+        .execute_batch(CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA)
+        .map_err(|error| {
+            format!("could not initialize Codex communication observability storage: {error}")
+        })?;
+    apply_existing_codex_thread_resume_schema(&connection)?;
+    apply_codex_thread_recovery_provenance_schema(&connection)?;
     Ok(connection)
 }
 
+fn apply_codex_thread_recovery_provenance_schema(connection: &Connection) -> Result<(), String> {
+    const VERSION: &str = "007_codex_thread_recovery_provenance";
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("无法开始 Codex 对话恢复来源迁移：{error}"))?;
+    let result = (|| {
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                [VERSION],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            connection.execute_batch(CODEX_THREAD_RECOVERY_PROVENANCE_SCHEMA)?;
+            connection.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![VERSION, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok::<_, rusqlite::Error>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(|error| format!("无法提交 Codex 对话恢复来源迁移：{error}")),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(format!("无法迁移 Codex 对话恢复来源：{error}"))
+        }
+    }
+}
+
+fn apply_existing_codex_thread_resume_schema(connection: &Connection) -> Result<(), String> {
+    const VERSION: &str = "006_existing_codex_thread_resume";
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("无法开始 Codex 对话迁移：{error}"))?;
+    let result = (|| {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY NOT NULL,
+                applied_at TEXT NOT NULL
+             )",
+        )?;
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                [VERSION],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            connection.execute_batch(EXISTING_CODEX_THREAD_RESUME_SCHEMA)?;
+            connection.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![VERSION, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok::<_, rusqlite::Error>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(|error| format!("无法提交 Codex 对话迁移：{error}")),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(format!("无法迁移 Codex 对话登记：{error}"))
+        }
+    }
+}
+
 fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String> {
+    let message_ids: Vec<String> = connection
+        .prepare(
+            "SELECT id FROM relay_messages
+             WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+        )
+        .map_err(|error| format!("could not inspect relay delivery state: {error}"))?
+        .query_map([], |row| row.get(0))
+        .map_err(|error| format!("could not read relay delivery state: {error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("could not collect relay delivery state: {error}"))?;
     let affected = connection
         .execute(
             "UPDATE relay_messages SET delivery_state = 'UNKNOWN'
@@ -312,6 +1359,14 @@ fn mark_uncertain_relay_deliveries(connection: &Connection) -> Result<(), String
              WHERE id IN (SELECT DISTINCT module_id FROM relay_messages WHERE delivery_state = 'UNKNOWN')",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| format!("could not mark relay recovery state: {error}"))?;
+        for message_id in message_ids {
+            sync_codex_cycle_for_chatgpt_message_state(
+                connection,
+                &message_id,
+                "UNKNOWN",
+                Some("应用重启后无法确认 ChatGPT 消息是否已送达；未自动重发。"),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1128,6 +2183,7 @@ async fn handle_chatgpt_bridge_connection(
                         let adapter_version = message.get("adapterVersion").and_then(Value::as_str);
                         let adapter_error = message.get("adapterError").and_then(Value::as_str);
                         let adapter_diagnostic = message.get("adapterDiagnostic").and_then(Value::as_str);
+                        let request_id = message.get("requestId").and_then(Value::as_str);
                         let relay = message.get("relay").and_then(Value::as_bool) == Some(true);
                         let valid_session = bridge.session.lock().ok().and_then(|session| session.clone()).is_some_and(|session| Some(session.session_id.as_str()) == session_id);
                         if !valid_session || reply.is_none() {
@@ -1144,7 +2200,22 @@ async fn handle_chatgpt_bridge_connection(
                             continue;
                         }
                         if relay {
-                            if let Err(error) = handle_relay_chatgpt_reply(app.clone(), reply.unwrap_or_default()) {
+                            if let Some(adapter_error) = adapter_error {
+                                if let Err(error) = handle_relay_chatgpt_adapter_failure(
+                                    app.clone(),
+                                    adapter_error,
+                                    adapter_diagnostic,
+                                ) {
+                                    bridge.set_status(&app, ChatGptBridgeStatus {
+                                        phase: "RELAY_BLOCKED".into(),
+                                        detail: format!("无法保存 ChatGPT 适配器错误：{error}"),
+                                        tab_id: None,
+                                        protocol_state: None,
+                                    });
+                                }
+                                continue;
+                            }
+                            if let Err(error) = handle_relay_chatgpt_reply(app.clone(), request_id, reply.unwrap_or_default()) {
                                 bridge.set_status(&app, ChatGptBridgeStatus {
                                     phase: "RELAY_BLOCKED".into(),
                                     detail: format!("传话回复无法处理：{error}"),
@@ -1288,6 +2359,11 @@ fn validate_relay_module(input: &RelayModuleInput) -> Result<(), String> {
     if input.retry_template.trim().is_empty() {
         return Err("请填写 ChatGPT 协议重试模板。".into());
     }
+    if let RelayCodexThreadTargetInput::Existing { thread_id } = &input.codex_thread_target {
+        if thread_id.trim().is_empty() {
+            return Err("请选择要继续的 Codex 对话。".into());
+        }
+    }
     Ok(())
 }
 
@@ -1307,6 +2383,8 @@ fn relay_row_to_module(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayModuleR
         started_cycles: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+        resume_thread_id: row.get(14)?,
+        codex_recovery_reason: row.get(15)?,
     })
 }
 
@@ -1316,11 +2394,117 @@ fn get_relay_module(
 ) -> Result<Option<RelayModuleRecord>, String> {
     connection.query_row(
         "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
-                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                resume_thread_id, codex_recovery_reason
          FROM relay_modules WHERE id = ?1",
         [id],
         relay_row_to_module,
     ).optional().map_err(|error| format!("无法读取传话模块：{error}"))
+}
+
+fn relay_codex_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayCodexThreadRecord> {
+    let state: String = row.get(2)?;
+    RelayCodexThreadState::from_db(&state).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })?;
+    Ok(RelayCodexThreadRecord {
+        thread_id: row.get(0)?,
+        working_directory: row.get(1)?,
+        state: RelayCodexThreadState::from_db(&state).expect("validated registry state"),
+        owner_module_id: row.get(3)?,
+        last_module_id: row.get(4)?,
+        reservation_previous_state: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+const RELAY_CODEX_THREAD_SELECT: &str = "SELECT thread_id, working_directory, state,
+    owner_module_id, last_module_id, reservation_previous_state, updated_at
+ FROM relay_codex_threads";
+
+fn get_relay_codex_thread(
+    connection: &Connection,
+    thread_id: &str,
+) -> Result<Option<RelayCodexThreadRecord>, String> {
+    connection
+        .query_row(
+            &format!("{RELAY_CODEX_THREAD_SELECT} WHERE thread_id = ?1"),
+            [thread_id],
+            relay_codex_thread_row,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 对话登记：{error}"))
+}
+
+fn list_relay_codex_threads(
+    connection: &Connection,
+) -> Result<Vec<RelayCodexThreadRecord>, String> {
+    connection
+        .prepare(&format!("{RELAY_CODEX_THREAD_SELECT} ORDER BY thread_id"))
+        .map_err(|error| format!("无法准备 Codex 对话登记查询：{error}"))?
+        .query_map([], relay_codex_thread_row)
+        .map_err(|error| format!("无法查询 Codex 对话登记：{error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("无法读取 Codex 对话登记：{error}"))
+}
+
+fn upsert_relay_codex_thread(
+    connection: &Connection,
+    record: &RelayCodexThreadRecord,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO relay_codex_threads (
+                thread_id, working_directory, state, owner_module_id, last_module_id,
+                reservation_previous_state, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(thread_id) DO UPDATE SET
+                working_directory = excluded.working_directory,
+                state = excluded.state,
+                owner_module_id = excluded.owner_module_id,
+                last_module_id = excluded.last_module_id,
+                reservation_previous_state = excluded.reservation_previous_state,
+                updated_at = excluded.updated_at",
+            params![
+                &record.thread_id,
+                &record.working_directory,
+                record.state.as_db(),
+                &record.owner_module_id,
+                &record.last_module_id,
+                &record.reservation_previous_state,
+                &record.updated_at,
+            ],
+        )
+        .map_err(|error| format!("无法保存 Codex 对话登记：{error}"))?;
+    Ok(())
+}
+
+fn set_relay_codex_thread_state(
+    connection: &Connection,
+    thread_id: &str,
+    state: RelayCodexThreadState,
+    owner_module_id: Option<&str>,
+    reservation_previous_state: Option<&str>,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE relay_codex_threads
+             SET state = ?2, owner_module_id = ?3, reservation_previous_state = ?4, updated_at = ?5
+             WHERE thread_id = ?1",
+            params![
+                thread_id,
+                state.as_db(),
+                owner_module_id,
+                reservation_previous_state,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|error| format!("无法更新 Codex 对话登记：{error}"))?;
+    Ok(())
 }
 
 fn next_relay_sequence(connection: &Connection, module_id: &str) -> Result<i64, String> {
@@ -1347,6 +2531,346 @@ fn relay_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayMessageRe
     })
 }
 
+fn relay_codex_cycle_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RelayCodexCycleRecord> {
+    Ok(RelayCodexCycleRecord {
+        id: row.get(0)?,
+        module_id: row.get(1)?,
+        cycle_number: row.get(2)?,
+        status: row.get(3)?,
+        prompt_text: row.get(4)?,
+        codex_thread_id: row.get(5)?,
+        codex_turn_id: row.get(6)?,
+        result_text: row.get(7)?,
+        outbound_chatgpt_message_id: row.get(8)?,
+        error_text: row.get(9)?,
+        created_at: row.get(10)?,
+        codex_started_at: row.get(11)?,
+        codex_completed_at: row.get(12)?,
+        relay_queued_at: row.get(13)?,
+        relay_delivered_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        block_reason: None,
+    })
+}
+
+const RELAY_CODEX_CYCLE_SELECT: &str = "SELECT id, module_id, cycle_number, status, prompt_text,
+    codex_thread_id, codex_turn_id, result_text, outbound_chatgpt_message_id, error_text,
+    created_at, codex_started_at, codex_completed_at, relay_queued_at, relay_delivered_at, updated_at
+ FROM relay_codex_cycles";
+
+fn create_relay_codex_cycle(
+    connection: &Connection,
+    module_id: &str,
+    cycle_number: i64,
+    prompt_text: &str,
+) -> Result<RelayCodexCycleRecord, String> {
+    let now = Utc::now().to_rfc3339();
+    let cycle = RelayCodexCycleRecord {
+        id: Uuid::new_v4().to_string(),
+        module_id: module_id.to_string(),
+        cycle_number,
+        status: "WAITING_TO_SEND_CODEX".into(),
+        prompt_text: prompt_text.to_string(),
+        codex_thread_id: None,
+        codex_turn_id: None,
+        result_text: None,
+        outbound_chatgpt_message_id: None,
+        error_text: None,
+        created_at: now.clone(),
+        codex_started_at: None,
+        codex_completed_at: None,
+        relay_queued_at: None,
+        relay_delivered_at: None,
+        updated_at: now,
+        block_reason: None,
+    };
+    connection
+        .execute(
+            "INSERT INTO relay_codex_cycles (
+            id, module_id, cycle_number, status, prompt_text, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &cycle.id,
+                &cycle.module_id,
+                cycle.cycle_number,
+                &cycle.status,
+                &cycle.prompt_text,
+                &cycle.created_at,
+                &cycle.updated_at,
+            ],
+        )
+        .map_err(|error| format!("无法创建 Codex 通讯循环：{error}"))?;
+    Ok(cycle)
+}
+
+fn get_relay_codex_cycle_by_id(
+    connection: &Connection,
+    cycle_id: &str,
+) -> Result<Option<RelayCodexCycleRecord>, String> {
+    connection
+        .query_row(
+            &format!("{RELAY_CODEX_CYCLE_SELECT} WHERE id = ?1"),
+            [cycle_id],
+            relay_codex_cycle_row,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))
+}
+
+fn get_relay_codex_cycle_by_outbound_message(
+    connection: &Connection,
+    message_id: &str,
+) -> Result<Option<RelayCodexCycleRecord>, String> {
+    connection
+        .query_row(
+            &format!("{RELAY_CODEX_CYCLE_SELECT} WHERE outbound_chatgpt_message_id = ?1"),
+            [message_id],
+            relay_codex_cycle_row,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))
+}
+
+fn relay_channel_snapshot_from_connection(
+    connection: &Connection,
+) -> Result<RelayChannelSnapshot, String> {
+    relay_channel_snapshot_from_connection_with_live_runtime(connection, None)
+}
+
+fn relay_channel_snapshot_from_connection_with_live_runtime(
+    connection: &Connection,
+    live_runtime: Option<&RelayCodexLiveRuntime>,
+) -> Result<RelayChannelSnapshot, String> {
+    let recovery_blocker_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages
+             WHERE direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法统计 ChatGPT 不确定送达消息：{error}"))?;
+
+    let active_chatgpt_message = if recovery_blocker_count > 0 {
+        connection
+            .query_row(
+                "SELECT message.module_id, module.name, message.id, message.kind, message.delivery_state
+                 FROM relay_messages AS message
+                 JOIN relay_modules AS module ON module.id = message.module_id
+                 WHERE message.direction = 'TO_CHATGPT' AND message.delivery_state = 'UNKNOWN'
+                 ORDER BY message.created_at ASC, message.id ASC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("无法读取 ChatGPT 不确定送达消息：{error}"))?
+    } else {
+        connection
+            .query_row(
+                "SELECT message.module_id, module.name, message.id, message.kind, message.delivery_state
+                 FROM relay_messages AS message
+                 JOIN relay_modules AS module ON module.id = message.module_id
+                 WHERE message.direction = 'TO_CHATGPT' AND message.delivery_state = 'SENT'
+                 ORDER BY message.created_at ASC, message.id ASC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("无法读取 ChatGPT 在途消息：{error}"))?
+    };
+    let chatgpt = match (recovery_blocker_count, active_chatgpt_message) {
+        (count, Some((module_id, module_name, message_id, kind, phase))) if count > 0 => {
+            RelayChatGptChannelSnapshot {
+                status: "RECOVERY_BLOCKED".into(),
+                active_module_id: Some(module_id),
+                active_module_name: Some(module_name),
+                active_message_id: Some(message_id),
+                active_kind: Some(kind),
+                active_phase: Some(phase),
+                recovery_blocker_count: count,
+            }
+        }
+        (0, Some((module_id, module_name, message_id, kind, phase))) => {
+            RelayChatGptChannelSnapshot {
+                status: "IN_FLIGHT".into(),
+                active_module_id: Some(module_id),
+                active_module_name: Some(module_name),
+                active_message_id: Some(message_id),
+                active_kind: Some(kind),
+                active_phase: Some(phase),
+                recovery_blocker_count: 0,
+            }
+        }
+        _ => RelayChatGptChannelSnapshot {
+            status: "IDLE".into(),
+            active_module_id: None,
+            active_module_name: None,
+            active_message_id: None,
+            active_kind: None,
+            active_phase: None,
+            recovery_blocker_count: 0,
+        },
+    };
+
+    let codex = if let Some(runtime) = live_runtime.filter(|runtime| runtime.turn_active) {
+        let module_name = connection
+            .query_row(
+                "SELECT name FROM relay_modules WHERE id = ?1",
+                [&runtime.module_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取活动 Codex 模块：{error}"))?;
+        let cycle = connection
+            .query_row(
+                "SELECT cycle_number, codex_thread_id, codex_turn_id, status
+                 FROM relay_codex_cycles
+                 WHERE module_id = ?1 AND status = 'CODEX_RUNNING'
+                 ORDER BY codex_started_at DESC, id DESC LIMIT 1",
+                [&runtime.module_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("无法读取活动 Codex 通讯循环：{error}"))?;
+        RelayCodexChannelSnapshot {
+            status: "RUNNING".into(),
+            active_module_id: Some(runtime.module_id.clone()),
+            active_module_name: module_name,
+            cycle_number: cycle.as_ref().map(|cycle| cycle.0),
+            codex_thread_id: cycle.as_ref().and_then(|cycle| cycle.1.clone()),
+            codex_turn_id: cycle.as_ref().and_then(|cycle| cycle.2.clone()),
+            cycle_status: cycle.map(|cycle| cycle.3),
+        }
+    } else {
+        RelayCodexChannelSnapshot {
+            status: "IDLE".into(),
+            active_module_id: None,
+            active_module_name: None,
+            cycle_number: None,
+            codex_thread_id: None,
+            codex_turn_id: None,
+            cycle_status: None,
+        }
+    };
+
+    Ok(RelayChannelSnapshot { chatgpt, codex })
+}
+
+fn relay_codex_cycle_block_reason(
+    connection: &Connection,
+    cycle: &RelayCodexCycleRecord,
+    snapshot: &RelayChannelSnapshot,
+) -> Result<Option<String>, String> {
+    if cycle.status == "CODEX_COMPLETED" && cycle.outbound_chatgpt_message_id.is_none() {
+        let phase = connection
+            .query_row(
+                "SELECT phase FROM relay_modules WHERE id = ?1",
+                [&cycle.module_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取 Codex 通讯模块状态：{error}"))?;
+        if phase.as_deref() == Some("STOPPED") {
+            return Ok(Some("模块已由用户终止，结果未回传 ChatGPT".into()));
+        }
+    }
+    if cycle.status == "FAILED" {
+        return Ok(cycle.error_text.clone());
+    }
+    if !matches!(
+        cycle.status.as_str(),
+        "WAITING_FOR_CHATGPT" | "SENDING_TO_CHATGPT"
+    ) {
+        return Ok(None);
+    }
+
+    let outbound_delivery_state = match cycle.outbound_chatgpt_message_id.as_deref() {
+        Some(message_id) => connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取 Codex 回传消息状态：{error}"))?,
+        None => None,
+    };
+    if outbound_delivery_state.as_deref() == Some("UNKNOWN") {
+        return Ok(Some("回传结果不确定，等待人工恢复。".into()));
+    }
+    if snapshot.chatgpt.status == "RECOVERY_BLOCKED" {
+        return Ok(Some(format!(
+            "存在待人工处理的不确定送达消息（{} 条）。",
+            snapshot.chatgpt.recovery_blocker_count
+        )));
+    }
+    if cycle.status == "SENDING_TO_CHATGPT" {
+        return Ok(Some("等待 ChatGPT 完成回复。".into()));
+    }
+    if snapshot.chatgpt.status == "IN_FLIGHT"
+        && snapshot.chatgpt.active_module_id.as_deref() != Some(cycle.module_id.as_str())
+    {
+        let module_name = snapshot
+            .chatgpt
+            .active_module_name
+            .as_deref()
+            .unwrap_or("未知模块");
+        let message_id = snapshot
+            .chatgpt
+            .active_message_id
+            .as_deref()
+            .unwrap_or("未知消息");
+        return Ok(Some(format!(
+            "ChatGPT 通道当前被模块「{module_name}」占用（消息 {message_id}）。"
+        )));
+    }
+    Ok(Some("等待全局 FIFO 调度。".into()))
+}
+
+fn list_relay_codex_cycles_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<Vec<RelayCodexCycleRecord>, String> {
+    let snapshot = relay_channel_snapshot_from_connection(connection)?;
+    let mut statement = connection
+        .prepare(&format!(
+            "{RELAY_CODEX_CYCLE_SELECT} WHERE module_id = ?1 ORDER BY cycle_number DESC"
+        ))
+        .map_err(|error| format!("无法查询 Codex 通讯循环：{error}"))?;
+    let mut cycles = statement
+        .query_map([module_id], relay_codex_cycle_row)
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))?;
+    drop(statement);
+    for cycle in &mut cycles {
+        cycle.block_reason = relay_codex_cycle_block_reason(connection, cycle, &snapshot)?;
+    }
+    Ok(cycles)
+}
+
 fn append_relay_event(
     connection: &Connection,
     module_id: &str,
@@ -1360,15 +2884,362 @@ fn append_relay_event(
     Ok(())
 }
 
-#[tauri::command]
-fn create_relay_module(
-    state: State<'_, AppState>,
-    input: RelayModuleInput,
+fn append_relay_event_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    module_id: &str,
+    event_type: &str,
+    detail: &str,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "INSERT INTO relay_events (id, module_id, event_type, detail, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                module_id,
+                event_type,
+                detail,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| format!("无法记录 Codex 通讯事件：{error}"))?;
+    Ok(())
+}
+
+fn mark_relay_codex_turn_started(
+    connection: &Connection,
+    cycle_id: &str,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 通讯循环事务：{error}"))?;
+    let (module_id, status): (String, String) = transaction
+        .query_row(
+            "SELECT module_id, status FROM relay_codex_cycles WHERE id = ?1",
+            [cycle_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))?
+        .ok_or_else(|| "Codex 通讯循环不存在。".to_string())?;
+    if status != "WAITING_TO_SEND_CODEX" {
+        return Err(format!(
+            "Codex 通讯循环当前状态为 `{status}`，不能开始回合。"
+        ));
+    }
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "UPDATE relay_codex_cycles
+             SET status = 'CODEX_RUNNING', codex_thread_id = ?2, codex_turn_id = ?3,
+                 codex_started_at = ?4, updated_at = ?4
+             WHERE id = ?1",
+            params![cycle_id, thread_id, turn_id, &now],
+        )
+        .map_err(|error| format!("无法记录 Codex 回合启动：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE relay_modules
+             SET phase = 'CODEX_RUNNING', started_cycles = started_cycles + 1,
+                 module_started_at = COALESCE(module_started_at, ?2), updated_at = ?2
+             WHERE id = ?1",
+            params![&module_id, &now],
+        )
+        .map_err(|error| format!("无法更新 Codex 回合计数：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        &module_id,
+        "CODEX_TURN_STARTED",
+        &format!("cycleId={cycle_id}; Codex 回合已开始。"),
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 回合启动：{error}"))
+}
+
+fn mark_relay_codex_result_received(
+    connection: &Connection,
+    cycle_id: &str,
+    result_text: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 结果事务：{error}"))?;
+    let (module_id, status, existing_result): (String, String, Option<String>) = transaction
+        .query_row(
+            "SELECT module_id, status, result_text FROM relay_codex_cycles WHERE id = ?1",
+            [cycle_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))?
+        .ok_or_else(|| "Codex 通讯循环不存在。".to_string())?;
+    if let Some(existing_result) = existing_result {
+        if existing_result == result_text {
+            return transaction
+                .commit()
+                .map_err(|error| format!("无法提交重复 Codex 结果读取：{error}"));
+        }
+        return Err("Codex final text 已持久化，不能覆盖。".into());
+    }
+    if status != "CODEX_RUNNING" {
+        return Err(format!(
+            "Codex 通讯循环当前状态为 `{status}`，不能记录 final text。"
+        ));
+    }
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "UPDATE relay_codex_cycles
+             SET status = 'CODEX_COMPLETED', result_text = ?2, codex_completed_at = ?3,
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![cycle_id, result_text, &now],
+        )
+        .map_err(|error| format!("无法记录 Codex final text：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        &module_id,
+        "CODEX_RESULT_RECEIVED",
+        &format!("cycleId={cycle_id}; 已持久化 Codex final text。"),
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex final text：{error}"))
+}
+
+fn queue_relay_codex_result_to_chatgpt(
+    connection: &Connection,
+    cycle_id: &str,
+) -> Result<String, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 回传排队事务：{error}"))?;
+    let cycle: RelayCodexCycleRecord = transaction
+        .query_row(
+            &format!("{RELAY_CODEX_CYCLE_SELECT} WHERE id = ?1"),
+            [cycle_id],
+            relay_codex_cycle_row,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))?
+        .ok_or_else(|| "Codex 通讯循环不存在。".to_string())?;
+    if let Some(message_id) = cycle.outbound_chatgpt_message_id {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交已排队 Codex 回传读取：{error}"))?;
+        return Ok(message_id);
+    }
+    if cycle.status != "CODEX_COMPLETED" {
+        return Err(format!(
+            "Codex 通讯循环当前状态为 `{}`，不能排队回传 ChatGPT。",
+            cycle.status
+        ));
+    }
+    let result_text = cycle
+        .result_text
+        .as_deref()
+        .ok_or_else(|| "Codex 通讯循环没有 final text，不能排队回传。".to_string())?;
+    let sequence_number: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM relay_messages WHERE module_id = ?1",
+            [&cycle.module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法分配 Codex 回传消息序号：{error}"))?;
+    let message_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "INSERT INTO relay_messages (
+                id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at
+             ) VALUES (?1, ?2, ?3, 'TO_CHATGPT', 'AUTOMATION', ?4, 'QUEUED', ?5, NULL)",
+            params![
+                &message_id,
+                &cycle.module_id,
+                sequence_number,
+                result_text,
+                &now
+            ],
+        )
+        .map_err(|error| format!("无法将 Codex 结果加入 ChatGPT 队列：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE relay_codex_cycles
+             SET status = 'WAITING_FOR_CHATGPT', outbound_chatgpt_message_id = ?2,
+                 relay_queued_at = ?3, updated_at = ?3
+             WHERE id = ?1 AND outbound_chatgpt_message_id IS NULL",
+            params![cycle_id, &message_id, &now],
+        )
+        .map_err(|error| format!("无法关联 Codex 回传消息：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        &cycle.module_id,
+        "CODEX_RESULT_QUEUED_TO_CHATGPT",
+        &format!("cycleId={cycle_id}; requestId={message_id}; Codex 结果已加入全局 FIFO。"),
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 回传排队：{error}"))?;
+    Ok(message_id)
+}
+
+fn sync_codex_cycle_for_chatgpt_message_state(
+    connection: &Connection,
+    message_id: &str,
+    delivery_state: &str,
+    error_text: Option<&str>,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 回传状态同步事务：{error}"))?;
+    let Some((cycle_id, module_id, current_status)) = transaction
+        .query_row(
+            "SELECT id, module_id, status FROM relay_codex_cycles
+             WHERE outbound_chatgpt_message_id = ?1",
+            [message_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 回传循环：{error}"))?
+    else {
+        return transaction
+            .commit()
+            .map_err(|error| format!("无法提交非 Codex 回传状态同步：{error}"));
+    };
+
+    let (target_status, next_error_text, event_type) = match delivery_state {
+        "QUEUED" => ("WAITING_FOR_CHATGPT", None, None),
+        "SENT" => (
+            "SENDING_TO_CHATGPT",
+            None,
+            Some("CODEX_RESULT_SEND_STARTED"),
+        ),
+        "DELIVERED" => (
+            "DELIVERED_TO_CHATGPT",
+            None,
+            Some("CODEX_RESULT_DELIVERED_TO_CHATGPT"),
+        ),
+        "UNKNOWN" => (
+            "WAITING_FOR_CHATGPT",
+            Some(error_text.unwrap_or("ChatGPT 回传送达结果不确定，等待人工恢复。")),
+            None,
+        ),
+        "FAILED" => (
+            "FAILED",
+            Some(error_text.unwrap_or("用户确认不重发 Codex 回传结果。")),
+            None,
+        ),
+        _ => {
+            return Err(format!(
+                "不支持同步的 ChatGPT 送达状态：`{delivery_state}`。"
+            ))
+        }
+    };
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "UPDATE relay_codex_cycles
+             SET status = ?2, error_text = ?3,
+                 relay_delivered_at = CASE
+                    WHEN ?2 = 'DELIVERED_TO_CHATGPT' AND relay_delivered_at IS NULL THEN ?4
+                    ELSE relay_delivered_at
+                 END,
+                 updated_at = ?4
+             WHERE id = ?1",
+            params![cycle_id, target_status, next_error_text, &now],
+        )
+        .map_err(|error| format!("无法同步 Codex 回传状态：{error}"))?;
+    if current_status != target_status {
+        if let Some(event_type) = event_type {
+            append_relay_event_in_transaction(
+                &transaction,
+                &module_id,
+                event_type,
+                &format!("cycleId={cycle_id}; requestId={message_id}; ChatGPT 回传状态已变为 {delivery_state}。"),
+            )?;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 回传状态同步：{error}"))
+}
+
+fn fail_relay_codex_cycle(
+    connection: &Connection,
+    cycle_id: &str,
+    error_text: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 失败记录事务：{error}"))?;
+    let module_id: String = transaction
+        .query_row(
+            "SELECT module_id FROM relay_codex_cycles
+             WHERE id = ?1 AND result_text IS NULL AND outbound_chatgpt_message_id IS NULL",
+            [cycle_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取 Codex 通讯循环：{error}"))?
+        .ok_or_else(|| "Codex 通讯循环已拥有结果，不能标记为失败。".to_string())?;
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "UPDATE relay_codex_cycles
+             SET status = 'FAILED', error_text = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![cycle_id, error_text, &now],
+        )
+        .map_err(|error| format!("无法记录 Codex 回合失败：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        &module_id,
+        "CODEX_TURN_FAILED",
+        &format!("cycleId={cycle_id}; {error_text}"),
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 回合失败：{error}"))
+}
+
+fn emit_relay_codex_changed(app: &AppHandle, module_id: &str, cycle_id: &str, status: &str) {
+    let _ = app.emit(
+        "relay-codex",
+        json!({ "moduleId": module_id, "cycleId": cycle_id, "status": status }),
+    );
+}
+
+fn create_relay_module_in(
+    connection: &Connection,
+    input: &RelayModuleInput,
+    revalidated_candidates: &[RelayCodexThreadCandidate],
 ) -> Result<RelayModuleRecord, String> {
     validate_relay_module(&input)?;
-    if !Path::new(input.working_directory.trim()).is_dir() {
-        return Err("所选 Codex 工作目录不存在。".into());
-    }
+    let resume_thread_id = match &input.codex_thread_target {
+        RelayCodexThreadTargetInput::New => None,
+        RelayCodexThreadTargetInput::Existing { thread_id } => {
+            let thread_id = thread_id.trim();
+            let valid = revalidated_candidates.iter().any(|candidate| {
+                candidate.thread_id == thread_id
+                    && candidate.selectable
+                    && matches!(candidate.status.as_str(), "idle" | "notLoaded")
+                    && matches!(candidate.source.as_str(), "cli" | "vscode" | "appServer")
+            });
+            if !valid {
+                return Err("所选 Codex 对话已变化或不可用；请刷新对话后重新选择。".into());
+            }
+            Some(thread_id.to_string())
+        }
+    };
     let now = Utc::now().to_rfc3339();
     let module = RelayModuleRecord {
         id: Uuid::new_v4().to_string(),
@@ -1379,29 +3250,664 @@ fn create_relay_module(
         retry_template: input.retry_template.trim().to_string(),
         phase: "READY".into(),
         codex_thread_id: None,
+        resume_thread_id: resume_thread_id.clone(),
+        codex_recovery_reason: None,
         module_started_at: None,
         stop_after_turn: false,
         invalid_reply_count: 0,
         started_cycles: 0,
         created_at: now.clone(),
-        updated_at: now,
+        updated_at: now.clone(),
     };
-    let connection = state
-        .connection
-        .lock()
-        .map_err(|_| "数据库锁已损坏。".to_string())?;
-    connection.execute(
-        "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, 0, 0, 0, ?8, ?8)",
-        params![&module.id, &module.name, &module.working_directory, module.max_cycles, module.max_runtime_minutes, &module.retry_template, &module.phase, &module.created_at],
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始创建传话模块事务：{error}"))?;
+    transaction.execute(
+        "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, resume_thread_id, codex_recovery_reason, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, NULL, NULL, 0, 0, 0, ?9, ?9)",
+        params![&module.id, &module.name, &module.working_directory, module.max_cycles, module.max_runtime_minutes, &module.retry_template, &module.phase, &module.resume_thread_id, &module.created_at],
     ).map_err(|error| format!("无法创建传话模块：{error}"))?;
-    append_relay_event(
-        &connection,
+    if let Some(thread_id) = resume_thread_id.as_deref() {
+        let existing = transaction
+            .query_row(
+                &format!("{RELAY_CODEX_THREAD_SELECT} WHERE thread_id = ?1"),
+                [thread_id],
+                relay_codex_thread_row,
+            )
+            .optional()
+            .map_err(|error| format!("无法检查 Codex 对话登记：{error}"))?;
+        match existing {
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO relay_codex_threads (
+                        thread_id, working_directory, state, owner_module_id, last_module_id,
+                        reservation_previous_state, updated_at
+                     ) VALUES (?1, ?2, 'RESERVED', ?3, ?3, 'NONE', ?4)",
+                        params![thread_id, &module.working_directory, &module.id, &now],
+                    )
+                    .map_err(|_| {
+                        "所选 Codex 对话已被其他模块占用；请刷新对话后重新选择。".to_string()
+                    })?;
+            }
+            Some(record) if record.state == RelayCodexThreadState::Released => {
+                let changed = transaction
+                    .execute(
+                        "UPDATE relay_codex_threads
+                     SET state = 'RESERVED', owner_module_id = ?2, last_module_id = ?2,
+                         reservation_previous_state = 'RELEASED', updated_at = ?3
+                     WHERE thread_id = ?1 AND state = 'RELEASED' AND owner_module_id IS NULL",
+                        params![thread_id, &module.id, &now],
+                    )
+                    .map_err(|error| format!("无法保留 Codex 对话：{error}"))?;
+                if changed != 1 {
+                    return Err("所选 Codex 对话已被其他模块占用；请刷新对话后重新选择。".into());
+                }
+            }
+            Some(_) => {
+                return Err("所选 Codex 对话已被其他模块占用或待恢复；请刷新后重新选择。".into());
+            }
+        }
+    }
+    append_relay_event_in_transaction(
+        &transaction,
         &module.id,
         "CREATED",
         "已创建传话模块，尚未开始自动化。",
     )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交传话模块创建事务：{error}"))?;
     Ok(module)
+}
+
+#[tauri::command]
+fn create_relay_module(
+    state: State<'_, AppState>,
+    input: RelayModuleInput,
+) -> Result<RelayModuleRecord, String> {
+    validate_relay_module(&input)?;
+    if !Path::new(input.working_directory.trim()).is_dir() {
+        return Err("所选 Codex 工作目录不存在。".into());
+    }
+    let registry = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        list_relay_codex_threads(&connection)?
+    };
+    let candidates =
+        revalidate_relay_codex_thread_target_for_creation(&state.relay_codex, &input, &registry)?;
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    create_relay_module_in(&connection, &input, &candidates)
+}
+
+fn revalidate_relay_codex_thread_target_for_creation(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    input: &RelayModuleInput,
+    registry: &[RelayCodexThreadRecord],
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    match &input.codex_thread_target {
+        RelayCodexThreadTargetInput::New => Ok(Vec::new()),
+        RelayCodexThreadTargetInput::Existing { .. } => {
+            discover_relay_codex_threads_for_cwd_guarded(
+                sessions,
+                input.working_directory.trim(),
+                registry,
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayModuleAcceptance {
+    Accepted,
+    AlreadyCompleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayModuleTermination {
+    Stopped,
+    StopRequested,
+    AlreadyStopped,
+    AlreadyStopRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCodexTurnCompletion {
+    ReturnedToChatGpt,
+    StoppedAfterTurn,
+}
+
+fn accept_relay_module_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<RelayModuleAcceptance, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始模块验收事务：{error}"))?;
+    let module = transaction
+        .query_row(
+            "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                    resume_thread_id, codex_recovery_reason
+             FROM relay_modules WHERE id = ?1",
+            [module_id],
+            relay_row_to_module,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取传话模块：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.phase == "COMPLETED" {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交模块验收事务：{error}"))?;
+        return Ok(RelayModuleAcceptance::AlreadyCompleted);
+    }
+    if module.phase == "STOPPED" {
+        return Err("模块已终止，不能验收完成。".into());
+    }
+    if module.phase != "WAITING_FOR_ACCEPTANCE" {
+        return Err("模块当前未等待人工验收，不能验收完成。".into());
+    }
+    if module.stop_after_turn {
+        return Err("模块正在终止，不能验收完成。".into());
+    }
+
+    let unknown_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages
+             WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查不确定送达消息：{error}"))?;
+    if unknown_count > 0 {
+        return Err("请先处理本模块的不确定送达消息。".into());
+    }
+    let running_cycle_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_codex_cycles
+             WHERE module_id = ?1 AND status = 'CODEX_RUNNING'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查 Codex 回合状态：{error}"))?;
+    if running_cycle_count > 0 {
+        return Err("当前 Codex 回合仍在运行，不能验收完成。".into());
+    }
+
+    let queued_message_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id FROM relay_messages
+                 WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?;
+        let message_ids = statement
+            .query_map([module_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?;
+        message_ids
+    };
+    for message_id in &queued_message_ids {
+        transaction
+            .execute(
+                "UPDATE relay_messages SET delivery_state = 'FAILED'
+                 WHERE id = ?1 AND delivery_state = 'QUEUED'",
+                [message_id],
+            )
+            .map_err(|error| format!("无法取消待发送消息：{error}"))?;
+        append_relay_event_in_transaction(
+            &transaction,
+            module_id,
+            "CHATGPT_QUEUED_MESSAGE_CANCELLED",
+            &format!("requestId={message_id}; 模块已验收完成，消息未发送。"),
+        )?;
+    }
+    rollback_relay_codex_reservation_on_terminal_in(&transaction, &module)?;
+    transaction
+        .execute(
+            "UPDATE relay_modules SET phase = 'COMPLETED', updated_at = ?2 WHERE id = ?1",
+            params![module_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法完成传话模块：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        module_id,
+        "MODULE_ACCEPTED",
+        "用户已验收完成模块。",
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交模块验收事务：{error}"))?;
+    Ok(RelayModuleAcceptance::Accepted)
+}
+
+fn terminate_relay_module_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<RelayModuleTermination, String> {
+    terminate_relay_module_with_active_turn_in(connection, module_id, false)
+}
+
+fn terminate_relay_module_with_active_turn_in(
+    connection: &Connection,
+    module_id: &str,
+    has_active_turn: bool,
+) -> Result<RelayModuleTermination, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始终止模块事务：{error}"))?;
+    let module = transaction
+        .query_row(
+            "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                    resume_thread_id, codex_recovery_reason
+             FROM relay_modules WHERE id = ?1",
+            [module_id],
+            relay_row_to_module,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取传话模块：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.phase == "STOPPED" {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交终止模块事务：{error}"))?;
+        return Ok(RelayModuleTermination::AlreadyStopped);
+    }
+    if module.phase == "COMPLETED" {
+        return Err("模块已验收完成，不能终止。".into());
+    }
+    if module.stop_after_turn && has_active_turn {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交重复终止模块事务：{error}"))?;
+        return Ok(RelayModuleTermination::AlreadyStopRequested);
+    }
+
+    let unknown_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages
+             WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查不确定送达消息：{error}"))?;
+    if unknown_count > 0 {
+        return Err("请先处理本模块的不确定送达消息。".into());
+    }
+    let queued_message_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id FROM relay_messages
+                 WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?;
+        let message_ids = statement
+            .query_map([module_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("无法读取待取消消息：{error}"))?;
+        message_ids
+    };
+    for message_id in &queued_message_ids {
+        transaction
+            .execute(
+                "UPDATE relay_messages SET delivery_state = 'FAILED'
+                 WHERE id = ?1 AND delivery_state = 'QUEUED'",
+                [message_id],
+            )
+            .map_err(|error| format!("无法取消待发送消息：{error}"))?;
+        append_relay_event_in_transaction(
+            &transaction,
+            module_id,
+            "CHATGPT_QUEUED_MESSAGE_CANCELLED",
+            &format!("requestId={message_id}; 模块已由用户终止，消息未发送。"),
+        )?;
+    }
+    let outcome = if has_active_turn {
+        transaction
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 1, updated_at = ?2 WHERE id = ?1",
+                params![module_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| format!("无法记录终止请求：{error}"))?;
+        append_relay_event_in_transaction(
+            &transaction,
+            module_id,
+            "MODULE_STOP_REQUESTED",
+            "用户已请求在当前 Codex 回合自然结束后终止模块。",
+        )?;
+        RelayModuleTermination::StopRequested
+    } else {
+        let stale_cycle_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM relay_codex_cycles
+                     WHERE module_id = ?1 AND status = 'CODEX_RUNNING'",
+                )
+                .map_err(|error| format!("无法读取遗留 Codex 回合：{error}"))?;
+            let cycle_ids = statement
+                .query_map([module_id], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("无法查询遗留 Codex 回合：{error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("无法读取遗留 Codex 回合：{error}"))?;
+            cycle_ids
+        };
+        for cycle_id in stale_cycle_ids {
+            let detail = "模块终止时未发现对应的活动 Codex runtime；遗留回合未自动重放。";
+            transaction
+                .execute(
+                    "UPDATE relay_codex_cycles
+                     SET status = 'FAILED', error_text = ?2, updated_at = ?3
+                     WHERE id = ?1 AND status = 'CODEX_RUNNING'",
+                    params![cycle_id, detail, Utc::now().to_rfc3339()],
+                )
+                .map_err(|error| format!("无法标记终止中的遗留 Codex 回合：{error}"))?;
+            append_relay_event_in_transaction(
+                &transaction,
+                module_id,
+                "CODEX_TURN_FAILED",
+                &format!("cycleId={cycle_id}; {detail}"),
+            )?;
+        }
+        rollback_relay_codex_reservation_on_terminal_in(&transaction, &module)?;
+        transaction
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'STOPPED', stop_after_turn = 0, updated_at = ?2
+                 WHERE id = ?1",
+                params![module_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| format!("无法终止传话模块：{error}"))?;
+        append_relay_event_in_transaction(
+            &transaction,
+            module_id,
+            "MODULE_TERMINATED",
+            "用户已终止模块。",
+        )?;
+        RelayModuleTermination::Stopped
+    };
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交终止模块事务：{error}"))?;
+    Ok(outcome)
+}
+
+fn submit_relay_acceptance_feedback_in(
+    connection: &Connection,
+    module_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    let feedback = text.trim();
+    if feedback.is_empty() {
+        return Err("验收反馈不能为空。".into());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始验收反馈事务：{error}"))?;
+    let module = transaction
+        .query_row(
+            "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
+                    codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                    resume_thread_id, codex_recovery_reason
+             FROM relay_modules WHERE id = ?1",
+            [module_id],
+            relay_row_to_module,
+        )
+        .optional()
+        .map_err(|error| format!("无法读取传话模块：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.phase != "WAITING_FOR_ACCEPTANCE" {
+        return Err("模块当前未等待人工验收，不能提交验收反馈。".into());
+    }
+    if module.stop_after_turn {
+        return Err("模块正在终止，不能提交验收反馈。".into());
+    }
+
+    let sequence_number: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM relay_messages WHERE module_id = ?1",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法计算传话消息序号：{error}"))?;
+    let message_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    transaction
+        .execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at)
+             VALUES (?1, ?2, ?3, 'TO_CHATGPT', 'AUTOMATION', ?4, 'QUEUED', ?5, NULL)",
+            params![&message_id, module_id, sequence_number, feedback, &now],
+        )
+        .map_err(|error| format!("无法将验收反馈加入队列：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE relay_modules SET phase = 'WAITING_FOR_CHATGPT', updated_at = ?2 WHERE id = ?1",
+            params![module_id, &now],
+        )
+        .map_err(|error| format!("无法更新验收反馈状态：{error}"))?;
+    append_relay_event_in_transaction(
+        &transaction,
+        module_id,
+        "CHATGPT_MESSAGE_QUEUED",
+        "已加入 ChatGPT 发送队列。",
+    )?;
+    append_relay_event_in_transaction(
+        &transaction,
+        module_id,
+        "ACCEPTANCE_FEEDBACK_QUEUED",
+        &format!("requestId={message_id}; 已将人工验收反馈加入自动化发送队列。"),
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交验收反馈事务：{error}"))?;
+    Ok(message_id)
+}
+
+fn relay_codex_turn_is_active_for_module(
+    state: &AppState,
+    module_id: &str,
+) -> Result<bool, String> {
+    let sessions = state
+        .relay_codex
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+    Ok(sessions.as_ref().is_some_and(|session| {
+        session.module_id == module_id && session.turn_active.load(Ordering::SeqCst)
+    }))
+}
+
+fn finalize_relay_module_stop_after_turn_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<bool, String> {
+    let changed = connection
+        .execute(
+            "UPDATE relay_modules
+             SET phase = 'STOPPED', stop_after_turn = 0, updated_at = ?2
+             WHERE id = ?1 AND stop_after_turn = 1 AND phase NOT IN ('COMPLETED', 'STOPPED')",
+            params![module_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法完成终止中的传话模块：{error}"))?;
+    Ok(changed > 0)
+}
+
+fn relay_codex_start_block_reason(module: &RelayModuleRecord) -> Option<&'static str> {
+    if module.stop_after_turn {
+        Some("模块正在终止，不能启动新的 Codex 回合。")
+    } else if matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+        Some("模块已经结束，不能启动新的 Codex 回合。")
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+fn accept_relay_module(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<(), String> {
+    if relay_codex_turn_is_active_for_module(&state, &module_id)? {
+        return Err("当前 Codex 回合仍在运行，不能验收完成。".into());
+    }
+    let outcome = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        accept_relay_module_in(&connection, &module_id)?
+    };
+    if outcome == RelayModuleAcceptance::AlreadyCompleted {
+        return Ok(());
+    }
+
+    match release_relay_codex_runtime(&app, &module_id) {
+        Ok(()) => {
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            let _ = persist_relay_codex_thread_release_outcome_in(
+                &connection,
+                &module_id,
+                true,
+                "模块已验收完成，Codex 对话已释放。",
+            )?;
+        }
+        Err(error) => {
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            let _ = persist_relay_codex_thread_release_outcome_in(
+                &connection,
+                &module_id,
+                false,
+                &format!("模块已验收完成，但 Codex 对话释放失败：{error}"),
+            )?;
+            let _ = app.emit(
+                "relay-control",
+                json!({ "type": "MODULE_ACCEPTED", "moduleId": module_id }),
+            );
+            emit_relay_codex_changed(&app, &module_id, "", "COMPLETED");
+            return Err(format!("模块已验收完成，但无法释放 Codex 对话：{error}"));
+        }
+    }
+    let _ = app.emit(
+        "relay-control",
+        json!({ "type": "MODULE_ACCEPTED", "moduleId": module_id }),
+    );
+    emit_relay_codex_changed(&app, &module_id, "", "COMPLETED");
+    Ok(())
+}
+
+#[tauri::command]
+fn terminate_relay_module(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<(), String> {
+    let has_active_turn = relay_codex_turn_is_active_for_module(&state, &module_id)?;
+    let outcome = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        if has_active_turn {
+            terminate_relay_module_with_active_turn_in(&connection, &module_id, true)?
+        } else {
+            terminate_relay_module_in(&connection, &module_id)?
+        }
+    };
+    if matches!(
+        outcome,
+        RelayModuleTermination::AlreadyStopped | RelayModuleTermination::AlreadyStopRequested
+    ) {
+        return Ok(());
+    }
+    if outcome == RelayModuleTermination::StopRequested {
+        let _ = app.emit(
+            "relay-control",
+            json!({ "type": "MODULE_STOP_REQUESTED", "moduleId": module_id }),
+        );
+        emit_relay_codex_changed(&app, &module_id, "", "CODEX_RUNNING");
+        return Ok(());
+    }
+
+    match release_relay_codex_runtime(&app, &module_id) {
+        Ok(()) => {
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            let _ = persist_relay_codex_thread_release_outcome_in(
+                &connection,
+                &module_id,
+                true,
+                "模块已终止，Codex 对话已释放。",
+            )?;
+        }
+        Err(error) => {
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            let _ = persist_relay_codex_thread_release_outcome_in(
+                &connection,
+                &module_id,
+                false,
+                &format!("模块已终止，但 Codex 对话释放失败：{error}"),
+            )?;
+            let _ = app.emit(
+                "relay-control",
+                json!({ "type": "MODULE_TERMINATED", "moduleId": module_id }),
+            );
+            emit_relay_codex_changed(&app, &module_id, "", "STOPPED");
+            return Err(format!("模块已终止，但无法释放 Codex 对话：{error}"));
+        }
+    }
+    let _ = app.emit(
+        "relay-control",
+        json!({ "type": "MODULE_TERMINATED", "moduleId": module_id }),
+    );
+    emit_relay_codex_changed(&app, &module_id, "", "STOPPED");
+    Ok(())
+}
+
+#[tauri::command]
+fn submit_relay_acceptance_feedback(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+    text: String,
+) -> Result<(), String> {
+    let message_id = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        submit_relay_acceptance_feedback_in(&connection, &module_id, &text)?
+    };
+    let _ = app.emit(
+        "relay-control",
+        json!({
+            "type": "ACCEPTANCE_FEEDBACK_QUEUED",
+            "moduleId": module_id,
+            "requestId": message_id,
+        }),
+    );
+    dispatch_next_relay_message(&app, &state)
 }
 
 #[tauri::command]
@@ -1412,7 +3918,8 @@ fn list_relay_modules(state: State<'_, AppState>) -> Result<Vec<RelayModuleRecor
         .map_err(|_| "数据库锁已损坏。".to_string())?;
     let mut statement = connection.prepare(
         "SELECT id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase,
-                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at
+                codex_thread_id, module_started_at, stop_after_turn, invalid_reply_count, started_cycles, created_at, updated_at,
+                resume_thread_id, codex_recovery_reason
          FROM relay_modules ORDER BY updated_at DESC",
     ).map_err(|error| format!("无法查询传话模块：{error}"))?;
     let modules = statement
@@ -1441,6 +3948,75 @@ fn list_relay_messages(
         .map_err(|error| format!("无法读取消息历史：{error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("无法读取消息历史：{error}"))?;
+    Ok(messages)
+}
+
+#[tauri::command]
+fn list_relay_codex_cycles(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<Vec<RelayCodexCycleRecord>, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    list_relay_codex_cycles_in(&connection, &module_id)
+}
+
+#[tauri::command]
+fn get_relay_channel_snapshot(state: State<'_, AppState>) -> Result<RelayChannelSnapshot, String> {
+    let live_runtime = {
+        let sessions = state
+            .relay_codex
+            .lock()
+            .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+        sessions.as_ref().map(|session| RelayCodexLiveRuntime {
+            module_id: session.module_id.clone(),
+            turn_active: session.turn_active.load(Ordering::SeqCst),
+        })
+    };
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    relay_channel_snapshot_from_connection_with_live_runtime(&connection, live_runtime.as_ref())
+}
+
+#[tauri::command]
+fn list_relay_recovery_messages(
+    state: State<'_, AppState>,
+) -> Result<Vec<RelayRecoveryRecord>, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    list_relay_recovery_messages_in(&connection)
+}
+
+fn list_relay_recovery_messages_in(
+    connection: &Connection,
+) -> Result<Vec<RelayRecoveryRecord>, String> {
+    let mut statement = connection.prepare(
+        "SELECT message.id, message.module_id, module.name, message.sequence_number, message.kind, message.created_at
+         FROM relay_messages AS message
+         JOIN relay_modules AS module ON module.id = message.module_id
+         WHERE message.direction = 'TO_CHATGPT' AND message.delivery_state = 'UNKNOWN'
+         ORDER BY message.created_at ASC, message.id ASC",
+    ).map_err(|error| format!("无法查询待恢复的不确定消息：{error}"))?;
+    let messages = statement
+        .query_map([], |row| {
+            Ok(RelayRecoveryRecord {
+                message_id: row.get(0)?,
+                module_id: row.get(1)?,
+                module_name: row.get(2)?,
+                sequence_number: row.get(3)?,
+                kind: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("无法读取待恢复的不确定消息：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取待恢复的不确定消息：{error}"))?;
     Ok(messages)
 }
 
@@ -1487,6 +4063,7 @@ fn send_chatgpt_message_internal(
 fn send_relay_chatgpt_message_internal(
     app: &AppHandle,
     bridge: &ChatGptBridge,
+    request_id: &str,
     text: &str,
 ) -> Result<(), String> {
     if text.trim().is_empty() {
@@ -1501,6 +4078,7 @@ fn send_relay_chatgpt_message_internal(
     bridge.send_to_extension(json!({
         "type": "sendChatGptMessage",
         "sessionId": session.session_id,
+        "requestId": request_id,
         "text": text,
         "relay": true
     }))?;
@@ -1518,63 +4096,137 @@ fn send_relay_chatgpt_message_internal(
 
 fn next_queued_relay_message(
     connection: &Connection,
-    module_id: &str,
 ) -> Result<Option<RelayMessageRecord>, String> {
     connection.query_row(
-        "SELECT id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at
-         FROM relay_messages WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'
-         ORDER BY sequence_number ASC LIMIT 1",
-        [module_id], relay_message_row,
+        "SELECT message.id, message.module_id, message.sequence_number, message.direction,
+                message.kind, message.text, message.delivery_state, message.created_at, message.delivered_at
+         FROM relay_messages AS message
+         JOIN relay_modules AS module ON module.id = message.module_id
+         WHERE message.direction = 'TO_CHATGPT'
+           AND message.delivery_state = 'QUEUED'
+           AND module.phase NOT IN ('COMPLETED', 'STOPPED')
+         ORDER BY message.created_at ASC, message.id ASC LIMIT 1",
+        [], relay_message_row,
     ).optional().map_err(|error| format!("无法读取待发送消息：{error}"))
 }
 
-fn dispatch_next_relay_message(
-    app: &AppHandle,
-    state: &AppState,
-    module_id: &str,
+fn claim_next_relay_message_for_dispatch(
+    connection: &Connection,
+) -> Result<RelayDispatchClaim, String> {
+    let recovery_blocker_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+        [], |row| row.get(0),
+    ).map_err(|error| format!("无法检查消息队列：{error}"))?;
+    if recovery_blocker_count > 0 {
+        return Ok(RelayDispatchClaim::RecoveryBlocked(recovery_blocker_count));
+    }
+    let already_in_flight: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+        [], |row| row.get(0),
+    ).map_err(|error| format!("无法检查消息队列：{error}"))?;
+    if already_in_flight > 0 {
+        return Ok(RelayDispatchClaim::InFlight);
+    }
+    let Some(message) = next_queued_relay_message(connection)? else {
+        return Ok(RelayDispatchClaim::Empty);
+    };
+    connection.execute(
+        "UPDATE relay_messages SET delivery_state = 'SENT' WHERE id = ?1 AND delivery_state = 'QUEUED'",
+        [&message.id],
+    ).map_err(|error| format!("无法标记待发送消息：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, &message.id, "SENT", None)?;
+    append_relay_event(
+        connection,
+        &message.module_id,
+        "CHATGPT_SEND_STARTED",
+        &format!(
+            "requestId={}; 已从全局 FIFO 队列选择消息，等待 ChatGPT 回复。",
+            message.id
+        ),
+    )?;
+    Ok(RelayDispatchClaim::Message(message))
+}
+
+fn record_relay_message_dispatched(
+    connection: &Connection,
+    message: &RelayMessageRecord,
 ) -> Result<(), String> {
-    let message = {
+    append_relay_event(
+        connection,
+        &message.module_id,
+        "CHATGPT_SEND_DISPATCHED",
+        &format!(
+            "requestId={}; 已向本机 WebSocket 发出 sendChatGptMessage。",
+            message.id
+        ),
+    )
+}
+
+fn dispatch_next_relay_message(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    let claim = {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let already_in_flight: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM relay_messages WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
-            [], |row| row.get(0),
-        ).map_err(|error| format!("无法检查消息队列：{error}"))?;
-        if already_in_flight > 0 {
+        claim_next_relay_message_for_dispatch(&connection)?
+    };
+    let message = match claim {
+        RelayDispatchClaim::RecoveryBlocked(recovery_blocker_count) => {
+            let reason = format!("存在待人工处理的不确定送达消息（{recovery_blocker_count} 条）。请明确重发，或选择不重发并继续；系统不会自动重发。");
+            let _ = app.emit(
+                "relay-control",
+                json!({ "type": "RECOVERY_BLOCKED", "reason": reason }),
+            );
+            state.chatgpt_bridge.set_status(
+                app,
+                ChatGptBridgeStatus {
+                    phase: "RELAY_RECOVERY_REQUIRED".into(),
+                    detail: reason,
+                    tab_id: None,
+                    protocol_state: None,
+                },
+            );
             return Ok(());
         }
-        let Some(message) = next_queued_relay_message(&connection, module_id)? else {
-            return Ok(());
-        };
-        connection.execute(
-            "UPDATE relay_messages SET delivery_state = 'SENT' WHERE id = ?1 AND delivery_state = 'QUEUED'",
-            [&message.id],
-        ).map_err(|error| format!("无法标记待发送消息：{error}"))?;
-        append_relay_event(
-            &connection,
-            module_id,
-            "CHATGPT_SEND_STARTED",
-            "已发送队首消息，等待 ChatGPT 回复。",
-        )?;
-        message
+        RelayDispatchClaim::InFlight | RelayDispatchClaim::Empty => return Ok(()),
+        RelayDispatchClaim::Message(message) => message,
     };
     if let Err(error) =
-        send_relay_chatgpt_message_internal(app, &state.chatgpt_bridge, &message.text)
+        send_relay_chatgpt_message_internal(app, &state.chatgpt_bridge, &message.id, &message.text)
     {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        connection
-            .execute(
-                "UPDATE relay_messages SET delivery_state = 'FAILED' WHERE id = ?1",
-                [&message.id],
-            )
-            .map_err(|database_error| format!("无法记录 ChatGPT 发送失败：{database_error}"))?;
-        append_relay_event(&connection, module_id, "CHATGPT_SEND_FAILED", &error)?;
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            &message.id,
+            "CHATGPT_TRANSPORT_FAILURE",
+            &format!("ChatGPT 连接/传输失败，消息送达结果不确定，未自动重发：{error}"),
+        )?;
+        state.chatgpt_bridge.set_status(
+            app,
+            ChatGptBridgeStatus {
+                phase: "RELAY_RECOVERY_REQUIRED".into(),
+                detail: format!("ChatGPT 连接/传输失败，消息送达结果不确定，未自动重发。请检查已绑定标签页和扩展后，再明确决定是否重发：{error}"),
+                tab_id: state
+                    .chatgpt_bridge
+                    .session
+                    .lock()
+                    .ok()
+                    .and_then(|session| session.clone())
+                    .map(|session| session.tab_id),
+                protocol_state: None,
+            },
+        );
         return Err(error);
+    }
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        record_relay_message_dispatched(&connection, &message)?;
     }
     Ok(())
 }
@@ -1595,25 +4247,35 @@ fn queue_relay_message(
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let module = get_relay_module(&connection, &module_id)?
-            .ok_or_else(|| "传话模块不存在。".to_string())?;
-        if matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
-            return Err("模块已经结束，不能再发送消息。".into());
-        }
-        let now = Utc::now().to_rfc3339();
-        connection.execute(
-            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at)
-             VALUES (?1, ?2, ?3, 'TO_CHATGPT', ?4, ?5, 'QUEUED', ?6, NULL)",
-            params![Uuid::new_v4().to_string(), module_id, next_relay_sequence(&connection, &module_id)?, kind.as_db(), text.trim(), now],
-        ).map_err(|error| format!("无法将消息加入队列：{error}"))?;
-        append_relay_event(
-            &connection,
-            &module_id,
-            "CHATGPT_MESSAGE_QUEUED",
-            "已加入 ChatGPT 发送队列。",
-        )?;
+        queue_relay_message_in(&connection, &module_id, kind, &text)?;
     }
-    dispatch_next_relay_message(&app, &state, &module_id)
+    dispatch_next_relay_message(&app, &state)
+}
+
+fn queue_relay_message_in(
+    connection: &Connection,
+    module_id: &str,
+    kind: RelayMessageKind,
+    text: &str,
+) -> Result<(), String> {
+    let module =
+        get_relay_module(connection, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    if matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+        return Err("模块已经结束，不能再发送消息。".into());
+    }
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at, delivered_at)
+         VALUES (?1, ?2, ?3, 'TO_CHATGPT', ?4, ?5, 'QUEUED', ?6, NULL)",
+        params![Uuid::new_v4().to_string(), module_id, next_relay_sequence(connection, module_id)?, kind.as_db(), text.trim(), now],
+    ).map_err(|error| format!("无法将消息加入队列：{error}"))?;
+    append_relay_event(
+        connection,
+        module_id,
+        "CHATGPT_MESSAGE_QUEUED",
+        "已加入 ChatGPT 发送队列。",
+    )?;
+    Ok(())
 }
 
 fn append_relay_message(
@@ -1642,38 +4304,327 @@ fn set_relay_phase(connection: &Connection, module_id: &str, phase: &str) -> Res
     Ok(())
 }
 
-fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String> {
+fn pause_relay_for_uncertain_delivery(
+    connection: &Connection,
+    message_id: &str,
+    event_type: &str,
+    detail: &str,
+) -> Result<String, String> {
+    let module_id: String = connection
+        .query_row(
+            "SELECT module_id FROM relay_messages WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+            [message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取待确认的 ChatGPT 消息：{error}"))?
+        .ok_or_else(|| "没有待确认的 ChatGPT 消息可标记为不确定。".to_string())?;
+    connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'UNKNOWN' WHERE id = ?1",
+            [message_id],
+        )
+        .map_err(|error| format!("无法保存 ChatGPT 不确定送达状态：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, message_id, "UNKNOWN", Some(detail))?;
+    let phase: String = connection
+        .query_row(
+            "SELECT phase FROM relay_modules WHERE id = ?1",
+            [&module_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取模块恢复状态：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if !matches!(phase.as_str(), "STOPPED" | "COMPLETED") {
+        set_relay_phase(connection, &module_id, "RECOVERY_REQUIRED")?;
+    }
+    append_relay_event(connection, &module_id, event_type, detail)?;
+    Ok(module_id)
+}
+
+fn requeue_unknown_relay_message(
+    connection: &Connection,
+    message_id: &str,
+) -> Result<String, String> {
+    let module_id: String = connection
+        .query_row(
+            "SELECT module_id FROM relay_messages WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取待恢复的 ChatGPT 消息：{error}"))?
+        .ok_or_else(|| "该消息不是可明确重发的不确定传话消息。".to_string())?;
+    connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'QUEUED', delivered_at = NULL WHERE id = ?1",
+            [message_id],
+        )
+        .map_err(|error| format!("无法重新排队 ChatGPT 消息：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, message_id, "QUEUED", None)?;
+    set_relay_phase_after_recovery(connection, &module_id)?;
+    append_relay_event(
+        connection,
+        &module_id,
+        "CHATGPT_EXPLICIT_RESEND",
+        &format!("requestId={message_id}; 用户已明确要求重发此前结果不确定的消息。"),
+    )?;
+    Ok(module_id)
+}
+
+fn set_relay_phase_after_recovery(connection: &Connection, module_id: &str) -> Result<(), String> {
+    let phase: String = connection
+        .query_row(
+            "SELECT phase FROM relay_modules WHERE id = ?1",
+            [module_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取模块恢复状态：{error}"))?
+        .ok_or_else(|| "传话模块不存在。".to_string())?;
+    if matches!(phase.as_str(), "STOPPED" | "COMPLETED") {
+        return Ok(());
+    }
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages
+         WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查模块恢复状态：{error}"))?;
+    set_relay_phase(
+        connection,
+        module_id,
+        if remaining > 0 {
+            "RECOVERY_REQUIRED"
+        } else {
+            "READY"
+        },
+    )
+}
+
+fn resolve_unknown_relay_message_without_resend(
+    connection: &Connection,
+    message_id: &str,
+) -> Result<String, String> {
+    let module_id: String = connection
+        .query_row(
+            "SELECT module_id FROM relay_messages WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'UNKNOWN'",
+            [message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取待恢复的 ChatGPT 消息：{error}"))?
+        .ok_or_else(|| "该消息不是可解除阻塞的不确定传话消息。".to_string())?;
+    let detail =
+        format!("requestId={message_id}; 用户确认不重发该送达结果不确定的消息，并解除其阻塞。");
+    connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'FAILED' WHERE id = ?1",
+            [message_id],
+        )
+        .map_err(|error| format!("无法保存不重发决定：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, message_id, "FAILED", Some(&detail))?;
+    set_relay_phase_after_recovery(connection, &module_id)?;
+    append_relay_event(
+        connection,
+        &module_id,
+        "CHATGPT_EXPLICIT_CONTINUE_WITHOUT_RESEND",
+        &detail,
+    )?;
+    Ok(module_id)
+}
+
+#[tauri::command]
+fn retry_unknown_relay_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<(), String> {
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        requeue_unknown_relay_message(&connection, &message_id)?;
+    }
+    dispatch_next_relay_message(&app, &state)
+}
+
+#[tauri::command]
+fn continue_unknown_relay_message_without_resend(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<(), String> {
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        resolve_unknown_relay_message_without_resend(&connection, &message_id)?;
+    }
+    dispatch_next_relay_message(&app, &state)
+}
+
+fn handle_relay_chatgpt_adapter_failure(
+    app: AppHandle,
+    adapter_error: &str,
+    adapter_diagnostic: Option<&str>,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        let message_id: String = connection
+            .query_row(
+                "SELECT id FROM relay_messages
+                 WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
+                 ORDER BY created_at ASC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法匹配 ChatGPT 适配器错误：{error}"))?
+            .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 适配器错误。".to_string())?;
+        let diagnostic = adapter_diagnostic
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!(" 诊断：{value}"))
+            .unwrap_or_default();
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            &message_id,
+            "CHATGPT_ADAPTER_FAILURE",
+            &format!(
+                "ChatGPT 适配器失败，消息送达结果不确定，未自动重发：{adapter_error}{diagnostic}"
+            ),
+        )?;
+    }
+    let reason = format!("ChatGPT 浏览器适配器失败，消息送达结果不确定，未自动重发。请检查已绑定标签页和扩展后，再明确决定是否重发：{adapter_error}");
+    let _ = app.emit(
+        "relay-control",
+        json!({ "type": "ADAPTER_FAILURE", "reason": reason }),
+    );
+    state.chatgpt_bridge.set_status(
+        &app,
+        ChatGptBridgeStatus {
+            phase: "RELAY_RECOVERY_REQUIRED".into(),
+            detail: reason,
+            tab_id: state
+                .chatgpt_bridge
+                .session
+                .lock()
+                .ok()
+                .and_then(|session| session.clone())
+                .map(|session| session.tab_id),
+            protocol_state: None,
+        },
+    );
+    Ok(())
+}
+
+struct RelayChatGptReplyOutcome {
+    outgoing: (String, String, String),
+    module: RelayModuleRecord,
+    terminal_ignored: bool,
+}
+
+fn process_relay_chatgpt_reply_in(
+    connection: &Connection,
+    request_id: Option<&str>,
+    reply: &str,
+) -> Result<RelayChatGptReplyOutcome, String> {
+    let outgoing: (String, String, String) = if let Some(request_id) = request_id {
+        connection
+            .query_row(
+                "SELECT id, module_id, kind FROM relay_messages
+                 WHERE id = ?1 AND direction = 'TO_CHATGPT' AND delivery_state = 'SENT'",
+                [request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("无法匹配 ChatGPT 回复 requestId：{error}"))?
+    } else {
+        connection
+            .query_row(
+                "SELECT id, module_id, kind FROM relay_messages
+                 WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
+                 ORDER BY created_at ASC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("无法匹配 ChatGPT 回复：{error}"))?
+    }
+    .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 回复。".to_string())?;
+    append_relay_event(
+        connection,
+        &outgoing.1,
+        "CHATGPT_REPLY_RECEIVED",
+        &format!("requestId={}; Rust 已收到 chatgptReply。", outgoing.0),
+    )?;
+    connection
+        .execute(
+            "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
+            params![outgoing.0, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法确认 ChatGPT 消息送达：{error}"))?;
+    sync_codex_cycle_for_chatgpt_message_state(connection, &outgoing.0, "DELIVERED", None)?;
+    append_relay_message(
+        connection,
+        &outgoing.1,
+        "FROM_CHATGPT",
+        &outgoing.2,
+        reply,
+        "DELIVERED",
+    )?;
+    append_relay_event(
+        connection,
+        &outgoing.1,
+        "CHATGPT_REPLY_PERSISTED",
+        &format!("requestId={}; 已持久化 FROM_CHATGPT。", outgoing.0),
+    )?;
+
+    let module =
+        get_relay_module(connection, &outgoing.1)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    let terminal_ignored = matches!(module.phase.as_str(), "STOPPED" | "COMPLETED");
+    if terminal_ignored {
+        append_relay_event(
+            connection,
+            &module.id,
+            "LATE_CHATGPT_REPLY_IGNORED",
+            &format!(
+                "requestId={}; 模块已结束，已保存迟到 ChatGPT 回复但不会继续自动化。",
+                outgoing.0
+            ),
+        )?;
+    }
+    Ok(RelayChatGptReplyOutcome {
+        outgoing,
+        module,
+        terminal_ignored,
+    })
+}
+
+fn handle_relay_chatgpt_reply(
+    app: AppHandle,
+    request_id: Option<&str>,
+    reply: &str,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let (module_id, outgoing_kind, next_action) = {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let outgoing: (String, String, String) = connection
-            .query_row(
-                "SELECT id, module_id, kind FROM relay_messages
-             WHERE direction = 'TO_CHATGPT' AND delivery_state = 'SENT'
-             ORDER BY created_at ASC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|error| format!("无法匹配 ChatGPT 回复：{error}"))?
-            .ok_or_else(|| "收到没有对应待发送消息的 ChatGPT 回复。".to_string())?;
-        connection.execute(
-            "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
-            params![outgoing.0, Utc::now().to_rfc3339()],
-        ).map_err(|error| format!("无法确认 ChatGPT 消息送达：{error}"))?;
-        append_relay_message(
-            &connection,
-            &outgoing.1,
-            "FROM_CHATGPT",
-            &outgoing.2,
-            reply,
-            "DELIVERED",
-        )?;
-
-        if outgoing.2 == "MANUAL" {
+        let reply_outcome = process_relay_chatgpt_reply_in(&connection, request_id, reply)?;
+        let outgoing = reply_outcome.outgoing;
+        if reply_outcome.terminal_ignored {
+            (outgoing.1, outgoing.2, None)
+        } else if outgoing.2 == "MANUAL" {
             append_relay_event(
                 &connection,
                 &outgoing.1,
@@ -1682,9 +4633,8 @@ fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String>
             )?;
             (outgoing.1, outgoing.2, None)
         } else {
-            let module = get_relay_module(&connection, &outgoing.1)?
-                .ok_or_else(|| "传话模块不存在。".to_string())?;
-            match relay_protocol::parse_terminal_control_block(reply, None) {
+            let module = reply_outcome.module;
+            match relay_protocol::parse_terminal_control_block(reply) {
                 Ok(relay_protocol::ControlBlock::CodexPrompt(prompt)) => {
                     connection.execute(
                         "UPDATE relay_modules SET phase = 'CODEX_PROMPT_READY', invalid_reply_count = 0, updated_at = ?2 WHERE id = ?1",
@@ -1698,16 +4648,29 @@ fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String>
                         &prompt,
                         "QUEUED",
                     )?;
+                    let cycle = create_relay_codex_cycle(
+                        &connection,
+                        &module.id,
+                        module.started_cycles + 1,
+                        &prompt,
+                    )?;
                     append_relay_event(
                         &connection,
                         &module.id,
                         "CODEX_PROMPT_RECEIVED",
-                        "已识别有效的 Codex 提示词，等待执行适配器接管。",
+                        &format!(
+                            "cycleId={}; 已识别有效的 Codex 提示词，等待执行适配器接管。",
+                            cycle.id
+                        ),
                     )?;
                     (
                         outgoing.1,
                         outgoing.2,
-                        Some(json!({ "type": "CODEX_PROMPT", "prompt": prompt })),
+                        Some(json!({
+                            "type": "CODEX_PROMPT",
+                            "prompt": prompt,
+                            "cycleId": cycle.id,
+                        })),
                     )
                 }
                 Ok(relay_protocol::ControlBlock::ModuleDone) => {
@@ -1731,22 +4694,6 @@ fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String>
                         outgoing.1,
                         outgoing.2,
                         Some(json!({ "type": "BLOCKED", "reason": reason })),
-                    )
-                }
-                Ok(relay_protocol::ControlBlock::CodexInput(_)) => {
-                    set_relay_phase(&connection, &module.id, "BLOCKED")?;
-                    append_relay_event(
-                        &connection,
-                        &module.id,
-                        "INVALID_CODEX_INPUT",
-                        "当前没有待回答的 Codex 输入请求。",
-                    )?;
-                    (
-                        outgoing.1,
-                        outgoing.2,
-                        Some(
-                            json!({ "type": "ERROR", "reason": "当前没有待回答的 Codex 输入请求。" }),
-                        ),
                     )
                 }
                 Err(error) => {
@@ -1797,6 +4744,11 @@ fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String>
     };
     if let Some(action) = &next_action {
         let _ = app.emit("relay-control", action);
+        if action.get("type").and_then(Value::as_str) == Some("CODEX_PROMPT") {
+            if let Some(cycle_id) = action.get("cycleId").and_then(Value::as_str) {
+                emit_relay_codex_changed(&app, &module_id, cycle_id, "WAITING_TO_SEND_CODEX");
+            }
+        }
     }
     state.chatgpt_bridge.set_status(
         &app,
@@ -1821,23 +4773,337 @@ fn handle_relay_chatgpt_reply(app: AppHandle, reply: &str) -> Result<(), String>
             protocol_state: None,
         },
     );
-    dispatch_next_relay_message(&app, &state, &module_id)?;
+    dispatch_next_relay_message(&app, &state)?;
     if let Some(action) = next_action {
         if action.get("type").and_then(Value::as_str) == Some("CODEX_PROMPT") {
             let prompt = action
                 .get("prompt")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "Codex 提示词事件缺少正文。".to_string())?;
-            start_or_continue_relay_codex_turn(&app, &module_id, prompt)?;
+            let cycle_id = action
+                .get("cycleId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Codex 提示词事件缺少 cycle ID。".to_string())?;
+            start_or_continue_relay_codex_turn(&app, &module_id, prompt, cycle_id)?;
         }
     }
     Ok(())
+}
+
+fn mark_relay_codex_turn_starting_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "UPDATE relay_modules SET phase = 'CODEX_STARTING', updated_at = ?2 WHERE id = ?1",
+            params![module_id, now],
+        )
+        .map_err(|error| format!("无法启动 Codex 回合：{error}"))?;
+    Ok(())
+}
+
+fn set_relay_codex_pending_cycle_error(
+    connection: &Connection,
+    cycle_id: &str,
+    error_text: &str,
+) -> Result<(), String> {
+    let changed = connection
+        .execute(
+            "UPDATE relay_codex_cycles
+             SET error_text = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'WAITING_TO_SEND_CODEX'",
+            params![cycle_id, error_text, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法保存待启动 Codex 回合的恢复原因：{error}"))?;
+    if changed != 1 {
+        return Err("Codex 通讯循环不是待启动状态，不能保存恢复原因。".into());
+    }
+    Ok(())
+}
+
+fn set_relay_codex_recovery_reason(
+    connection: &Connection,
+    module_id: &str,
+    reason: Option<RelayCodexRecoveryReason>,
+) -> Result<(), String> {
+    let reason = reason.map(|reason| match reason {
+        RelayCodexRecoveryReason::ThreadResumeFailed => "THREAD_RESUME_FAILED",
+        RelayCodexRecoveryReason::ThreadResumeUnknown => "THREAD_RESUME_UNKNOWN",
+        RelayCodexRecoveryReason::ThreadReacquireRequired => "THREAD_REACQUIRE_REQUIRED",
+        RelayCodexRecoveryReason::TurnStartFailed => "TURN_START_FAILED",
+        RelayCodexRecoveryReason::TurnStartUnknown => "TURN_START_UNKNOWN",
+        RelayCodexRecoveryReason::ThreadStartFailed => "THREAD_START_FAILED",
+        RelayCodexRecoveryReason::ThreadStartUnknown => "THREAD_START_UNKNOWN",
+        RelayCodexRecoveryReason::ThreadBecameActiveBeforeResume => {
+            "THREAD_BECAME_ACTIVE_BEFORE_RESUME"
+        }
+    });
+    connection
+        .execute(
+            "UPDATE relay_modules SET codex_recovery_reason = ?2, updated_at = ?3 WHERE id = ?1",
+            params![module_id, reason, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法保存 Codex 回合恢复原因：{error}"))?;
+    Ok(())
+}
+
+fn allowed_relay_codex_recovery_actions_in(
+    connection: &Connection,
+    module: &RelayModuleRecord,
+    runtime: RelayCodexRecoveryRuntimeState,
+) -> Result<Vec<RelayCodexRecoveryAllowedAction>, String> {
+    if matches!(
+        runtime,
+        RelayCodexRecoveryRuntimeState::CurrentTurnActive
+            | RelayCodexRecoveryRuntimeState::OtherModule
+    ) || module.phase != "RECOVERY_REQUIRED"
+    {
+        return Ok(Vec::new());
+    }
+    let Some(reason) = module.codex_recovery_reason.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let pending_p1 = list_relay_codex_cycles_in(connection, &module.id)?
+        .into_iter()
+        .any(|cycle| cycle.status == "WAITING_TO_SEND_CODEX");
+    let target_thread_id = module
+        .resume_thread_id
+        .as_deref()
+        .or(module.codex_thread_id.as_deref());
+    let registry = match target_thread_id {
+        Some(thread_id) => get_relay_codex_thread(connection, thread_id)?,
+        None => None,
+    };
+    let reserved_by_module = registry.as_ref().is_some_and(|record| {
+        record.state == RelayCodexThreadState::Reserved
+            && record.owner_module_id.as_deref() == Some(module.id.as_str())
+    });
+    let active_by_module = registry.as_ref().is_some_and(|record| {
+        record.state == RelayCodexThreadState::Active
+            && record.owner_module_id.as_deref() == Some(module.id.as_str())
+    });
+    let unavailable_from_module = registry.as_ref().is_some_and(|record| {
+        record.state == RelayCodexThreadState::Unavailable
+            && record.owner_module_id.is_none()
+            && record.last_module_id.as_deref() == Some(module.id.as_str())
+    });
+    if unavailable_from_module {
+        return Ok(vec![RelayCodexRecoveryAllowedAction::ReacquireThread]);
+    }
+    let actions = match reason {
+        "THREAD_START_FAILED" => vec![RelayCodexRecoveryAllowedAction::StartNewThread],
+        "THREAD_START_UNKNOWN" if reserved_by_module => {
+            vec![RelayCodexRecoveryAllowedAction::RetryResume]
+        }
+        "THREAD_START_UNKNOWN" => vec![
+            RelayCodexRecoveryAllowedAction::StartNewThread,
+            RelayCodexRecoveryAllowedAction::SelectExistingThread,
+        ],
+        "THREAD_RESUME_FAILED" | "THREAD_BECAME_ACTIVE_BEFORE_RESUME" if reserved_by_module => {
+            vec![
+                RelayCodexRecoveryAllowedAction::RetryResume,
+                RelayCodexRecoveryAllowedAction::StartNewThread,
+            ]
+        }
+        "THREAD_RESUME_UNKNOWN"
+            if runtime == RelayCodexRecoveryRuntimeState::CurrentIdle
+                && active_by_module
+                && module.codex_thread_id.is_some()
+                && pending_p1 =>
+        {
+            vec![RelayCodexRecoveryAllowedAction::RetryTurnStart]
+        }
+        "TURN_START_FAILED" if active_by_module && pending_p1 => {
+            vec![RelayCodexRecoveryAllowedAction::RetryTurnStart]
+        }
+        _ => Vec::new(),
+    };
+    Ok(actions)
+}
+
+fn pending_relay_codex_cycle_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<RelayCodexCycleRecord, String> {
+    list_relay_codex_cycles_in(connection, module_id)?
+        .into_iter()
+        .find(|cycle| cycle.status == "WAITING_TO_SEND_CODEX")
+        .ok_or_else(|| "没有可恢复的待发送 Codex 提示词。".to_string())
+}
+
+fn prepare_relay_codex_start_new_thread_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始新 Codex 对话恢复事务：{error}"))?;
+    let module =
+        get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    pending_relay_codex_cycle_in(&transaction, module_id)?;
+    if let Some(thread_id) = module.resume_thread_id.as_deref() {
+        let record = get_relay_codex_thread(&transaction, thread_id)?
+            .ok_or_else(|| "所选 Codex 对话保留已不存在，不能切换为新对话。".to_string())?;
+        if record.state != RelayCodexThreadState::Reserved
+            || record.owner_module_id.as_deref() != Some(module_id)
+        {
+            return Err("所选 Codex 对话不再由当前模块保留，不能切换为新对话。".into());
+        }
+        match record.reservation_previous_state.as_deref() {
+            Some("NONE") => {
+                let changed = transaction
+                    .execute(
+                        "DELETE FROM relay_codex_threads WHERE thread_id = ?1 AND state = 'RESERVED' AND owner_module_id = ?2",
+                        params![thread_id, module_id],
+                    )
+                    .map_err(|error| format!("无法撤销新对话保留：{error}"))?;
+                if changed != 1 {
+                    return Err("所选 Codex 对话保留已发生竞争变化。".into());
+                }
+            }
+            Some("RELEASED") => {
+                let changed = transaction
+                    .execute(
+                        "UPDATE relay_codex_threads
+                         SET state = 'RELEASED', owner_module_id = NULL,
+                             reservation_previous_state = NULL, updated_at = ?3
+                         WHERE thread_id = ?1 AND state = 'RESERVED' AND owner_module_id = ?2
+                           AND reservation_previous_state = 'RELEASED'",
+                        params![thread_id, module_id, Utc::now().to_rfc3339()],
+                    )
+                    .map_err(|error| format!("无法恢复 Codex 对话保留状态：{error}"))?;
+                if changed != 1 {
+                    return Err("所选 Codex 对话保留已发生竞争变化。".into());
+                }
+            }
+            _ => return Err("Codex 对话保留来源无效。".into()),
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE relay_modules
+             SET resume_thread_id = NULL, codex_thread_id = NULL, updated_at = ?2
+             WHERE id = ?1",
+            params![module_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法切换为新 Codex 对话：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交新 Codex 对话恢复：{error}"))?;
+    Ok(())
+}
+
+fn prepare_relay_codex_select_existing_thread_in(
+    connection: &Connection,
+    module_id: &str,
+    thread_id: &str,
+    working_directory: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始选择 Codex 对话事务：{error}"))?;
+    let module =
+        get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.resume_thread_id.is_some() || module.codex_thread_id.is_some() {
+        return Err("当前模块已有 Codex 对话目标，不能覆盖。".into());
+    }
+    pending_relay_codex_cycle_in(&transaction, module_id)?;
+    match get_relay_codex_thread(&transaction, thread_id)? {
+        None => {
+            transaction
+                .execute(
+                    "INSERT INTO relay_codex_threads (
+                    thread_id, working_directory, state, owner_module_id, last_module_id,
+                    reservation_previous_state, updated_at
+                 ) VALUES (?1, ?2, 'RESERVED', ?3, ?3, 'NONE', ?4)",
+                    params![
+                        thread_id,
+                        working_directory,
+                        module_id,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(|error| format!("无法保留 Codex 对话：{error}"))?;
+        }
+        Some(record) if record.state == RelayCodexThreadState::Released => {
+            let changed = transaction
+                .execute(
+                    "UPDATE relay_codex_threads
+                 SET state = 'RESERVED', owner_module_id = ?2, last_module_id = ?2,
+                     reservation_previous_state = 'RELEASED', updated_at = ?3
+                 WHERE thread_id = ?1 AND state = 'RELEASED' AND owner_module_id IS NULL",
+                    params![thread_id, module_id, Utc::now().to_rfc3339()],
+                )
+                .map_err(|error| format!("无法重新保留 Codex 对话：{error}"))?;
+            if changed != 1 {
+                return Err("Codex 对话保留已发生竞争变化。".into());
+            }
+        }
+        Some(_) => return Err("所选 Codex 对话当前不可保留。".into()),
+    }
+    transaction
+        .execute(
+            "UPDATE relay_modules
+         SET resume_thread_id = ?2, codex_thread_id = NULL, updated_at = ?3
+         WHERE id = ?1",
+            params![module_id, thread_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法保存所选 Codex 对话：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 对话选择：{error}"))?;
+    Ok(())
+}
+
+fn relay_codex_recovery_action_is_allowed(
+    allowed: &[RelayCodexRecoveryAllowedAction],
+    action: &RelayCodexRecoveryAction,
+) -> bool {
+    allowed.iter().any(|candidate| {
+        matches!(
+            (candidate, action),
+            (
+                RelayCodexRecoveryAllowedAction::RetryResume,
+                RelayCodexRecoveryAction::RetryResume
+            ) | (
+                RelayCodexRecoveryAllowedAction::ReacquireThread,
+                RelayCodexRecoveryAction::ReacquireThread
+            ) | (
+                RelayCodexRecoveryAllowedAction::StartNewThread,
+                RelayCodexRecoveryAction::StartNewThread
+            ) | (
+                RelayCodexRecoveryAllowedAction::RetryTurnStart,
+                RelayCodexRecoveryAction::RetryTurnStart
+            ) | (
+                RelayCodexRecoveryAllowedAction::SelectExistingThread,
+                RelayCodexRecoveryAction::SelectExistingThread { .. }
+            )
+        )
+    })
+}
+
+fn send_relay_codex_start_turn(
+    session: &RelayCodexSession,
+    cycle_id: &str,
+    prompt: &str,
+) -> Result<(), ()> {
+    session.turn_active.store(true, Ordering::SeqCst);
+    session
+        .commands
+        .send(RelayCodexCommand::StartTurn {
+            cycle_id: cycle_id.to_string(),
+            prompt: prompt.to_string(),
+        })
+        .map_err(|_| ())
 }
 
 fn start_or_continue_relay_codex_turn(
     app: &AppHandle,
     module_id: &str,
     prompt: &str,
+    cycle_id: &str,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let module = {
@@ -1847,6 +5113,11 @@ fn start_or_continue_relay_codex_turn(
             .map_err(|_| "数据库锁已损坏。".to_string())?;
         let module = get_relay_module(&connection, module_id)?
             .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if let Some(reason) = relay_codex_start_block_reason(&module) {
+            fail_relay_codex_cycle(&connection, cycle_id, reason)?;
+            emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
+            return Err(reason.into());
+        }
         if module.started_cycles >= module.max_cycles {
             set_relay_phase(&connection, module_id, "WAITING_FOR_ACCEPTANCE")?;
             append_relay_event(
@@ -1855,7 +5126,10 @@ fn start_or_continue_relay_codex_turn(
                 "CYCLE_BUDGET_REACHED",
                 "已达到最大自动化循环次数，等待人工验收。",
             )?;
-            return Err("已达到最大自动化循环次数，不能启动新的 Codex 回合。".into());
+            let reason = "已达到最大自动化循环次数，不能启动新的 Codex 回合。";
+            fail_relay_codex_cycle(&connection, cycle_id, reason)?;
+            emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
+            return Err(reason.into());
         }
         if let Some(started) = module.module_started_at.as_deref() {
             let started = DateTime::parse_from_rfc3339(started)
@@ -1869,14 +5143,18 @@ fn start_or_continue_relay_codex_turn(
                     "RUNTIME_BUDGET_REACHED",
                     "已达到模块最长运行时间，等待人工验收。",
                 )?;
-                return Err("已达到模块最长运行时间，不能启动新的 Codex 回合。".into());
+                let reason = "已达到模块最长运行时间，不能启动新的 Codex 回合。";
+                fail_relay_codex_cycle(&connection, cycle_id, reason)?;
+                emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
+                return Err(reason.into());
             }
         }
-        connection.execute(
-            "UPDATE relay_modules SET phase = 'CODEX_STARTING', started_cycles = started_cycles + 1,
-             module_started_at = COALESCE(module_started_at, ?2), updated_at = ?2 WHERE id = ?1",
-            params![module_id, Utc::now().to_rfc3339()],
-        ).map_err(|error| format!("无法启动 Codex 回合：{error}"))?;
+        if let Err(error) = verify_relay_codex_thread_ownership_for_turn_in(&connection, &module) {
+            let _ = set_relay_codex_pending_cycle_error(&connection, cycle_id, &error);
+            emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
+            return Err(error);
+        }
+        mark_relay_codex_turn_starting_in(&connection, module_id)?;
         module
     };
 
@@ -1886,176 +5164,823 @@ fn start_or_continue_relay_codex_turn(
         .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
     if let Some(session) = sessions.as_ref() {
         if session.module_id != module_id {
-            return Err("另一个模块正在持有 Codex 对话；当前中间件一次只能运行一个模块。".into());
+            let reason = "另一个模块正在持有 Codex 对话；当前中间件一次只能运行一个模块。";
+            drop(sessions);
+            relay_codex_failed(app, module_id, Some(cycle_id), reason.into());
+            return Err(reason.into());
         }
-        session
-            .commands
-            .send(RelayCodexCommand::StartTurn(prompt.to_string()))
-            .map_err(|_| "Codex 对话已经退出。".to_string())?;
+        if send_relay_codex_start_turn(session, cycle_id, prompt).is_err() {
+            let reason = "Codex 对话已经退出。".to_string();
+            drop(sessions);
+            relay_codex_failed(app, module_id, Some(cycle_id), reason.clone());
+            return Err(reason);
+        }
     } else {
         if !Path::new(&module.working_directory).is_dir() {
-            return Err("所选 Codex 工作目录不存在。".into());
+            let reason = "所选 Codex 工作目录不存在。".to_string();
+            drop(sessions);
+            relay_codex_failed(app, module_id, Some(cycle_id), reason.clone());
+            return Err(reason);
         }
         let (sender, receiver) = std_mpsc::channel();
+        let turn_active = Arc::new(AtomicBool::new(false));
         let app_for_worker = app.clone();
         let working_directory = module.working_directory.clone();
-        let module_id = module_id.to_string();
+        let execution_mode = match relay_codex_execution_mode_for_new_session(&module) {
+            Ok(execution_mode) => execution_mode,
+            Err(reason) => {
+                drop(sessions);
+                let connection = state
+                    .connection
+                    .lock()
+                    .map_err(|_| "数据库锁已损坏。".to_string())?;
+                set_relay_phase(&connection, module_id, "RECOVERY_REQUIRED")?;
+                set_relay_codex_recovery_reason(
+                    &connection,
+                    module_id,
+                    Some(RelayCodexRecoveryReason::ThreadReacquireRequired),
+                )?;
+                set_relay_codex_pending_cycle_error(&connection, cycle_id, &reason)?;
+                append_relay_event(
+                    &connection,
+                    module_id,
+                    "CODEX_THREAD_REACQUIRE_REQUIRED",
+                    "已获取的 Codex 对话没有当前进程的 live worker，未自动重新恢复。",
+                )?;
+                emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
+                return Err(reason);
+            }
+        };
+        let worker_module_id = module_id.to_string();
+        let initial_cycle_id = cycle_id.to_string();
+        let worker_turn_active = turn_active.clone();
         std::thread::spawn(move || {
-            relay_codex_worker(app_for_worker, module_id, working_directory, receiver)
+            relay_codex_worker(
+                app_for_worker,
+                worker_module_id,
+                working_directory,
+                execution_mode,
+                initial_cycle_id,
+                receiver,
+                worker_turn_active,
+            )
         });
-        sender
-            .send(RelayCodexCommand::StartTurn(prompt.to_string()))
-            .map_err(|_| "无法启动 Codex 对话。".to_string())?;
+        let send_result = sender.send(RelayCodexCommand::StartTurn {
+            cycle_id: cycle_id.to_string(),
+            prompt: prompt.to_string(),
+        });
+        if send_result.is_err() {
+            let reason = "无法启动 Codex 对话。".to_string();
+            drop(sessions);
+            relay_codex_failed(app, module_id, Some(cycle_id), reason.clone());
+            return Err(reason);
+        }
         *sessions = Some(RelayCodexSession {
             module_id: module.id,
             commands: sender,
+            turn_active,
         });
     }
     let _ = app.emit(
         "relay-codex-status",
-        json!({ "phase": "CODEX_STARTING", "moduleId": module_id }),
+        json!({ "phase": "CODEX_STARTING", "moduleId": module_id, "cycleId": cycle_id }),
     );
     Ok(())
+}
+
+fn relay_codex_recovery_runtime_state(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    module_id: &str,
+) -> Result<RelayCodexRecoveryRuntimeState, String> {
+    let sessions = sessions
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+    let Some(session) = sessions.as_ref() else {
+        return Ok(RelayCodexRecoveryRuntimeState::None);
+    };
+    if session.module_id != module_id {
+        return Ok(RelayCodexRecoveryRuntimeState::OtherModule);
+    }
+    Ok(if session.turn_active.load(Ordering::SeqCst) {
+        RelayCodexRecoveryRuntimeState::CurrentTurnActive
+    } else {
+        RelayCodexRecoveryRuntimeState::CurrentIdle
+    })
+}
+
+fn launch_relay_codex_recovery_worker(
+    app: &AppHandle,
+    module: &RelayModuleRecord,
+    cycle_id: &str,
+    execution_mode: RelayCodexExecutionMode,
+    initial_prompt: Option<&str>,
+) -> Result<(), String> {
+    if !Path::new(&module.working_directory).is_dir() {
+        return Err("所选 Codex 工作目录不存在。".into());
+    }
+    let state = app.state::<AppState>();
+    let mut sessions = state
+        .relay_codex
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+    if sessions.is_some() {
+        return Err("已有 Codex 会话正在运行或被保留，不能启动恢复。".into());
+    }
+    let (sender, receiver) = std_mpsc::channel();
+    let turn_active = Arc::new(AtomicBool::new(false));
+    let app_for_worker = app.clone();
+    let working_directory = module.working_directory.clone();
+    let worker_module_id = module.id.clone();
+    let initial_cycle_id = cycle_id.to_string();
+    let worker_turn_active = turn_active.clone();
+    std::thread::spawn(move || {
+        relay_codex_worker(
+            app_for_worker,
+            worker_module_id,
+            working_directory,
+            execution_mode,
+            initial_cycle_id,
+            receiver,
+            worker_turn_active,
+        )
+    });
+    if let Some(prompt) = initial_prompt {
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: cycle_id.to_string(),
+                prompt: prompt.to_string(),
+            })
+            .map_err(|_| "无法向 Codex 恢复会话发送回合启动请求。".to_string())?;
+    }
+    *sessions = Some(RelayCodexSession {
+        module_id: module.id.clone(),
+        commands: sender,
+        turn_active,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn recover_relay_codex(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+    action: RelayCodexRecoveryAction,
+) -> Result<(), String> {
+    let runtime = relay_codex_recovery_runtime_state(&state.relay_codex, &module_id)?;
+    let (mut module, cycle, allowed) = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        let module = get_relay_module(&connection, &module_id)?
+            .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if module.phase != "RECOVERY_REQUIRED" {
+            return Err("当前模块不处于可恢复状态。".into());
+        }
+        let allowed = allowed_relay_codex_recovery_actions_in(&connection, &module, runtime)?;
+        if !relay_codex_recovery_action_is_allowed(&allowed, &action) {
+            return Err("当前恢复动作未获安全授权，未执行任何操作。".into());
+        }
+        let cycle = if matches!(action, RelayCodexRecoveryAction::ReacquireThread) {
+            None
+        } else {
+            Some(pending_relay_codex_cycle_in(&connection, &module_id)?)
+        };
+        (module, cycle, allowed)
+    };
+    debug_assert!(relay_codex_recovery_action_is_allowed(&allowed, &action));
+
+    match action {
+        RelayCodexRecoveryAction::RetryResume => {
+            let cycle = cycle.as_ref().expect("authorized retry resume has P1");
+            let thread_id = module
+                .resume_thread_id
+                .clone()
+                .ok_or_else(|| "当前模块没有可继续的 Codex 对话目标。".to_string())?;
+            {
+                let connection = state
+                    .connection
+                    .lock()
+                    .map_err(|_| "数据库锁已损坏。".to_string())?;
+                mark_relay_codex_turn_starting_in(&connection, &module_id)?;
+            }
+            launch_relay_codex_recovery_worker(
+                &app,
+                &module,
+                &cycle.id,
+                RelayCodexExecutionMode::ResumeReservedThenTurn { thread_id },
+                Some(&cycle.prompt_text),
+            )?;
+        }
+        RelayCodexRecoveryAction::StartNewThread => {
+            let cycle = cycle.as_ref().expect("authorized new thread has P1");
+            {
+                let connection = state
+                    .connection
+                    .lock()
+                    .map_err(|_| "数据库锁已损坏。".to_string())?;
+                prepare_relay_codex_start_new_thread_in(&connection, &module_id)?;
+                mark_relay_codex_turn_starting_in(&connection, &module_id)?;
+                module = get_relay_module(&connection, &module_id)?
+                    .ok_or_else(|| "传话模块不存在。".to_string())?;
+            }
+            launch_relay_codex_recovery_worker(
+                &app,
+                &module,
+                &cycle.id,
+                RelayCodexExecutionMode::NewThenTurn,
+                Some(&cycle.prompt_text),
+            )?;
+        }
+        RelayCodexRecoveryAction::ReacquireThread => {
+            let thread_id = module
+                .codex_thread_id
+                .clone()
+                .or(module.resume_thread_id.clone())
+                .ok_or_else(|| "当前模块没有可重新获取的 Codex 对话。".to_string())?;
+            let origin_recovery_reason = module
+                .codex_recovery_reason
+                .clone()
+                .ok_or_else(|| "当前模块没有可保留的 Codex 恢复原因。".to_string())?;
+            launch_relay_codex_recovery_worker(
+                &app,
+                &module,
+                cycle.as_ref().map(|cycle| cycle.id.as_str()).unwrap_or(""),
+                RelayCodexExecutionMode::ReacquireOnly {
+                    thread_id,
+                    origin_recovery_reason,
+                },
+                None,
+            )?;
+        }
+        RelayCodexRecoveryAction::RetryTurnStart => match runtime {
+            RelayCodexRecoveryRuntimeState::CurrentIdle => {
+                let cycle = cycle.as_ref().expect("authorized turn retry has P1");
+                let sessions = state
+                    .relay_codex
+                    .lock()
+                    .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+                let session = sessions
+                    .as_ref()
+                    .filter(|session| session.module_id == module_id)
+                    .ok_or_else(|| "Codex 空闲会话已不可用，未重发回合。".to_string())?;
+                send_relay_codex_start_turn(session, &cycle.id, &cycle.prompt_text)
+                    .map_err(|_| "Codex 空闲会话已退出，未重发回合。".to_string())?;
+            }
+            RelayCodexRecoveryRuntimeState::None => {
+                let cycle = cycle.as_ref().expect("authorized turn retry has P1");
+                let thread_id = module
+                    .codex_thread_id
+                    .clone()
+                    .ok_or_else(|| "当前模块没有已确认的 Codex 对话。".to_string())?;
+                {
+                    let connection = state
+                        .connection
+                        .lock()
+                        .map_err(|_| "数据库锁已损坏。".to_string())?;
+                    mark_relay_codex_turn_starting_in(&connection, &module_id)?;
+                }
+                launch_relay_codex_recovery_worker(
+                    &app,
+                    &module,
+                    &cycle.id,
+                    RelayCodexExecutionMode::ResumeKnownThreadThenTurn { thread_id },
+                    Some(&cycle.prompt_text),
+                )?;
+            }
+            RelayCodexRecoveryRuntimeState::CurrentTurnActive
+            | RelayCodexRecoveryRuntimeState::OtherModule => {
+                return Err("当前 Codex 会话不是可安全重试回合的空闲会话。".into());
+            }
+        },
+        RelayCodexRecoveryAction::SelectExistingThread { thread_id } => {
+            let registry = {
+                let connection = state
+                    .connection
+                    .lock()
+                    .map_err(|_| "数据库锁已损坏。".to_string())?;
+                list_relay_codex_threads(&connection)?
+            };
+            let candidates = discover_relay_codex_threads_for_cwd_guarded(
+                &state.relay_codex,
+                &module.working_directory,
+                &registry,
+            )?;
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.thread_id == thread_id && candidate.selectable)
+            {
+                return Err("所选 Codex 对话当前不可继续，未修改恢复目标。".into());
+            }
+            let connection = state
+                .connection
+                .lock()
+                .map_err(|_| "数据库锁已损坏。".to_string())?;
+            prepare_relay_codex_select_existing_thread_in(
+                &connection,
+                &module_id,
+                &thread_id,
+                &module.working_directory,
+            )?;
+        }
+    }
+    emit_relay_codex_changed(
+        &app,
+        &module_id,
+        cycle
+            .as_ref()
+            .map(|cycle| cycle.id.as_str())
+            .unwrap_or_default(),
+        "RECOVERY_ACTION_APPLIED",
+    );
+    Ok(())
+}
+
+fn relay_codex_recovery_summary(reason: Option<&str>) -> String {
+    match reason {
+        Some("TURN_START_UNKNOWN") => "无法确认任务是否已启动，禁止直接重发。".into(),
+        Some("THREAD_START_UNKNOWN") => "无法确认是否创建了对话，但任务提示尚未发送。".into(),
+        Some("THREAD_RESUME_UNKNOWN") => "无法确认 Codex 对话是否已继续，需先明确重新获取。".into(),
+        Some("THREAD_REACQUIRE_REQUIRED") => {
+            "应用重启或连接中断后无法确认 Codex 对话占用，需先重新获取。".into()
+        }
+        Some("TURN_START_FAILED") => "Codex 回合未成功启动，可在确认对话归属后重试。".into(),
+        Some("THREAD_START_FAILED") => "Codex 对话未成功创建，可选择重新创建。".into(),
+        Some("THREAD_RESUME_FAILED") => "Codex 对话未成功继续，可检查后选择恢复方式。".into(),
+        Some("THREAD_BECAME_ACTIVE_BEFORE_RESUME") => {
+            "目标 Codex 对话正在运行，不能由中间件接管。".into()
+        }
+        _ => "当前没有需要处理的 Codex 对话恢复操作。".into(),
+    }
+}
+
+#[tauri::command]
+fn get_relay_codex_thread_state(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<RelayCodexThreadStateSnapshot, String> {
+    let runtime = relay_codex_recovery_runtime_state(&state.relay_codex, &module_id)?;
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    let module =
+        get_relay_module(&connection, &module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    let intended_thread_id = module.resume_thread_id.clone();
+    let acquired_thread_id = module.codex_thread_id.clone();
+    let registry = intended_thread_id
+        .as_deref()
+        .or(acquired_thread_id.as_deref())
+        .map(|thread_id| get_relay_codex_thread(&connection, thread_id))
+        .transpose()?
+        .flatten();
+    let pending_cycle = list_relay_codex_cycles_in(&connection, &module_id)?
+        .into_iter()
+        .find(|cycle| cycle.status == "WAITING_TO_SEND_CODEX")
+        .map(|cycle| RelayCodexThreadRecoveryCycleSnapshot {
+            id: cycle.id,
+            cycle_number: cycle.cycle_number,
+            status: cycle.status,
+            prompt_text: cycle.prompt_text,
+        });
+    let allowed_actions = allowed_relay_codex_recovery_actions_in(&connection, &module, runtime)?;
+    Ok(RelayCodexThreadStateSnapshot {
+        module_id,
+        working_directory: module.working_directory,
+        intended_thread_id,
+        acquired_thread_id,
+        registry,
+        recovery_reason: module.codex_recovery_reason.clone(),
+        summary: relay_codex_recovery_summary(module.codex_recovery_reason.as_deref()),
+        pending_cycle,
+        allowed_actions,
+    })
 }
 
 fn relay_codex_worker(
     app: AppHandle,
     module_id: String,
     working_directory: String,
+    execution_mode: RelayCodexExecutionMode,
+    initial_cycle_id: String,
     commands: std_mpsc::Receiver<RelayCodexCommand>,
+    turn_active: Arc<AtomicBool>,
 ) {
     let command = codex_command();
-    let child = Command::new(&command)
-        .arg("app-server")
-        .current_dir(&working_directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let Ok(mut child) = child else {
-        relay_codex_failed(&app, &module_id, "无法启动本地 Codex App Server。".into());
-        return;
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        relay_codex_failed(&app, &module_id, "Codex App Server 没有可用输入流。".into());
-        return;
-    };
-    let Some(stdout) = child.stdout.take() else {
-        relay_codex_failed(&app, &module_id, "Codex App Server 没有可用输出流。".into());
-        return;
-    };
-    let Some(stderr) = child.stderr.take() else {
-        relay_codex_failed(&app, &module_id, "Codex App Server 没有可用错误流。".into());
-        return;
-    };
-    let (events_sender, events) = std_mpsc::channel::<Result<Value, String>>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let event = line
-                .map_err(|error| format!("无法读取 Codex 输出：{error}"))
-                .and_then(|line| {
-                    serde_json::from_str(&line)
-                        .map_err(|error| format!("Codex 输出不是 JSON：{error}"))
-                });
-            if events_sender.send(event).is_err() {
-                break;
-            }
+    let mut transport = match RelayCodexProcessTransport::spawn(&command, &working_directory) {
+        Ok(transport) => transport,
+        Err(error) => {
+            TauriRelayCodexWorkerHost::new(app.clone(), working_directory.clone()).failed(
+                &module_id,
+                Some(initial_cycle_id.as_str()),
+                error,
+            );
+            return;
         }
-    });
-    std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
-    if let Err(error) = send_rpc(
-        &mut stdin,
+    };
+    let mut host = TauriRelayCodexWorkerHost::new(app.clone(), working_directory.clone());
+    let release_acknowledgement = run_relay_codex_worker_core(
+        &mut transport,
+        &mut host,
+        &module_id,
+        &initial_cycle_id,
+        &working_directory,
+        &execution_mode,
+        &commands,
+        &turn_active,
+    );
+    let release_result = transport.shutdown();
+    let state = app.state::<AppState>();
+    clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
+    if let Some(acknowledgement) = release_acknowledgement {
+        let _ = acknowledgement.send(release_result);
+    }
+}
+
+fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
+    transport: &mut T,
+    host: &mut H,
+    module_id: &str,
+    initial_cycle_id: &str,
+    working_directory: &str,
+    execution_mode: &RelayCodexExecutionMode,
+    commands: &std_mpsc::Receiver<RelayCodexCommand>,
+    turn_active: &Arc<AtomicBool>,
+) -> Option<std_mpsc::Sender<Result<(), String>>> {
+    if let Err(error) = transport.send_json(
         json!({ "method": "initialize", "id": 1, "params": { "clientInfo": { "name": "chatgpt-codex-middleware", "title": "ChatGPT × Codex Middleware", "version": env!("CARGO_PKG_VERSION") } } }),
     ) {
-        relay_codex_failed(&app, &module_id, error);
-        return;
+        report_relay_codex_worker_failure(
+            host,
+            execution_mode,
+            execution_mode.resume_thread_id().is_some(),
+            module_id,
+            Some(initial_cycle_id),
+            error,
+        );
+        return None;
     }
 
     let mut thread_id: Option<String> = None;
-    let mut pending_prompt: Option<String> = None;
+    let mut pending_turn: Option<(String, String)> = None;
+    // Acquiring a thread is not a Codex turn.  Only StartTurn may create an
+    // active cycle, so an idle reacquired session can later start or release.
+    let mut active_cycle_id: Option<String> = None;
     let mut next_request_id = 3_i64;
+    let mut outstanding = Some((1_i64, RelayCodexOutstandingRpc::Initialize));
     let mut final_summary = String::new();
+    let mut release_acknowledgement: Option<std_mpsc::Sender<Result<(), String>>> = None;
+    let mut acquisition_pending = execution_mode.resume_thread_id().is_some();
+    macro_rules! worker_failed {
+        ($cycle_id:expr, $reason:expr $(,)?) => {
+            report_relay_codex_worker_failure(
+                host,
+                execution_mode,
+                acquisition_pending,
+                module_id,
+                $cycle_id,
+                $reason,
+            )
+        };
+    }
     'worker: loop {
         while let Ok(command) = commands.try_recv() {
             match command {
-                RelayCodexCommand::StartTurn(prompt) => {
+                RelayCodexCommand::StartTurn { cycle_id, prompt } => {
+                    turn_active.store(true, Ordering::SeqCst);
+                    if active_cycle_id.is_some() && pending_turn.is_none() && thread_id.is_some() {
+                        host.failed(
+                            &module_id,
+                            Some(cycle_id.as_str()),
+                            "上一 Codex 回合尚未结束，不能启动新的回合。".into(),
+                        );
+                        continue;
+                    }
+                    active_cycle_id = Some(cycle_id.clone());
                     if let Some(thread) = thread_id.as_deref() {
-                        if let Err(error) = send_rpc(
-                            &mut stdin,
+                        outstanding = Some((
+                            next_request_id,
+                            RelayCodexOutstandingRpc::TurnStart {
+                                cycle_id: cycle_id.clone(),
+                                thread_id: thread.to_string(),
+                            },
+                        ));
+                        if let Err(error) = transport.send_json(
                             json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
                         ) {
-                            relay_codex_failed(&app, &module_id, error);
+                            host.failed(
+                                module_id,
+                                active_cycle_id.as_deref(),
+                                format!("Codex turn/start 送达结果未知：{error}"),
+                            );
                             break 'worker;
                         }
                         next_request_id += 1;
                         final_summary.clear();
                     } else {
-                        pending_prompt = Some(prompt);
+                        pending_turn = Some((cycle_id, prompt));
+                    }
+                }
+                RelayCodexCommand::Release { acknowledgement } => {
+                    if active_cycle_id.is_some() || pending_turn.is_some() {
+                        let _ = acknowledgement
+                            .send(Err("当前 Codex 回合仍在运行，不能释放 Codex 对话。".into()));
+                    } else {
+                        release_acknowledgement = Some(acknowledgement);
+                        break 'worker;
                     }
                 }
             }
         }
-        match events.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(Err(error)) => {
-                relay_codex_failed(&app, &module_id, error);
-                break;
-            }
-            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                relay_codex_failed(
-                    &app,
-                    &module_id,
-                    "Codex App Server 已在回合完成前退出。".into(),
+        match transport.recv_event(std::time::Duration::from_millis(100)) {
+            RelayCodexTransportEvent::ProtocolError(error) => {
+                worker_failed!(
+                    active_cycle_id.as_deref(),
+                    relay_codex_unknown_outstanding_reason(
+                        outstanding.as_ref().map(|(_, rpc)| rpc),
+                        error,
+                    ),
                 );
                 break;
             }
-            Ok(Ok(message)) => {
-                if let Some(error) = message
-                    .get("error")
-                    .and_then(|value| value.get("message"))
-                    .and_then(Value::as_str)
-                {
-                    relay_codex_failed(&app, &module_id, format!("Codex App Server 错误：{error}"));
-                    break;
-                }
-                match message.get("id").and_then(Value::as_i64) {
-                    Some(1) => {
-                        if send_rpc(&mut stdin, json!({ "method": "initialized", "params": {} }))
-                            .and_then(|_| {
-                                send_rpc(
-                                    &mut stdin,
-                                    json!({ "method": "thread/start", "id": 2, "params": {} }),
-                                )
-                            })
-                            .is_err()
-                        {
-                            relay_codex_failed(&app, &module_id, "无法初始化 Codex 对话。".into());
-                            break;
-                        }
-                    }
-                    Some(2) => {
-                        thread_id = message
-                            .pointer("/result/thread/id")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned);
-                        let Some(thread) = thread_id.as_deref() else {
-                            relay_codex_failed(&app, &module_id, "Codex 未返回对话 ID。".into());
-                            break;
-                        };
-                        relay_codex_thread_ready(&app, &module_id, thread);
-                        if let Some(prompt) = pending_prompt.take() {
-                            if let Err(error) = send_rpc(
-                                &mut stdin,
-                                json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
+            RelayCodexTransportEvent::Timeout => continue,
+            RelayCodexTransportEvent::Closed(detail) => {
+                worker_failed!(
+                    active_cycle_id.as_deref(),
+                    relay_codex_unknown_outstanding_reason(
+                        outstanding.as_ref().map(|(_, rpc)| rpc),
+                        detail,
+                    ),
+                );
+                break;
+            }
+            RelayCodexTransportEvent::Message(message) => {
+                if let Some((request_id, rpc)) = outstanding.clone() {
+                    match classify_relay_codex_rpc_response(&message, request_id) {
+                        RelayCodexRpcOutcome::Unrelated => {}
+                        RelayCodexRpcOutcome::MatchingExplicitError(error) => {
+                            let reason = if matches!(
+                                &rpc,
+                                RelayCodexOutstandingRpc::ThreadListForResume { .. }
                             ) {
-                                relay_codex_failed(&app, &module_id, error);
-                                break;
-                            }
-                            next_request_id += 1;
+                                format!("Codex 恢复前对话检查失败：{error}")
+                            } else {
+                                format!("Codex {} 明确失败：{error}", relay_codex_rpc_name(&rpc))
+                            };
+                            worker_failed!(active_cycle_id.as_deref(), reason);
+                            break;
                         }
+                        RelayCodexRpcOutcome::MatchingMalformed(error) => {
+                            worker_failed!(
+                                active_cycle_id.as_deref(),
+                                relay_codex_unknown_outstanding_reason(Some(&rpc), error),
+                            );
+                            break;
+                        }
+                        RelayCodexRpcOutcome::MatchingSuccess => match rpc {
+                            RelayCodexOutstandingRpc::Initialize => {
+                                outstanding = None;
+                                if let Err(error) = transport
+                                    .send_json(json!({ "method": "initialized", "params": {} }))
+                                {
+                                    worker_failed!(
+                                        active_cycle_id.as_deref(),
+                                        format!("无法初始化 Codex 对话：{error}"),
+                                    );
+                                    break;
+                                }
+                                let (method, params, rpc) =
+                                    if let Some(thread_id) = execution_mode.resume_thread_id() {
+                                        (
+                                            "thread/list",
+                                            relay_codex_thread_list_params(working_directory, None),
+                                            RelayCodexOutstandingRpc::ThreadListForResume {
+                                                thread_id: thread_id.to_string(),
+                                                cursor: None,
+                                            },
+                                        )
+                                    } else {
+                                        (
+                                            "thread/start",
+                                            json!({}),
+                                            RelayCodexOutstandingRpc::ThreadStart,
+                                        )
+                                    };
+                                outstanding = Some((2, rpc));
+                                if let Err(error) = transport.send_json(
+                                    json!({ "method": method, "id": 2, "params": params }),
+                                ) {
+                                    worker_failed!(
+                                        active_cycle_id.as_deref(),
+                                        relay_codex_unknown_outstanding_reason(
+                                            outstanding.as_ref().map(|(_, rpc)| rpc),
+                                            error,
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                            RelayCodexOutstandingRpc::ThreadListForResume {
+                                thread_id: expected,
+                                ..
+                            } => {
+                                let (preflight, next_cursor) = match inspect_relay_codex_resume_page(
+                                    message.get("result").unwrap_or(&Value::Null),
+                                    &expected,
+                                    working_directory,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        worker_failed!(
+                                            active_cycle_id.as_deref(),
+                                            format!("Codex 恢复前对话检查失败：{error}"),
+                                        );
+                                        break;
+                                    }
+                                };
+                                match preflight {
+                                    RelayCodexResumePreflight::Eligible => {
+                                        outstanding = Some((
+                                            next_request_id,
+                                            RelayCodexOutstandingRpc::ThreadResume {
+                                                thread_id: expected.clone(),
+                                            },
+                                        ));
+                                        if let Err(error) = transport.send_json(json!({
+                                            "method": "thread/resume",
+                                            "id": next_request_id,
+                                            "params": { "threadId": expected }
+                                        })) {
+                                            worker_failed!(
+                                                active_cycle_id.as_deref(),
+                                                relay_codex_unknown_outstanding_reason(
+                                                    outstanding.as_ref().map(|(_, rpc)| rpc),
+                                                    error,
+                                                ),
+                                            );
+                                            break;
+                                        }
+                                        next_request_id += 1;
+                                    }
+                                    RelayCodexResumePreflight::Active => {
+                                        worker_failed!(
+                                            active_cycle_id.as_deref(),
+                                            "Codex 恢复前对话检查发现目标正在运行，暂不可继续。"
+                                                .into(),
+                                        );
+                                        break;
+                                    }
+                                    RelayCodexResumePreflight::Invalid(detail) => {
+                                        worker_failed!(
+                                            active_cycle_id.as_deref(),
+                                            format!("Codex 恢复前对话检查失败：{detail}"),
+                                        );
+                                        break;
+                                    }
+                                    RelayCodexResumePreflight::Missing => {
+                                        if let Some(cursor) = next_cursor {
+                                            outstanding = Some((
+                                                next_request_id,
+                                                RelayCodexOutstandingRpc::ThreadListForResume {
+                                                    thread_id: expected,
+                                                    cursor: Some(cursor.clone()),
+                                                },
+                                            ));
+                                            if let Err(error) = transport.send_json(json!({
+                                                "method": "thread/list",
+                                                "id": next_request_id,
+                                                "params": relay_codex_thread_list_params(working_directory, Some(&cursor))
+                                            })) {
+                                                worker_failed!(
+                                                    active_cycle_id.as_deref(),
+                                                    relay_codex_unknown_outstanding_reason(
+                                                        outstanding.as_ref().map(|(_, rpc)| rpc),
+                                                        error,
+                                                    ),
+                                                );
+                                                break;
+                                            }
+                                            next_request_id += 1;
+                                        } else {
+                                            worker_failed!(
+                                                active_cycle_id.as_deref(),
+                                                "Codex 恢复前对话检查失败：未找到所选 Codex 对话。"
+                                                    .into(),
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            RelayCodexOutstandingRpc::ThreadStart => {
+                                outstanding = None;
+                                thread_id = message
+                                    .pointer("/result/thread/id")
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned);
+                                let Some(thread) = thread_id.as_deref() else {
+                                    host.failed(
+                                        &module_id,
+                                        active_cycle_id.as_deref(),
+                                        "Codex thread/start 送达结果未知：匹配响应未返回有效对话 ID。"
+                                            .into(),
+                                    );
+                                    break;
+                                };
+                                if let Err(error) = host.thread_ready(module_id, thread) {
+                                    host.failed(module_id, active_cycle_id.as_deref(), error);
+                                    break;
+                                }
+                                if execution_mode.starts_turn_after_acquisition() {
+                                    if let Some((cycle_id, prompt)) = pending_turn.take() {
+                                        outstanding = Some((
+                                            next_request_id,
+                                            RelayCodexOutstandingRpc::TurnStart {
+                                                cycle_id: cycle_id.clone(),
+                                                thread_id: thread.to_string(),
+                                            },
+                                        ));
+                                        if let Err(error) = transport.send_json(
+                                            json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
+                                        ) {
+                                            host.failed(
+                                                module_id,
+                                                Some(cycle_id.as_str()),
+                                                format!("Codex turn/start 送达结果未知：{error}"),
+                                            );
+                                            break;
+                                        }
+                                        next_request_id += 1;
+                                        final_summary.clear();
+                                    }
+                                }
+                            }
+                            RelayCodexOutstandingRpc::TurnStart {
+                                cycle_id,
+                                thread_id,
+                            } => {
+                                outstanding = None;
+                                let turn_id =
+                                    message.pointer("/result/turn/id").and_then(Value::as_str);
+                                if let Err(error) = host.turn_started(
+                                    &module_id,
+                                    &cycle_id,
+                                    Some(&thread_id),
+                                    turn_id,
+                                ) {
+                                    host.failed(&module_id, Some(cycle_id.as_str()), error);
+                                    break;
+                                }
+                            }
+                            RelayCodexOutstandingRpc::ThreadResume {
+                                thread_id: expected,
+                            } => {
+                                let actual =
+                                    message.pointer("/result/thread/id").and_then(Value::as_str);
+                                if actual != Some(expected.as_str()) {
+                                    worker_failed!(
+                                        active_cycle_id.as_deref(),
+                                        "Codex thread/resume 送达结果未知：匹配响应未返回预期对话 ID。"
+                                            .into(),
+                                    );
+                                    break;
+                                }
+                                thread_id = Some(expected);
+                                if let Some(thread) = thread_id.as_deref() {
+                                    let kind = execution_mode
+                                        .acquisition_kind()
+                                        .expect("thread/resume must have an acquisition kind");
+                                    if let Err(error) =
+                                        host.thread_acquired(module_id, thread, kind)
+                                    {
+                                        worker_failed!(active_cycle_id.as_deref(), error);
+                                        break;
+                                    }
+                                }
+                                acquisition_pending = false;
+                                if execution_mode.starts_turn_after_acquisition() {
+                                    if let Some((cycle_id, prompt)) = pending_turn.take() {
+                                        outstanding = Some((
+                                            next_request_id,
+                                            RelayCodexOutstandingRpc::TurnStart {
+                                                cycle_id: cycle_id.clone(),
+                                                thread_id: thread_id
+                                                    .clone()
+                                                    .expect("confirmed resume"),
+                                            },
+                                        ));
+                                        if let Err(error) = transport.send_json(json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread_id, "input": [{ "type": "text", "text": prompt }] } })) {
+                                        host.failed(module_id, Some(cycle_id.as_str()), format!("Codex turn/start 送达结果未知：{error}"));
+                                        break;
+                                    }
+                                        next_request_id += 1;
+                                        final_summary.clear();
+                                    }
+                                }
+                            }
+                        },
                     }
-                    Some(_) => {}
-                    None => {}
                 }
                 if message.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
                 {
@@ -2078,96 +6003,457 @@ fn relay_codex_worker(
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
                     if status == "completed" {
-                        relay_codex_turn_completed(&app, &module_id, final_summary.trim());
+                        if let Some(cycle_id) = active_cycle_id.take() {
+                            turn_active.store(false, Ordering::SeqCst);
+                            host.turn_completed(&module_id, &cycle_id, final_summary.trim());
+                        } else {
+                            host.failed(
+                                &module_id,
+                                None,
+                                "Codex 回合完成事件没有对应的通讯循环。".into(),
+                            );
+                        }
                     } else {
-                        relay_codex_failed(
-                            &app,
+                        turn_active.store(false, Ordering::SeqCst);
+                        host.failed(
                             &module_id,
+                            active_cycle_id.as_deref(),
                             format!("Codex 回合以 `{status}` 结束。"),
                         );
+                        active_cycle_id = None;
                     }
                 }
             }
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    turn_active.store(false, Ordering::SeqCst);
+    release_acknowledgement
 }
 
-fn relay_codex_thread_ready(app: &AppHandle, module_id: &str, thread_id: &str) {
+fn relay_codex_thread_ready(
+    app: &AppHandle,
+    module_id: &str,
+    thread_id: &str,
+    working_directory: &str,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
-    if let Ok(connection) = state.connection.lock() {
-        let _ = connection.execute("UPDATE relay_modules SET codex_thread_id = ?2, phase = 'CODEX_RUNNING', updated_at = ?3 WHERE id = ?1", params![module_id, thread_id, Utc::now().to_rfc3339()]);
-        let _ = append_relay_event(
-            &connection,
-            module_id,
-            "CODEX_THREAD_STARTED",
-            "已创建中间件持有的 Codex 对话。",
-        );
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    confirm_relay_codex_new_thread_start_in(&connection, module_id, thread_id, working_directory)
+}
+
+fn confirm_relay_codex_new_thread_start_in(
+    connection: &Connection,
+    module_id: &str,
+    thread_id: &str,
+    working_directory: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 对话确认事务：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE relay_modules
+             SET codex_thread_id = ?2, codex_recovery_reason = NULL, updated_at = ?3
+             WHERE id = ?1 AND resume_thread_id IS NULL",
+            params![module_id, thread_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法保存新 Codex 对话 ID：{error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO relay_codex_threads (
+                thread_id, working_directory, state, owner_module_id, last_module_id,
+                reservation_previous_state, updated_at
+             ) VALUES (?1, ?2, 'ACTIVE', ?3, ?3, NULL, ?4)
+             ON CONFLICT(thread_id) DO UPDATE SET
+                working_directory = excluded.working_directory,
+                state = 'ACTIVE', owner_module_id = excluded.owner_module_id,
+                last_module_id = excluded.last_module_id,
+                reservation_previous_state = NULL, updated_at = excluded.updated_at",
+            params![
+                thread_id,
+                working_directory,
+                module_id,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| format!("无法登记新 Codex 对话：{error}"))?;
+    append_relay_event(
+        &transaction,
+        module_id,
+        "CODEX_THREAD_STARTED",
+        "已创建中间件持有的 Codex 对话。",
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 对话确认：{error}"))?;
+    Ok(())
+}
+
+fn confirm_relay_codex_thread_acquisition_in(
+    connection: &Connection,
+    module_id: &str,
+    thread_id: &str,
+    kind: RelayCodexAcquisitionKind,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始确认 Codex 对话获取事务：{error}"))?;
+    let module = get_relay_module(&transaction, module_id)?
+        .ok_or_else(|| "传话模块不存在，不能确认 Codex 对话获取。".to_string())?;
+    let record = get_relay_codex_thread(&transaction, thread_id)?
+        .ok_or_else(|| "所选 Codex 对话登记已不存在，不能确认获取。".to_string())?;
+    let valid = match kind {
+        RelayCodexAcquisitionKind::ReservedResume => {
+            record.state == RelayCodexThreadState::Reserved
+                && record.owner_module_id.as_deref() == Some(module_id)
+        }
+        RelayCodexAcquisitionKind::ReacquireUnavailable => {
+            record.state == RelayCodexThreadState::Unavailable
+                && record.owner_module_id.is_none()
+                && record.last_module_id.as_deref() == Some(module_id)
+        }
+        RelayCodexAcquisitionKind::ResumeKnownActive => {
+            record.state == RelayCodexThreadState::Active
+                && record.owner_module_id.as_deref() == Some(module_id)
+                && module.codex_thread_id.as_deref() == Some(thread_id)
+        }
+    };
+    if !valid {
+        return Err("所选 Codex 对话登记不再满足当前恢复获取条件。".into());
     }
-    let _ = app.emit(
-        "relay-codex-status",
-        json!({ "phase": "CODEX_RUNNING", "moduleId": module_id, "threadId": thread_id }),
-    );
+    let now = Utc::now().to_rfc3339();
+    match kind {
+        RelayCodexAcquisitionKind::ReservedResume => {
+            transaction
+                .execute(
+                    "UPDATE relay_codex_threads
+                     SET state = 'ACTIVE', owner_module_id = ?2, last_module_id = ?2,
+                         reservation_previous_state = NULL, updated_at = ?3
+                     WHERE thread_id = ?1 AND state = 'RESERVED' AND owner_module_id = ?2",
+                    params![thread_id, module_id, now],
+                )
+                .map_err(|error| format!("无法确认继续 Codex 对话：{error}"))?;
+        }
+        RelayCodexAcquisitionKind::ReacquireUnavailable => {
+            transaction
+                .execute(
+                    "UPDATE relay_codex_threads
+                     SET state = 'ACTIVE', owner_module_id = ?2, last_module_id = ?2,
+                         reservation_previous_state = NULL, updated_at = ?3
+                     WHERE thread_id = ?1 AND state = 'UNAVAILABLE' AND owner_module_id IS NULL
+                       AND last_module_id = ?2",
+                    params![thread_id, module_id, now],
+                )
+                .map_err(|error| format!("无法重新获取 Codex 对话：{error}"))?;
+        }
+        RelayCodexAcquisitionKind::ResumeKnownActive => {}
+    }
+    let clear_recovery = !matches!(kind, RelayCodexAcquisitionKind::ReacquireUnavailable);
+    transaction
+        .execute(
+            "UPDATE relay_modules
+             SET codex_thread_id = ?2,
+                 codex_recovery_reason = CASE WHEN ?3 THEN NULL ELSE codex_recovery_reason END,
+                 updated_at = ?4
+             WHERE id = ?1",
+            params![
+                module_id,
+                thread_id,
+                clear_recovery,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| format!("无法保存获取的 Codex 对话：{error}"))?;
+    if matches!(kind, RelayCodexAcquisitionKind::ReacquireUnavailable)
+        && module.codex_recovery_reason.as_deref() == Some("THREAD_REACQUIRE_REQUIRED")
+    {
+        let unresolved: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM relay_codex_cycles
+                 WHERE module_id = ?1
+                   AND (
+                     status IN ('CODEX_RUNNING', 'WAITING_TO_SEND_CODEX')
+                     OR (status = 'FAILED' AND error_text LIKE 'APP_RESTART_INTERRUPTED%')
+                   )",
+                [module_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("无法检查 Codex 对话恢复循环：{error}"))?;
+        if unresolved == 0 {
+            let previous_phase: Option<String> = transaction
+                .query_row(
+                    "SELECT codex_recovery_previous_phase FROM relay_modules WHERE id = ?1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("无法读取 Codex 对话恢复来源：{error}"))?;
+            if let Some(previous_phase) = previous_phase {
+                transaction
+                    .execute(
+                        "UPDATE relay_modules
+                         SET phase = ?2, codex_recovery_reason = NULL,
+                             codex_recovery_previous_phase = NULL, updated_at = ?3
+                         WHERE id = ?1 AND phase = 'RECOVERY_REQUIRED'",
+                        params![module_id, previous_phase, Utc::now().to_rfc3339()],
+                    )
+                    .map_err(|error| format!("无法恢复 Codex 对话重启前模块状态：{error}"))?;
+            }
+        }
+    }
+    let event = match kind {
+        RelayCodexAcquisitionKind::ReservedResume
+        | RelayCodexAcquisitionKind::ResumeKnownActive => "CODEX_THREAD_RESUMED",
+        RelayCodexAcquisitionKind::ReacquireUnavailable => "CODEX_THREAD_REACQUIRED",
+    };
+    append_relay_event(
+        &transaction,
+        module_id,
+        event,
+        "已确认获取所选 Codex 对话。",
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 对话获取确认：{error}"))?;
+    Ok(())
 }
 
-fn relay_codex_turn_completed(app: &AppHandle, module_id: &str, summary: &str) {
+fn relay_codex_thread_acquired(
+    app: &AppHandle,
+    module_id: &str,
+    thread_id: &str,
+    kind: RelayCodexAcquisitionKind,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let result = (|| -> Result<(), String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    confirm_relay_codex_thread_acquisition_in(&connection, module_id, thread_id, kind)
+}
+
+fn relay_codex_execution_mode_for_new_session(
+    module: &RelayModuleRecord,
+) -> Result<RelayCodexExecutionMode, String> {
+    match (
+        module.resume_thread_id.as_deref(),
+        module.codex_thread_id.as_deref(),
+    ) {
+        (None, _) => Ok(RelayCodexExecutionMode::NewThenTurn),
+        (Some(thread_id), None) => Ok(RelayCodexExecutionMode::ResumeReservedThenTurn {
+            thread_id: thread_id.to_string(),
+        }),
+        (Some(_), Some(_)) => {
+            Err("已获取的 Codex 对话没有当前进程的 live worker，未自动重新恢复。".into())
+        }
+    }
+}
+
+fn verify_relay_codex_thread_ownership_for_turn_in(
+    connection: &Connection,
+    module: &RelayModuleRecord,
+) -> Result<(), String> {
+    let Some(thread_id) = module.resume_thread_id.as_deref() else {
+        return Ok(());
+    };
+    let record = get_relay_codex_thread(connection, thread_id)?;
+    let owned_for_turn = match module.codex_thread_id.as_deref() {
+        None => record.is_some_and(|record| {
+            record.state == RelayCodexThreadState::Reserved
+                && record.owner_module_id.as_deref() == Some(module.id.as_str())
+        }),
+        Some(codex_thread_id) if codex_thread_id == thread_id => record.is_some_and(|record| {
+            record.state == RelayCodexThreadState::Active
+                && record.owner_module_id.as_deref() == Some(module.id.as_str())
+        }),
+        Some(_) => false,
+    };
+    if owned_for_turn {
+        return Ok(());
+    }
+    set_relay_phase(connection, &module.id, "RECOVERY_REQUIRED")?;
+    set_relay_codex_recovery_reason(
+        connection,
+        &module.id,
+        Some(RelayCodexRecoveryReason::ThreadReacquireRequired),
+    )?;
+    append_relay_event(
+        connection,
+        &module.id,
+        "CODEX_THREAD_REACQUIRE_REQUIRED",
+        "所选 Codex 对话已不再由当前模块保留，未启动 App Server。",
+    )?;
+    Err("所选 Codex 对话已不再由当前模块保留，请重新选择后继续。".into())
+}
+
+fn relay_codex_turn_started(
+    app: &AppHandle,
+    module_id: &str,
+    cycle_id: &str,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    {
         let connection = state
             .connection
             .lock()
             .map_err(|_| "数据库锁已损坏。".to_string())?;
-        let summary = if summary.is_empty() {
-            "Codex 回合已完成，但没有返回文字。"
-        } else {
-            summary
-        };
+        mark_relay_codex_turn_started(&connection, cycle_id, thread_id, turn_id)?;
+    }
+    emit_relay_codex_changed(app, module_id, cycle_id, "CODEX_RUNNING");
+    let _ = app.emit(
+        "relay-codex-status",
+        json!({
+            "phase": "CODEX_RUNNING",
+            "moduleId": module_id,
+            "cycleId": cycle_id,
+            "threadId": thread_id,
+            "turnId": turn_id,
+        }),
+    );
+    Ok(())
+}
+
+fn complete_relay_codex_turn_in(
+    connection: &Connection,
+    module_id: &str,
+    cycle_id: &str,
+    summary: &str,
+) -> Result<RelayCodexTurnCompletion, String> {
+    let summary = if summary.is_empty() {
+        "Codex 回合已完成，但没有返回文字。"
+    } else {
+        summary
+    };
+    let already_received = get_relay_codex_cycle_by_id(connection, cycle_id)?
+        .ok_or_else(|| "Codex 通讯循环不存在。".to_string())?
+        .result_text
+        .is_some();
+    mark_relay_codex_result_received(connection, cycle_id, summary)?;
+    if !already_received {
         append_relay_message(
-            &connection,
+            connection,
             module_id,
             "FROM_CODEX",
             "AUTOMATION",
             summary,
             "DELIVERED",
         )?;
-        append_relay_message(
-            &connection,
-            module_id,
-            "TO_CHATGPT",
-            "AUTOMATION",
-            summary,
-            "QUEUED",
-        )?;
-        set_relay_phase(&connection, module_id, "READY")?;
-        append_relay_event(
-            &connection,
-            module_id,
-            "CODEX_TURN_COMPLETED",
-            "Codex 结果已入 ChatGPT 队列。",
-        )?;
-        Ok(())
+    }
+    let module =
+        get_relay_module(connection, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.stop_after_turn {
+        if !finalize_relay_module_stop_after_turn_in(connection, module_id)? {
+            return Err("终止中的传话模块状态已被并发更新。".into());
+        }
+        return Ok(RelayCodexTurnCompletion::StoppedAfterTurn);
+    }
+    if module.phase == "STOPPED" {
+        return Ok(RelayCodexTurnCompletion::StoppedAfterTurn);
+    }
+    if module.phase == "COMPLETED" {
+        return Err("模块已验收完成，不能回传 Codex 结果。".into());
+    }
+    queue_relay_codex_result_to_chatgpt(connection, cycle_id)?;
+    set_relay_phase(connection, module_id, "READY")?;
+    Ok(RelayCodexTurnCompletion::ReturnedToChatGpt)
+}
+
+fn finish_stopped_relay_codex_runtime(app: AppHandle, module_id: String, cycle_id: String) {
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        let release_result = release_relay_codex_runtime(&app, &module_id);
+        if let Ok(connection) = state.connection.lock() {
+            let _ = match release_result {
+                Ok(()) => persist_relay_codex_thread_release_outcome_in(
+                    &connection,
+                    &module_id,
+                    true,
+                    "模块已终止，当前 Codex 回合结束后已释放 Codex 对话。",
+                ),
+                Err(error) => persist_relay_codex_thread_release_outcome_in(
+                    &connection,
+                    &module_id,
+                    false,
+                    &format!("模块已终止，但 Codex 对话释放失败：{error}"),
+                ),
+            };
+        }
+        emit_relay_codex_changed(&app, &module_id, &cycle_id, "STOPPED");
+        let _ = app.emit(
+            "relay-control",
+            json!({ "type": "MODULE_TERMINATED", "moduleId": module_id }),
+        );
+    });
+}
+
+fn relay_codex_turn_completed(app: &AppHandle, module_id: &str, cycle_id: &str, summary: &str) {
+    let state = app.state::<AppState>();
+    let result = (|| -> Result<RelayCodexTurnCompletion, String> {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        complete_relay_codex_turn_in(&connection, module_id, cycle_id, summary)
     })();
     match result {
-        Ok(()) => {
+        Ok(RelayCodexTurnCompletion::ReturnedToChatGpt) => {
+            emit_relay_codex_changed(app, module_id, cycle_id, "CODEX_COMPLETED");
+            emit_relay_codex_changed(app, module_id, cycle_id, "WAITING_FOR_CHATGPT");
             let _ = app.emit(
                 "relay-codex-status",
-                json!({ "phase": "CODEX_COMPLETED", "moduleId": module_id }),
+                json!({ "phase": "CODEX_COMPLETED", "moduleId": module_id, "cycleId": cycle_id }),
             );
-            let _ = dispatch_next_relay_message(app, &state, module_id);
+            let _ = dispatch_next_relay_message(app, &state);
         }
-        Err(error) => relay_codex_failed(app, module_id, error),
+        Ok(RelayCodexTurnCompletion::StoppedAfterTurn) => {
+            emit_relay_codex_changed(app, module_id, cycle_id, "CODEX_COMPLETED");
+            let _ = app.emit(
+                "relay-codex-status",
+                json!({ "phase": "CODEX_COMPLETED", "moduleId": module_id, "cycleId": cycle_id }),
+            );
+            finish_stopped_relay_codex_runtime(
+                app.clone(),
+                module_id.to_string(),
+                cycle_id.to_string(),
+            );
+        }
+        Err(error) => relay_codex_failed(app, module_id, Some(cycle_id), error),
     }
 }
 
-fn relay_codex_failed(app: &AppHandle, module_id: &str, reason: String) {
+fn relay_codex_failed(app: &AppHandle, module_id: &str, cycle_id: Option<&str>, reason: String) {
     let state = app.state::<AppState>();
+    let mut stopped_after_turn = false;
     if let Ok(connection) = state.connection.lock() {
-        let _ = set_relay_phase(&connection, module_id, "BLOCKED");
+        if let Some(cycle_id) = cycle_id {
+            let _ = fail_relay_codex_cycle(&connection, cycle_id, &reason);
+            emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
+        }
+        let stop_requested = get_relay_module(&connection, module_id)
+            .ok()
+            .flatten()
+            .is_some_and(|module| module.stop_after_turn);
+        if stop_requested {
+            stopped_after_turn =
+                finalize_relay_module_stop_after_turn_in(&connection, module_id).unwrap_or(false);
+        } else {
+            let _ = set_relay_phase(&connection, module_id, "BLOCKED");
+        }
         let _ = append_relay_event(&connection, module_id, "CODEX_FAILED", &reason);
     }
-    if let Ok(mut session) = state.relay_codex.lock() {
-        *session = None;
+    if !stopped_after_turn {
+        clear_relay_codex_session_if_matches(&state.relay_codex, module_id);
+    } else {
+        mark_relay_codex_session_turn_inactive(&state.relay_codex, module_id);
+        finish_stopped_relay_codex_runtime(
+            app.clone(),
+            module_id.to_string(),
+            cycle_id.unwrap_or_default().to_string(),
+        );
     }
     let _ = app.emit(
         "relay-control",
@@ -2341,6 +6627,237 @@ fn send_rpc(stdin: &mut impl Write, message: Value) -> Result<(), String> {
     stdin
         .flush()
         .map_err(|error| format!("could not flush App Server request: {error}"))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCodexThreadCandidate {
+    thread_id: String,
+    name: Option<String>,
+    source: String,
+    status: String,
+    branch: Option<String>,
+    recency_at: Option<i64>,
+    selectable: bool,
+    disabled_reason: Option<String>,
+}
+
+const RELAY_CODEX_THREAD_ACTIVE_REASON: &str = "当前正在运行，暂不可选择";
+const RELAY_CODEX_THREAD_SYSTEM_ERROR_REASON: &str =
+    "Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。";
+const RELAY_CODEX_THREAD_REGISTRY_REASON: &str = "该 Codex 对话当前由本地传话模块占用或待恢复。";
+
+fn relay_codex_thread_status(thread: &Value) -> Option<&str> {
+    thread
+        .pointer("/status/type")
+        .and_then(Value::as_str)
+        .or_else(|| thread.get("status").and_then(Value::as_str))
+}
+
+fn relay_codex_thread_candidate_from_value(
+    thread: &Value,
+    working_directory: &str,
+    registry: &[RelayCodexThreadRecord],
+) -> Option<RelayCodexThreadCandidate> {
+    let thread_id = thread.get("id")?.as_str()?.to_string();
+    if thread.get("cwd").and_then(Value::as_str)? != working_directory {
+        return None;
+    }
+    let source = thread.get("source")?.as_str()?.to_string();
+    if !matches!(source.as_str(), "cli" | "vscode" | "appServer") {
+        return None;
+    }
+    let status = relay_codex_thread_status(thread)?.to_string();
+    let registry_blocked = registry.iter().any(|record| {
+        record.thread_id == thread_id
+            && matches!(
+                record.state,
+                RelayCodexThreadState::Reserved
+                    | RelayCodexThreadState::Active
+                    | RelayCodexThreadState::Unavailable
+            )
+    });
+    let disabled_reason = if registry_blocked {
+        Some(RELAY_CODEX_THREAD_REGISTRY_REASON.to_string())
+    } else {
+        match status.as_str() {
+            "idle" | "notLoaded" => None,
+            "active" => Some(RELAY_CODEX_THREAD_ACTIVE_REASON.to_string()),
+            "systemError" => Some(RELAY_CODEX_THREAD_SYSTEM_ERROR_REASON.to_string()),
+            _ => Some("Codex 对话当前状态暂不可选择；请刷新后重试。".to_string()),
+        }
+    };
+    Some(RelayCodexThreadCandidate {
+        thread_id,
+        name: thread
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        source,
+        status,
+        branch: thread
+            .pointer("/gitInfo/branch")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        recency_at: thread
+            .get("recencyAt")
+            .and_then(Value::as_i64)
+            .or_else(|| thread.get("updatedAt").and_then(Value::as_i64)),
+        selectable: disabled_reason.is_none(),
+        disabled_reason,
+    })
+}
+
+fn read_relay_codex_rpc_response(
+    source: &mut impl BufRead,
+    request_id: i64,
+) -> Result<Value, String> {
+    for line in source.lines() {
+        let line = line.map_err(|error| format!("无法读取 Codex 对话列表：{error}"))?;
+        let message: Value = serde_json::from_str(&line)
+            .map_err(|error| format!("Codex 对话列表不是 JSON：{error}"))?;
+        if message.get("id").and_then(Value::as_i64) != Some(request_id) {
+            continue;
+        }
+        if let Some(error) = message.get("error") {
+            let detail = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            return Err(format!("Codex 对话列表请求失败：{detail}"));
+        }
+        return Ok(message);
+    }
+    Err("Codex App Server 在返回对话列表前已关闭。".into())
+}
+
+fn discover_relay_codex_threads_from_json_lines(
+    mut source: impl BufRead,
+    sink: &mut impl Write,
+    working_directory: &str,
+    registry: &[RelayCodexThreadRecord],
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    send_rpc(
+        sink,
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": { "clientInfo": {
+                "name": "chatgpt-codex-middleware",
+                "title": "ChatGPT × Codex Middleware",
+                "version": env!("CARGO_PKG_VERSION")
+            }}
+        }),
+    )?;
+    read_relay_codex_rpc_response(&mut source, 1)?;
+    send_rpc(sink, json!({ "method": "initialized", "params": {} }))?;
+
+    let mut candidates = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut request_id = 2;
+    loop {
+        let mut params = json!({
+            "cwd": working_directory,
+            "archived": false,
+            "sourceKinds": ["cli", "vscode", "appServer"],
+            "sortKey": "recency_at",
+            "sortDirection": "desc"
+        });
+        if let Some(next_cursor) = cursor.as_deref() {
+            params["cursor"] = Value::String(next_cursor.to_string());
+        }
+        send_rpc(
+            sink,
+            json!({ "method": "thread/list", "id": request_id, "params": params }),
+        )?;
+        let response = read_relay_codex_rpc_response(&mut source, request_id)?;
+        let result = response.get("result").unwrap_or(&Value::Null);
+        let threads = result
+            .get("data")
+            .or_else(|| result.get("threads"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Codex 对话列表响应缺少 data。".to_string())?;
+        candidates.extend(threads.iter().filter_map(|thread| {
+            relay_codex_thread_candidate_from_value(thread, working_directory, registry)
+        }));
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+        request_id += 1;
+    }
+    Ok(candidates)
+}
+
+fn discover_relay_codex_threads_for_cwd(
+    working_directory: &str,
+    registry: &[RelayCodexThreadRecord],
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    if !Path::new(working_directory).is_dir() {
+        return Err("所选 Codex 工作目录不存在。".into());
+    }
+    let command = codex_command();
+    let mut child = Command::new(&command)
+        .arg("app-server")
+        .current_dir(working_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("无法启动临时 Codex App Server：{error}"))?;
+    let result = (|| {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "临时 Codex App Server 没有可用输入流。".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "临时 Codex App Server 没有可用输出流。".to_string())?;
+        discover_relay_codex_threads_from_json_lines(
+            BufReader::new(stdout),
+            &mut stdin,
+            working_directory,
+            registry,
+        )
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn discover_relay_codex_threads_for_cwd_guarded(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    working_directory: &str,
+    registry: &[RelayCodexThreadRecord],
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    let runtime = sessions
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+    if runtime.is_some() {
+        return Err("当前已有 Codex 对话运行或被保留，不能同时发现对话。".into());
+    }
+    // Keep the one-runtime guard through temporary App Server shutdown.
+    discover_relay_codex_threads_for_cwd(working_directory, registry)
+}
+
+#[tauri::command]
+fn list_relay_codex_threads_for_cwd(
+    state: State<'_, AppState>,
+    working_directory: String,
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    let working_directory = working_directory.trim().to_string();
+    let registry = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        list_relay_codex_threads(&connection)?
+    };
+    discover_relay_codex_threads_for_cwd_guarded(&state.relay_codex, &working_directory, &registry)
 }
 
 fn process_app_server_turn(
@@ -2941,6 +7458,7 @@ fn handle_orchestration_protocol(app: AppHandle, envelope: ProtocolEnvelope) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     fn input() -> InactiveModuleInput {
         InactiveModuleInput {
@@ -2952,6 +7470,4701 @@ mod tests {
             module_timeout_minutes: 120,
             global_timeout_minutes: 240,
         }
+    }
+
+    fn relay_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(CONVERSATION_RELAY_SCHEMA)
+            .expect("relay schema");
+        connection
+            .execute_batch(CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA)
+            .expect("Codex communication observability schema");
+        apply_existing_codex_thread_resume_schema(&connection)
+            .expect("existing Codex thread resume schema");
+        apply_codex_thread_recovery_provenance_schema(&connection)
+            .expect("Codex thread recovery provenance schema");
+        connection
+    }
+
+    #[test]
+    fn relay_codex_thread_migration_is_gated_and_backfills_conservatively() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(CONVERSATION_RELAY_SCHEMA)
+            .expect("relay schema");
+        connection
+            .execute_batch(CODEX_COMMUNICATION_OBSERVABILITY_SCHEMA)
+            .expect("Codex communication observability schema");
+
+        for (id, phase, thread_id) in [
+            ("released", "COMPLETED", "thread-released"),
+            ("running", "CODEX_RUNNING", "thread-running"),
+            ("failed-release", "STOPPED", "thread-failed-release"),
+            ("duplicate-one", "COMPLETED", "thread-duplicate"),
+            ("duplicate-two", "STOPPED", "thread-duplicate"),
+        ] {
+            connection.execute(
+                "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, codex_thread_id, invalid_reply_count, started_cycles, created_at, updated_at)
+                 VALUES (?1, ?1, 'G:\\workspace', 12, 240, 'retry', ?2, ?3, 0, 0, '2026-08-17T00:00:00Z', ?1)",
+                params![id, phase, thread_id],
+            ).expect("legacy module");
+        }
+        for (module_id, event_type, created_at) in [
+            ("released", "CODEX_THREAD_RELEASED", "2026-08-17T01:00:00Z"),
+            (
+                "failed-release",
+                "CODEX_THREAD_RELEASED",
+                "2026-08-17T01:00:00Z",
+            ),
+            (
+                "failed-release",
+                "CODEX_THREAD_RELEASE_FAILED",
+                "2026-08-17T02:00:00Z",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO relay_events (id, module_id, event_type, detail, created_at)
+                 VALUES (?1, ?2, ?3, 'legacy audit', ?4)",
+                    params![
+                        format!("event-{module_id}-{event_type}"),
+                        module_id,
+                        event_type,
+                        created_at
+                    ],
+                )
+                .expect("legacy event");
+        }
+
+        apply_existing_codex_thread_resume_schema(&connection).expect("apply migration");
+        apply_existing_codex_thread_resume_schema(&connection).expect("migration is idempotent");
+
+        let state_for = |thread_id: &str| -> String {
+            connection
+                .query_row(
+                    "SELECT state FROM relay_codex_threads WHERE thread_id = ?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .expect("registry state")
+        };
+        assert_eq!(state_for("thread-released"), "RELEASED");
+        assert_eq!(state_for("thread-running"), "UNAVAILABLE");
+        assert_eq!(state_for("thread-failed-release"), "UNAVAILABLE");
+        assert_eq!(state_for("thread-duplicate"), "UNAVAILABLE");
+        assert_eq!(connection.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = '006_existing_codex_thread_resume'",
+            [],
+            |row| row.get(0),
+        ).expect("migration row"), 1);
+    }
+
+    #[test]
+    fn relay_codex_thread_registry_enforces_owner_and_reservation_provenance() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "owner-a", "所有者 A");
+        insert_relay_module(&connection, "owner-b", "所有者 B");
+
+        let reserved = RelayCodexThreadRecord {
+            thread_id: "thread-a".into(),
+            working_directory: r"G:\workspace".into(),
+            state: RelayCodexThreadState::Reserved,
+            owner_module_id: Some("owner-a".into()),
+            last_module_id: Some("owner-a".into()),
+            reservation_previous_state: Some("NONE".into()),
+            updated_at: "2026-08-17T00:00:00Z".into(),
+        };
+        upsert_relay_codex_thread(&connection, &reserved).expect("reserve no-row thread");
+        assert_eq!(
+            get_relay_codex_thread(&connection, "thread-a")
+                .expect("read registry")
+                .expect("thread row")
+                .reservation_previous_state
+                .as_deref(),
+            Some("NONE")
+        );
+
+        let second_reservation = RelayCodexThreadRecord {
+            thread_id: "thread-b".into(),
+            state: RelayCodexThreadState::Reserved,
+            owner_module_id: Some("owner-a".into()),
+            ..reserved.clone()
+        };
+        assert!(upsert_relay_codex_thread(&connection, &second_reservation).is_err());
+        assert!(connection.execute(
+            "INSERT INTO relay_codex_threads (thread_id, working_directory, state, owner_module_id, updated_at)
+             VALUES ('bad-release', 'G:\\workspace', 'RELEASED', 'owner-b', '2026-08-17T00:00:00Z')",
+            [],
+        ).is_err());
+    }
+
+    #[test]
+    fn relay_codex_cycle_accounting_starts_only_after_confirmed_turn() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "保持原始提示词")
+            .expect("persist pending cycle");
+        let before: (i64, Option<String>) = connection
+            .query_row(
+                "SELECT started_cycles, module_started_at FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("module before confirmation");
+        assert_eq!(before, (0, None));
+        mark_relay_codex_turn_starting_in(&connection, "module-a").expect("rpc write pending");
+        let still_pending: (i64, Option<String>) = connection
+            .query_row(
+                "SELECT started_cycles, module_started_at FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("module after rpc write");
+        assert_eq!(still_pending, (0, None));
+        set_relay_codex_pending_cycle_error(&connection, &cycle.id, "等待恢复")
+            .expect("persist P1 block reason");
+
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("confirmed turn start");
+        let after: (i64, Option<String>, String) = connection
+            .query_row(
+                "SELECT started_cycles, module_started_at, phase FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after confirmation");
+        assert_eq!(after.0, 1);
+        assert!(after.1.is_some());
+        assert_eq!(after.2, "CODEX_RUNNING");
+    }
+
+    #[test]
+    fn relay_codex_thread_target_rejects_blank_existing_id() {
+        let invalid = RelayModuleInput {
+            name: "模块".into(),
+            working_directory: r"G:\workspace".into(),
+            max_cycles: 1,
+            max_runtime_minutes: 1,
+            retry_template: "retry".into(),
+            codex_thread_target: RelayCodexThreadTargetInput::Existing {
+                thread_id: "  ".into(),
+            },
+        };
+        assert!(validate_relay_module(&invalid).is_err());
+        assert!(matches!(
+            RelayCodexThreadTargetInput::default(),
+            RelayCodexThreadTargetInput::New
+        ));
+    }
+
+    #[test]
+    fn relay_codex_thread_discovery_is_paginated_metadata_only_and_read_only() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "owner", "所有者");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "reserved".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("owner".into()),
+                last_module_id: Some("owner".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: "2026-08-24T00:00:00Z".into(),
+            },
+        )
+        .expect("persist registry blocker");
+        let script = concat!(
+            "{\"id\":1,\"result\":{}}\n",
+            "{\"id\":2,\"result\":{\"data\":[",
+            "{\"id\":\"idle\",\"cwd\":\"G:\\\\workspace\",\"name\":null,\"source\":\"cli\",\"status\":{\"type\":\"idle\"},\"recencyAt\":1724464800,\"updatedAt\":1724461200,\"preview\":\"must not escape\"},",
+            "{\"id\":\"active\",\"cwd\":\"G:\\\\workspace\",\"name\":\"active\",\"source\":\"vscode\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"recencyAt\":null,\"updatedAt\":1724457600},",
+            "{\"id\":\"wrong-cwd\",\"cwd\":\"G:\\\\other\",\"source\":\"cli\",\"status\":{\"type\":\"idle\"}}],\"nextCursor\":\"page-2\"}}\n",
+            "{\"id\":3,\"result\":{\"data\":[",
+            "{\"id\":\"system\",\"cwd\":\"G:\\\\workspace\",\"source\":\"appServer\",\"status\":{\"type\":\"systemError\"}},",
+            "{\"id\":\"reserved\",\"cwd\":\"G:\\\\workspace\",\"source\":\"cli\",\"status\":{\"type\":\"idle\"}},",
+            "{\"id\":\"unsupported\",\"cwd\":\"G:\\\\workspace\",\"source\":\"exec\",\"status\":{\"type\":\"idle\"}}]}}\n"
+        );
+        let mut output = Vec::new();
+        let candidates = discover_relay_codex_threads_from_json_lines(
+            std::io::Cursor::new(script.as_bytes()),
+            &mut output,
+            r"G:\workspace",
+            &list_relay_codex_threads(&connection).expect("registry"),
+        )
+        .expect("discovery");
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates
+            .iter()
+            .any(|item| item.thread_id == "idle" && item.selectable));
+        assert!(candidates.iter().any(|item| item.thread_id == "active"
+            && item.disabled_reason.as_deref() == Some("当前正在运行，暂不可选择")));
+        assert!(candidates.iter().any(|item| item.thread_id == "system"
+            && item.disabled_reason.as_deref()
+                == Some("Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。")));
+        assert!(candidates
+            .iter()
+            .any(|item| item.thread_id == "reserved" && !item.selectable));
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|item| item.thread_id == "idle")
+                .and_then(|item| item.recency_at),
+            Some(1724464800)
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|item| item.thread_id == "active")
+                .and_then(|item| item.recency_at),
+            Some(1724457600)
+        );
+        let frames = String::from_utf8(output).expect("JSON lines");
+        assert!(frames.contains("\"method\":\"thread/list\""));
+        assert!(frames.contains("\"sourceKinds\":[\"cli\",\"vscode\",\"appServer\"]"));
+        assert!(frames.contains("\"sortKey\":\"recency_at\""));
+        assert!(frames.contains("\"cursor\":\"page-2\""));
+        assert!(!frames.contains("thread/read"));
+        assert!(!frames.contains("thread/resume"));
+        assert!(!frames.contains("thread/start"));
+        assert!(!frames.contains("turn/start"));
+    }
+
+    #[test]
+    fn relay_codex_worker_requires_matching_rpc_success_before_confirming_turn_start() {
+        let request_id = 9;
+        assert_eq!(
+            classify_relay_codex_rpc_response(
+                &json!({ "method": "item/agentMessage/delta", "params": { "delta": "ignored" } }),
+                request_id,
+            ),
+            RelayCodexRpcOutcome::Unrelated
+        );
+        assert_eq!(
+            classify_relay_codex_rpc_response(
+                &json!({ "id": 8, "result": { "turn": { "id": "wrong" } } }),
+                request_id,
+            ),
+            RelayCodexRpcOutcome::Unrelated
+        );
+        assert_eq!(
+            classify_relay_codex_rpc_response(
+                &json!({ "id": request_id, "error": { "message": "denied" } }),
+                request_id,
+            ),
+            RelayCodexRpcOutcome::MatchingExplicitError("denied".into())
+        );
+        assert_eq!(
+            classify_relay_codex_rpc_response(
+                &json!({ "id": request_id, "result": { "turn": { "id": "turn-a" } } }),
+                request_id,
+            ),
+            RelayCodexRpcOutcome::MatchingSuccess
+        );
+    }
+
+    #[test]
+    fn relay_codex_transport_events_keep_protocol_and_close_failures_distinct() {
+        assert!(matches!(
+            RelayCodexTransportEvent::ProtocolError("bad JSON".into()),
+            RelayCodexTransportEvent::ProtocolError(_)
+        ));
+        assert!(matches!(
+            RelayCodexTransportEvent::Closed("EOF".into()),
+            RelayCodexTransportEvent::Closed(_)
+        ));
+    }
+
+    #[derive(Default)]
+    struct TestRelayCodexWorkerHost {
+        callbacks: Vec<String>,
+        start_turn_after_acquire: Option<std_mpsc::Sender<RelayCodexCommand>>,
+        release_after_acquire: Option<(
+            std_mpsc::Sender<RelayCodexCommand>,
+            std_mpsc::Sender<Result<(), String>>,
+        )>,
+        turn_sender: Option<std_mpsc::Sender<RelayCodexCommand>>,
+        follow_up_turns_after_completion: VecDeque<(String, String)>,
+        release_after_completion: Option<(
+            std_mpsc::Sender<RelayCodexCommand>,
+            std_mpsc::Sender<Result<(), String>>,
+        )>,
+    }
+
+    struct ScriptedRelayCodexTransport {
+        events: VecDeque<RelayCodexTransportEvent>,
+        sent: Vec<Value>,
+        send_results: VecDeque<Result<(), String>>,
+    }
+
+    impl RelayCodexTransport for ScriptedRelayCodexTransport {
+        fn send_json(&mut self, value: Value) -> Result<(), String> {
+            self.sent.push(value);
+            self.send_results.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn recv_event(&mut self, _timeout: std::time::Duration) -> RelayCodexTransportEvent {
+            self.events
+                .pop_front()
+                .unwrap_or(RelayCodexTransportEvent::Closed("script exhausted".into()))
+        }
+    }
+
+    impl RelayCodexWorkerHost for TestRelayCodexWorkerHost {
+        fn thread_ready(&mut self, module_id: &str, thread_id: &str) -> Result<(), String> {
+            self.callbacks
+                .push(format!("thread_ready:{module_id}:{thread_id}"));
+            Ok(())
+        }
+
+        fn thread_acquired(
+            &mut self,
+            module_id: &str,
+            thread_id: &str,
+            kind: RelayCodexAcquisitionKind,
+        ) -> Result<(), String> {
+            self.callbacks
+                .push(format!("thread_acquired:{kind:?}:{module_id}:{thread_id}"));
+            if let Some(sender) = self.start_turn_after_acquire.take() {
+                sender
+                    .send(RelayCodexCommand::StartTurn {
+                        cycle_id: "cycle-a".into(),
+                        prompt: "继续任务".into(),
+                    })
+                    .expect("inject follow-up turn");
+            }
+            if let Some((sender, acknowledgement)) = self.release_after_acquire.take() {
+                sender
+                    .send(RelayCodexCommand::Release { acknowledgement })
+                    .expect("inject idle release");
+            }
+            Ok(())
+        }
+
+        fn turn_started(
+            &mut self,
+            module_id: &str,
+            cycle_id: &str,
+            thread_id: Option<&str>,
+            turn_id: Option<&str>,
+        ) -> Result<(), String> {
+            self.callbacks.push(format!(
+                "turn_started:{module_id}:{cycle_id}:{}:{}",
+                thread_id.unwrap_or_default(),
+                turn_id.unwrap_or_default()
+            ));
+            Ok(())
+        }
+
+        fn turn_completed(&mut self, module_id: &str, cycle_id: &str, summary: &str) {
+            self.callbacks
+                .push(format!("turn_completed:{module_id}:{cycle_id}:{summary}"));
+            if let Some((cycle_id, prompt)) = self.follow_up_turns_after_completion.pop_front() {
+                self.turn_sender
+                    .as_ref()
+                    .expect("follow-up turn sender")
+                    .send(RelayCodexCommand::StartTurn { cycle_id, prompt })
+                    .expect("inject follow-up turn after completion");
+            } else if let Some((sender, acknowledgement)) = self.release_after_completion.take() {
+                sender
+                    .send(RelayCodexCommand::Release { acknowledgement })
+                    .expect("release completed worker");
+            }
+        }
+
+        fn failed(&mut self, module_id: &str, cycle_id: Option<&str>, reason: String) {
+            self.callbacks.push(format!(
+                "failed:{module_id}:{}:{reason}",
+                cycle_id.unwrap_or_default()
+            ));
+        }
+
+        fn recovery_acquisition_failed(
+            &mut self,
+            module_id: &str,
+            origin_recovery_reason: &str,
+            detail: String,
+        ) {
+            self.callbacks.push(format!(
+                "reacquire_failed:{module_id}:{origin_recovery_reason}:{detail}"
+            ));
+        }
+    }
+
+    #[test]
+    fn relay_codex_worker_host_records_domain_callbacks() {
+        let mut host = TestRelayCodexWorkerHost::default();
+        host.thread_ready("module-a", "thread-a")
+            .expect("test host accepts thread");
+        host.turn_started("module-a", "cycle-a", Some("thread-a"), Some("turn-a"))
+            .expect("test host accepts start");
+        host.turn_completed("module-a", "cycle-a", "完成");
+        host.failed("module-a", Some("cycle-b"), "失败".into());
+        assert_eq!(
+            host.callbacks,
+            vec![
+                "thread_ready:module-a:thread-a",
+                "turn_started:module-a:cycle-a:thread-a:turn-a",
+                "turn_completed:module-a:cycle-a:完成",
+                "failed:module-a:cycle-b:失败",
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_codex_worker_core_runs_scripted_happy_path() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "完成任务".into(),
+            })
+            .expect("queue initial turn");
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 2, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "turn": { "id": "turn-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({
+                    "method": "item/completed",
+                    "params": { "item": { "type": "agentMessage", "text": "完成" } }
+                })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+                ),
+                RelayCodexTransportEvent::Closed("script complete".into()),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+
+        let acknowledgement = run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::NewThenTurn,
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(acknowledgement.is_none());
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter_map(|frame| frame.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "initialized", "thread/start", "turn/start"]
+        );
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "thread_ready:module-a:thread-a"));
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_started:module-a:cycle-a:thread-a:turn-a"));
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_completed:module-a:cycle-a:完成"));
+    }
+
+    #[test]
+    fn relay_codex_protocol_marks_malformed_or_disconnected_thread_start_unknown_without_retry() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "P1".into(),
+            })
+            .expect("queue P1");
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "thread": {} } })),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::NewThenTurn,
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host.callbacks.iter().any(|callback| callback
+            == "failed:module-a:cycle-a:Codex thread/start 送达结果未知：匹配响应未返回有效对话 ID。"));
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/start"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn relay_codex_protocol_keeps_explicit_thread_start_error_distinct_from_unknown() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "P1".into(),
+            })
+            .expect("queue P1");
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 2, "error": { "message": "denied" } }),
+                ),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::NewThenTurn,
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback
+                == "failed:module-a:cycle-a:Codex thread/start 明确失败：denied"));
+        assert!(!host
+            .callbacks
+            .iter()
+            .any(|callback| callback.contains("送达结果未知")));
+    }
+
+    #[test]
+    fn relay_codex_protocol_arms_thread_start_before_send_failure() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "P1".into(),
+            })
+            .expect("queue P1");
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([RelayCodexTransportEvent::Message(
+                json!({ "id": 1, "result": {} }),
+            )]),
+            sent: Vec::new(),
+            send_results: VecDeque::from([Ok(()), Ok(()), Err("write failed".into())]),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::NewThenTurn,
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host.callbacks.iter().any(|callback| callback
+            == "failed:module-a:cycle-a:Codex thread/start 送达结果未知：write failed"));
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/start"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn relay_new_thread_confirmation_persists_active_owner_before_turn_start() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "新模块");
+        confirm_relay_codex_new_thread_start_in(
+            &connection,
+            "module-a",
+            "thread-a",
+            r"G:\workspace",
+        )
+        .expect("confirm new thread");
+
+        let module = get_relay_module(&connection, "module-a")
+            .expect("read module")
+            .expect("module exists");
+        let thread = get_relay_codex_thread(&connection, "thread-a")
+            .expect("read registry")
+            .expect("registry entry");
+        assert_eq!(module.codex_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(thread.state, RelayCodexThreadState::Active);
+        assert_eq!(thread.owner_module_id.as_deref(), Some("module-a"));
+        assert!(thread.reservation_previous_state.is_none());
+        assert_eq!(module.started_cycles, 0);
+        assert!(module.module_started_at.is_none());
+    }
+
+    #[test]
+    fn relay_existing_multi_cycle_ownership_validation_is_acquisition_aware() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "继续模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set reserved target");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: Some("RELEASED".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed reservation");
+
+        let pre_acquisition = get_relay_module(&connection, "module-a")
+            .expect("read module")
+            .expect("module exists");
+        verify_relay_codex_thread_ownership_for_turn_in(&connection, &pre_acquisition)
+            .expect("reserved target remains valid before first acquisition");
+        assert_eq!(
+            relay_codex_execution_mode_for_new_session(&pre_acquisition),
+            Ok(RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            })
+        );
+
+        confirm_relay_codex_thread_acquisition_in(
+            &connection,
+            "module-a",
+            "thread-a",
+            RelayCodexAcquisitionKind::ReservedResume,
+        )
+        .expect("confirm first acquisition");
+        let acquired = get_relay_module(&connection, "module-a")
+            .expect("read acquired module")
+            .expect("module exists");
+        let registry = get_relay_codex_thread(&connection, "thread-a")
+            .expect("read acquired registry")
+            .expect("registry exists");
+        assert_eq!(acquired.resume_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(acquired.codex_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(registry.state, RelayCodexThreadState::Active);
+        assert_eq!(registry.owner_module_id.as_deref(), Some("module-a"));
+        verify_relay_codex_thread_ownership_for_turn_in(&connection, &acquired)
+            .expect("acquired target remains valid for later cycles");
+        assert!(relay_codex_execution_mode_for_new_session(&acquired).is_err());
+
+        for (number, prompt, turn_id) in [(1, "P1", "turn-1"), (2, "P2", "turn-2")] {
+            let cycle = create_relay_codex_cycle(&connection, "module-a", number, prompt)
+                .expect("create cycle");
+            mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some(turn_id))
+                .expect("confirm turn start");
+            assert_eq!(
+                complete_relay_codex_turn_in(&connection, "module-a", &cycle.id, "完成")
+                    .expect("complete turn"),
+                RelayCodexTurnCompletion::ReturnedToChatGpt
+            );
+        }
+        let started_cycles: i64 = connection
+            .query_row(
+                "SELECT started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read started cycle count");
+        assert_eq!(started_cycles, 2);
+        let third_cycle_validation = get_relay_module(&connection, "module-a")
+            .expect("read module for third cycle")
+            .expect("module exists");
+        verify_relay_codex_thread_ownership_for_turn_in(&connection, &third_cycle_validation)
+            .expect("third cycle remains valid on the acquired thread");
+
+        let wrong_owner = relay_connection();
+        insert_relay_module(&wrong_owner, "module-a", "继续模块");
+        insert_relay_module(&wrong_owner, "module-other", "其他模块");
+        wrong_owner
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-a', codex_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set acquired target");
+        upsert_relay_codex_thread(
+            &wrong_owner,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Active,
+                owner_module_id: Some("module-other".into()),
+                last_module_id: Some("module-other".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed foreign owner");
+        let foreign_module = get_relay_module(&wrong_owner, "module-a")
+            .expect("read foreign module")
+            .expect("module exists");
+        assert!(
+            verify_relay_codex_thread_ownership_for_turn_in(&wrong_owner, &foreign_module).is_err()
+        );
+
+        let mismatch = relay_connection();
+        insert_relay_module(&mismatch, "module-a", "继续模块");
+        mismatch
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-a', codex_thread_id = 'thread-b' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set mismatched targets");
+        let mismatched_module = get_relay_module(&mismatch, "module-a")
+            .expect("read mismatched module")
+            .expect("module exists");
+        assert!(
+            verify_relay_codex_thread_ownership_for_turn_in(&mismatch, &mismatched_module).is_err()
+        );
+    }
+
+    #[test]
+    fn relay_codex_acquisition_confirmation_persists_each_safe_registry_transition() {
+        let cases = [
+            (
+                RelayCodexAcquisitionKind::ReservedResume,
+                RelayCodexThreadState::Reserved,
+                Some("module-a"),
+                Some("module-a"),
+                true,
+            ),
+            (
+                RelayCodexAcquisitionKind::ReacquireUnavailable,
+                RelayCodexThreadState::Unavailable,
+                None,
+                Some("module-a"),
+                true,
+            ),
+            (
+                RelayCodexAcquisitionKind::ReacquireUnavailable,
+                RelayCodexThreadState::Unavailable,
+                None,
+                Some("module-other"),
+                false,
+            ),
+            (
+                RelayCodexAcquisitionKind::ResumeKnownActive,
+                RelayCodexThreadState::Active,
+                Some("module-a"),
+                Some("module-a"),
+                true,
+            ),
+            (
+                RelayCodexAcquisitionKind::ResumeKnownActive,
+                RelayCodexThreadState::Active,
+                Some("module-other"),
+                Some("module-other"),
+                false,
+            ),
+        ];
+
+        for (kind, state, owner, last, allowed) in cases {
+            let connection = relay_connection();
+            insert_relay_module(&connection, "module-a", "恢复模块");
+            insert_relay_module(&connection, "module-other", "其他模块");
+            if matches!(kind, RelayCodexAcquisitionKind::ResumeKnownActive) {
+                connection
+                    .execute(
+                        "UPDATE relay_modules SET codex_thread_id = 'thread-a' WHERE id = 'module-a'",
+                        [],
+                    )
+                    .expect("set known thread");
+            } else {
+                connection
+                    .execute(
+                        "UPDATE relay_modules SET resume_thread_id = 'thread-a' WHERE id = 'module-a'",
+                        [],
+                    )
+                    .expect("set selected thread");
+            }
+            upsert_relay_codex_thread(
+                &connection,
+                &RelayCodexThreadRecord {
+                    thread_id: "thread-a".into(),
+                    working_directory: r"G:\workspace".into(),
+                    state,
+                    owner_module_id: owner.map(str::to_string),
+                    last_module_id: last.map(str::to_string),
+                    reservation_previous_state: (state == RelayCodexThreadState::Reserved)
+                        .then(|| "RELEASED".into()),
+                    updated_at: Utc::now().to_rfc3339(),
+                },
+            )
+            .expect("seed registry");
+
+            let result = confirm_relay_codex_thread_acquisition_in(
+                &connection,
+                "module-a",
+                "thread-a",
+                kind,
+            );
+            assert_eq!(result.is_ok(), allowed, "{kind:?} {state:?}");
+            let record = get_relay_codex_thread(&connection, "thread-a")
+                .expect("read registry")
+                .expect("record remains");
+            if allowed {
+                assert_eq!(record.state, RelayCodexThreadState::Active);
+                assert_eq!(record.owner_module_id.as_deref(), Some("module-a"));
+                assert_eq!(record.last_module_id.as_deref(), Some("module-a"));
+                assert!(record.reservation_previous_state.is_none());
+            } else {
+                assert_eq!(record.state, state);
+                assert_eq!(record.owner_module_id.as_deref(), owner);
+                assert_eq!(record.last_module_id.as_deref(), last);
+            }
+        }
+    }
+
+    #[test]
+    fn relay_codex_reacquire_failure_preserves_its_origin_recovery_reason() {
+        let origins = [
+            "TURN_START_UNKNOWN",
+            "THREAD_RESUME_UNKNOWN",
+            "THREAD_REACQUIRE_REQUIRED",
+        ];
+        let failures = [
+            "Codex 恢复前对话检查发现目标正在运行，暂不可继续。",
+            "Codex thread/resume 明确失败：denied",
+            "Codex thread/resume 送达结果未知：EOF",
+        ];
+        for origin in origins {
+            for failure in failures {
+                let connection = relay_connection();
+                insert_relay_module(&connection, "module-a", "恢复模块");
+                insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None)
+                    .expect("pending cycle");
+                connection
+                    .execute(
+                        "UPDATE relay_modules
+                         SET phase = 'RECOVERY_REQUIRED', codex_recovery_reason = ?1
+                         WHERE id = 'module-a'",
+                        [origin],
+                    )
+                    .expect("seed recovery reason");
+
+                persist_relay_codex_reacquire_failure_in(&connection, "module-a", origin, failure)
+                    .expect("persist reacquire failure");
+
+                let module = get_relay_module(&connection, "module-a")
+                    .expect("read module")
+                    .expect("module exists");
+                assert_eq!(module.codex_recovery_reason.as_deref(), Some(origin));
+                let cycle = list_relay_codex_cycles_in(&connection, "module-a")
+                    .expect("read cycles")
+                    .into_iter()
+                    .find(|cycle| cycle.id == "cycle-a")
+                    .expect("cycle exists");
+                assert_eq!(cycle.status, "WAITING_TO_SEND_CODEX");
+                assert_eq!(cycle.error_text.as_deref(), Some(failure));
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM relay_events
+                             WHERE module_id = 'module-a' AND event_type = 'CODEX_THREAD_REACQUIRE_FAILED'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .expect("event count"),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relay_existing_thread_precheck_blocks_missing_reservation_without_spawning() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "继续模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set selected thread");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("read module")
+            .expect("module exists");
+
+        assert!(verify_relay_codex_thread_ownership_for_turn_in(&connection, &module).is_err());
+        let after = get_relay_module(&connection, "module-a")
+            .expect("read module")
+            .expect("module exists");
+        assert_eq!(after.phase, "RECOVERY_REQUIRED");
+        assert_eq!(
+            after.codex_recovery_reason.as_deref(),
+            Some("THREAD_REACQUIRE_REQUIRED")
+        );
+    }
+
+    #[test]
+    fn relay_existing_thread_core_resumes_reserved_thread_before_starting_turn() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "继续任务".into(),
+            })
+            .expect("queue turn");
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "data": [{
+                        "id": "thread-a", "cwd": "G:\\workspace", "source": "cli",
+                        "status": { "type": "idle" }
+                    }] } })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({ "id": 4, "result": {} })),
+                RelayCodexTransportEvent::Closed("done".into()),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "thread_acquired:ReservedResume:module-a:thread-a"));
+        assert!(transport
+            .sent
+            .iter()
+            .any(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/resume")));
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/start")));
+    }
+
+    #[test]
+    fn relay_existing_multi_cycle_reuses_one_acquired_worker_and_thread() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-1".into(),
+                prompt: "P1".into(),
+            })
+            .expect("queue first turn");
+        let (release_acknowledgement, _release_receiver) = std_mpsc::channel();
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "data": [{
+                    "id": "thread-a", "cwd": "G:\\workspace", "source": "cli",
+                    "status": { "type": "idle" }
+                }] } })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 4, "result": { "turn": { "id": "turn-1" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({
+                    "method": "item/completed",
+                    "params": { "item": { "type": "agentMessage", "text": "完成 1" } }
+                })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+                ),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 5, "result": { "turn": { "id": "turn-2" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({
+                    "method": "item/completed",
+                    "params": { "item": { "type": "agentMessage", "text": "完成 2" } }
+                })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+                ),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 6, "result": { "turn": { "id": "turn-3" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({
+                    "method": "item/completed",
+                    "params": { "item": { "type": "agentMessage", "text": "完成 3" } }
+                })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+                ),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost {
+            turn_sender: Some(sender.clone()),
+            follow_up_turns_after_completion: VecDeque::from([
+                ("cycle-2".into(), "P2".into()),
+                ("cycle-3".into(), "P3".into()),
+            ]),
+            release_after_completion: Some((sender, release_acknowledgement)),
+            ..Default::default()
+        };
+        let turn_active = Arc::new(AtomicBool::new(false));
+        let acknowledgement = run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-1",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        let methods = transport
+            .sent
+            .iter()
+            .filter_map(|frame| frame.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let third_turn_start = methods
+            .iter()
+            .enumerate()
+            .filter(|(_, method)| **method == "turn/start")
+            .nth(2)
+            .expect("third cycle starts a third turn")
+            .0;
+        assert_eq!(
+            methods[..third_turn_start]
+                .iter()
+                .filter(|method| **method == "turn/start")
+                .count(),
+            2,
+            "cycles 1 and 2 only start their own turns"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "thread/resume")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "thread/start")
+                .count(),
+            0
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "turn/start")
+                .count(),
+            3
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "thread/list")
+                .count(),
+            1
+        );
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_completed:module-a:cycle-2:完成 2"));
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_completed:module-a:cycle-3:完成 3"));
+        assert!(acknowledgement.is_some());
+        assert!(!turn_active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn relay_existing_thread_active_preflight_halts_before_resume() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "继续任务".into(),
+            })
+            .expect("queue turn");
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "data": [{
+                    "id": "thread-a", "cwd": "G:\\workspace", "source": "vscode",
+                    "status": { "type": "active", "activeFlags": [] }
+                }] } })),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host.callbacks.iter().any(|callback| callback
+            == "failed:module-a:cycle-a:Codex 恢复前对话检查发现目标正在运行，暂不可继续。"));
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/resume")));
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/start")));
+    }
+
+    #[test]
+    fn relay_existing_thread_preflight_rejects_system_error_missing_wrong_cwd_and_source() {
+        let cases = [
+            json!({ "data": [{ "id": "thread-a", "cwd": "G:\\workspace", "source": "cli", "status": { "type": "systemError" } }] }),
+            json!({ "data": [] }),
+            json!({ "data": [{ "id": "thread-a", "cwd": "G:\\other", "source": "cli", "status": { "type": "idle" } }] }),
+            json!({ "data": [{ "id": "thread-a", "cwd": "G:\\workspace", "source": "exec", "status": { "type": "idle" } }] }),
+        ];
+        for page in cases {
+            assert!(matches!(
+                inspect_relay_codex_resume_page(&page, "thread-a", r"G:\workspace"),
+                Ok((RelayCodexResumePreflight::Invalid(_), _))
+                    | Ok((RelayCodexResumePreflight::Missing, None))
+            ));
+        }
+    }
+
+    #[test]
+    fn relay_existing_thread_preflight_accepts_not_loaded_and_paginates_before_resume() {
+        let first_page = json!({ "data": [], "nextCursor": "page-2" });
+        let second_page = json!({ "data": [{
+            "id": "thread-a", "cwd": "G:\\workspace", "source": "appServer",
+            "status": { "type": "notLoaded" }
+        }] });
+        assert!(matches!(
+            inspect_relay_codex_resume_page(&second_page, "thread-a", r"G:\workspace"),
+            Ok((RelayCodexResumePreflight::Eligible, None))
+        ));
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "继续任务".into(),
+            })
+            .expect("queue turn");
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": first_page })),
+                RelayCodexTransportEvent::Message(json!({ "id": 3, "result": second_page })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 4, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({ "id": 5, "result": {} })),
+                RelayCodexTransportEvent::Closed("done".into()),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/list"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/resume"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn relay_codex_reacquire_only_confirms_thread_without_sending_p1() {
+        let (sender, receiver) = std_mpsc::channel();
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "data": [{
+                    "id": "thread-a", "cwd": "G:\\workspace", "source": "cli",
+                    "status": { "type": "idle" }
+                }] } })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Closed("test complete".into()),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ReacquireOnly {
+                thread_id: "thread-a".into(),
+                origin_recovery_reason: "THREAD_RESUME_UNKNOWN".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "thread_acquired:ReacquireUnavailable:module-a:thread-a"));
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|frame| frame.get("method").and_then(Value::as_str) == Some("turn/start")));
+        assert!(!turn_active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn relay_codex_reacquire_only_starts_one_later_turn_without_reusing_recovery_cycle() {
+        let (sender, receiver) = std_mpsc::channel();
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "data": [{
+                    "id": "thread-a", "cwd": "G:\\workspace", "source": "cli",
+                    "status": { "type": "idle" }
+                }] } })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({ "id": 4, "result": {} })),
+                RelayCodexTransportEvent::Closed("test complete".into()),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost {
+            start_turn_after_acquire: Some(sender),
+            ..Default::default()
+        };
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "recovery-cycle",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ReacquireOnly {
+                thread_id: "thread-a".into(),
+                origin_recovery_reason: "THREAD_RESUME_UNKNOWN".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_started:module-a:cycle-a:thread-a:"));
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("turn/start"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn relay_codex_reacquire_only_allows_idle_release_after_confirmation() {
+        let (sender, receiver) = std_mpsc::channel();
+        let (acknowledgement, acknowledgement_receiver) = std_mpsc::channel();
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "data": [{
+                    "id": "thread-a", "cwd": "G:\\workspace", "source": "cli",
+                    "status": { "type": "idle" }
+                }] } })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost {
+            release_after_acquire: Some((sender, acknowledgement)),
+            ..Default::default()
+        };
+        let turn_active = Arc::new(AtomicBool::new(false));
+        let release = run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "recovery-cycle",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ReacquireOnly {
+                thread_id: "thread-a".into(),
+                origin_recovery_reason: "THREAD_RESUME_UNKNOWN".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(release.is_some());
+        assert!(!turn_active.load(Ordering::SeqCst));
+        release
+            .expect("idle release acknowledgement")
+            .send(Ok(()))
+            .expect("acknowledge release");
+        assert!(acknowledgement_receiver
+            .recv()
+            .expect("receive release result")
+            .is_ok());
+    }
+
+    #[test]
+    fn relay_existing_thread_explicit_resume_failure_retains_every_reservation_provenance() {
+        for previous_state in ["NONE", "RELEASED"] {
+            let connection = relay_connection();
+            insert_relay_module(&connection, "module-a", "继续模块");
+            connection
+                .execute(
+                    "UPDATE relay_modules SET resume_thread_id = 'thread-a' WHERE id = 'module-a'",
+                    [],
+                )
+                .expect("set selected thread");
+            upsert_relay_codex_thread(
+                &connection,
+                &RelayCodexThreadRecord {
+                    thread_id: "thread-a".into(),
+                    working_directory: r"G:\workspace".into(),
+                    state: RelayCodexThreadState::Reserved,
+                    owner_module_id: Some("module-a".into()),
+                    last_module_id: Some("module-a".into()),
+                    reservation_previous_state: Some(previous_state.into()),
+                    updated_at: Utc::now().to_rfc3339(),
+                },
+            )
+            .expect("reserve thread");
+            let cycle =
+                create_relay_codex_cycle(&connection, "module-a", 1, "P1 原文").expect("create P1");
+
+            assert!(persist_relay_codex_start_recovery_in(
+                &connection,
+                "module-a",
+                Some(&cycle.id),
+                "Codex thread/resume 明确失败：denied",
+            )
+            .expect("persist recovery"));
+
+            let thread = get_relay_codex_thread(&connection, "thread-a")
+                .expect("read registry")
+                .expect("reserved row");
+            let module = get_relay_module(&connection, "module-a")
+                .expect("read module")
+                .expect("module");
+            let after_cycle = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+                .expect("read P1")
+                .expect("P1");
+            assert_eq!(thread.state, RelayCodexThreadState::Reserved);
+            assert_eq!(thread.owner_module_id.as_deref(), Some("module-a"));
+            assert_eq!(
+                thread.reservation_previous_state.as_deref(),
+                Some(previous_state)
+            );
+            assert_eq!(module.phase, "RECOVERY_REQUIRED");
+            assert_eq!(module.codex_thread_id, None);
+            assert_eq!(
+                module.codex_recovery_reason.as_deref(),
+                Some("THREAD_RESUME_FAILED")
+            );
+            assert_eq!(after_cycle.status, "WAITING_TO_SEND_CODEX");
+            assert_eq!(after_cycle.prompt_text, "P1 原文");
+        }
+    }
+
+    #[test]
+    fn relay_existing_thread_unknown_resume_marks_registry_unavailable_without_retry() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "继续模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set selected thread");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("reserve thread");
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 1, "P1 原文").expect("create P1");
+
+        assert!(persist_relay_codex_start_recovery_in(
+            &connection,
+            "module-a",
+            Some(&cycle.id),
+            "Codex thread/resume 送达结果未知：EOF",
+        )
+        .expect("persist unknown"));
+        let thread = get_relay_codex_thread(&connection, "thread-a")
+            .expect("read registry")
+            .expect("registry row");
+        assert_eq!(thread.state, RelayCodexThreadState::Unavailable);
+        assert_eq!(thread.owner_module_id, None);
+        assert_eq!(thread.last_module_id.as_deref(), Some("module-a"));
+    }
+
+    #[test]
+    fn relay_codex_recovery_actions_follow_persisted_authorization_matrix() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "恢复模块");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "P1").expect("create P1");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'RECOVERY_REQUIRED', resume_thread_id = 'thread-a',
+                     codex_recovery_reason = 'THREAD_START_UNKNOWN'
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set recovery");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(
+            allowed_relay_codex_recovery_actions_in(
+                &connection,
+                &module,
+                RelayCodexRecoveryRuntimeState::None
+            )
+            .expect("actions"),
+            vec![
+                RelayCodexRecoveryAllowedAction::StartNewThread,
+                RelayCodexRecoveryAllowedAction::SelectExistingThread,
+            ]
+        );
+
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("reserve");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(
+            allowed_relay_codex_recovery_actions_in(
+                &connection,
+                &module,
+                RelayCodexRecoveryRuntimeState::None
+            )
+            .expect("actions"),
+            vec![RelayCodexRecoveryAllowedAction::RetryResume]
+        );
+
+        set_relay_codex_thread_state(
+            &connection,
+            "thread-a",
+            RelayCodexThreadState::Unavailable,
+            None,
+            None,
+        )
+        .expect("unavailable");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_recovery_reason = 'THREAD_RESUME_UNKNOWN' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set unknown");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(
+            allowed_relay_codex_recovery_actions_in(
+                &connection,
+                &module,
+                RelayCodexRecoveryRuntimeState::None
+            )
+            .expect("actions"),
+            vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
+        );
+
+        connection
+            .execute(
+                "UPDATE relay_codex_threads SET state = 'ACTIVE', owner_module_id = 'module-a' WHERE thread_id = 'thread-a'",
+                [],
+            )
+            .expect("activate");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("record acquired");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(
+            allowed_relay_codex_recovery_actions_in(
+                &connection,
+                &module,
+                RelayCodexRecoveryRuntimeState::CurrentIdle
+            )
+            .expect("actions"),
+            vec![RelayCodexRecoveryAllowedAction::RetryTurnStart]
+        );
+        for runtime in [
+            RelayCodexRecoveryRuntimeState::CurrentTurnActive,
+            RelayCodexRecoveryRuntimeState::OtherModule,
+        ] {
+            assert!(
+                allowed_relay_codex_recovery_actions_in(&connection, &module, runtime)
+                    .expect("conflicting runtime has no actions")
+                    .is_empty()
+            );
+        }
+
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_recovery_reason = 'TURN_START_UNKNOWN' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set unsafe turn unknown");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert!(allowed_relay_codex_recovery_actions_in(
+            &connection,
+            &module,
+            RelayCodexRecoveryRuntimeState::CurrentIdle
+        )
+        .expect("actions")
+        .is_empty());
+        assert_eq!(cycle.status, "WAITING_TO_SEND_CODEX");
+    }
+
+    #[test]
+    fn relay_codex_recovery_action_matcher_never_authorizes_a_different_action() {
+        let allowed = vec![RelayCodexRecoveryAllowedAction::ReacquireThread];
+        assert!(relay_codex_recovery_action_is_allowed(
+            &allowed,
+            &RelayCodexRecoveryAction::ReacquireThread
+        ));
+        for denied in [
+            RelayCodexRecoveryAction::RetryResume,
+            RelayCodexRecoveryAction::StartNewThread,
+            RelayCodexRecoveryAction::RetryTurnStart,
+            RelayCodexRecoveryAction::SelectExistingThread {
+                thread_id: "thread-other".into(),
+            },
+        ] {
+            assert!(!relay_codex_recovery_action_is_allowed(&allowed, &denied));
+        }
+    }
+
+    #[test]
+    fn relay_codex_thread_state_summaries_keep_unknown_turn_and_start_distinct() {
+        assert_eq!(
+            relay_codex_recovery_summary(Some("TURN_START_UNKNOWN")),
+            "无法确认任务是否已启动，禁止直接重发。"
+        );
+        assert_eq!(
+            relay_codex_recovery_summary(Some("THREAD_START_UNKNOWN")),
+            "无法确认是否创建了对话，但任务提示尚未发送。"
+        );
+    }
+
+    #[test]
+    fn relay_codex_discovery_guard_rejects_an_occupied_runtime_before_process_launch() {
+        let (sender, _receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(AtomicBool::new(false)),
+        }));
+        let error = discover_relay_codex_threads_for_cwd_guarded(
+            &sessions,
+            r"G:\definitely-not-a-working-directory",
+            &[],
+        )
+        .expect_err("occupied runtime rejects discovery");
+        assert!(error.contains("不能同时发现对话"));
+    }
+
+    #[test]
+    fn relay_codex_creation_revalidation_uses_the_runtime_discovery_guard() {
+        let (sender, _receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(AtomicBool::new(false)),
+        }));
+        let connection = relay_connection();
+        let mut new_input = relay_module_input(RelayCodexThreadTargetInput::New);
+        new_input.working_directory = r"G:\definitely-not-a-working-directory".into();
+        assert!(
+            revalidate_relay_codex_thread_target_for_creation(&sessions, &new_input, &[])
+                .expect("NEW does not discover")
+                .is_empty()
+        );
+
+        let existing_input = relay_module_input(RelayCodexThreadTargetInput::Existing {
+            thread_id: "thread-existing".into(),
+        });
+        let error =
+            revalidate_relay_codex_thread_target_for_creation(&sessions, &existing_input, &[])
+                .expect_err("occupied runtime rejects creation revalidation before discovery");
+        assert!(error.contains("不能同时发现对话"));
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_modules", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no module created after rejected revalidation"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_codex_threads", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("no thread reservation after rejected revalidation"),
+            0
+        );
+    }
+
+    #[test]
+    fn relay_codex_recovery_target_mutations_preserve_p1_and_counter_facts() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "恢复模块");
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 7, "P1 原文  ").expect("create P1");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'RECOVERY_REQUIRED', resume_thread_id = 'thread-old',
+                     codex_recovery_reason = 'THREAD_START_UNKNOWN'
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set recovery");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-old".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("reserve old");
+        prepare_relay_codex_start_new_thread_in(&connection, "module-a").expect("prepare new");
+        assert!(get_relay_codex_thread(&connection, "thread-old")
+            .expect("read old")
+            .is_none());
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(module.resume_thread_id, None);
+        assert_eq!(module.codex_thread_id, None);
+        assert_eq!(module.started_cycles, 0);
+        assert!(module.module_started_at.is_none());
+        let after = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("cycle")
+            .expect("P1");
+        assert_eq!(after.id, cycle.id);
+        assert_eq!(after.cycle_number, 7);
+        assert_eq!(after.prompt_text, "P1 原文  ");
+        assert_eq!(after.status, "WAITING_TO_SEND_CODEX");
+
+        prepare_relay_codex_select_existing_thread_in(
+            &connection,
+            "module-a",
+            "thread-new",
+            r"G:\workspace",
+        )
+        .expect("select no-row thread");
+        let selected = get_relay_codex_thread(&connection, "thread-new")
+            .expect("registry")
+            .expect("reserved");
+        assert_eq!(selected.state, RelayCodexThreadState::Reserved);
+        assert_eq!(selected.owner_module_id.as_deref(), Some("module-a"));
+        assert_eq!(selected.reservation_previous_state.as_deref(), Some("NONE"));
+    }
+
+    #[test]
+    fn relay_codex_start_new_revalidates_reserved_target_without_partial_mutation() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "恢复模块");
+        insert_relay_module(&connection, "module-other", "其他模块");
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None)
+            .expect("pending cycle");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'RECOVERY_REQUIRED', resume_thread_id = 'thread-a',
+                     codex_recovery_reason = 'THREAD_RESUME_FAILED'
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("seed recovery");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed reservation");
+        let authorized = get_relay_module(&connection, "module-a")
+            .expect("read module")
+            .expect("module exists");
+        assert!(allowed_relay_codex_recovery_actions_in(
+            &connection,
+            &authorized,
+            RelayCodexRecoveryRuntimeState::None,
+        )
+        .expect("authorize")
+        .contains(&RelayCodexRecoveryAllowedAction::StartNewThread));
+
+        connection
+            .execute(
+                "UPDATE relay_codex_threads
+                 SET state = 'UNAVAILABLE', owner_module_id = NULL, last_module_id = 'module-other',
+                     reservation_previous_state = NULL
+                 WHERE thread_id = 'thread-a'",
+                [],
+            )
+            .expect("simulate ownership race");
+        assert!(prepare_relay_codex_start_new_thread_in(&connection, "module-a").is_err());
+        let module = get_relay_module(&connection, "module-a")
+            .expect("read module")
+            .expect("module exists");
+        assert_eq!(module.resume_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(module.codex_thread_id, None);
+        let registry = get_relay_codex_thread(&connection, "thread-a")
+            .expect("read registry")
+            .expect("registry remains");
+        assert_eq!(registry.state, RelayCodexThreadState::Unavailable);
+        assert_eq!(registry.last_module_id.as_deref(), Some("module-other"));
+    }
+
+    #[test]
+    fn relay_codex_thread_restart_marks_active_owner_reacquire_required_without_replaying_turns() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-live", "运行模块");
+        insert_relay_module(&connection, "module-terminal", "终态模块");
+        insert_relay_module(&connection, "module-reserved", "保留模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'CODEX_RUNNING' WHERE id = 'module-live'",
+                [],
+            )
+            .expect("seed live phase");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-terminal'",
+                [],
+            )
+            .expect("seed terminal phase");
+        for (thread_id, module_id) in [
+            ("thread-live", "module-live"),
+            ("thread-terminal", "module-terminal"),
+        ] {
+            upsert_relay_codex_thread(
+                &connection,
+                &RelayCodexThreadRecord {
+                    thread_id: thread_id.into(),
+                    working_directory: r"G:\workspace".into(),
+                    state: RelayCodexThreadState::Active,
+                    owner_module_id: Some(module_id.into()),
+                    last_module_id: Some(module_id.into()),
+                    reservation_previous_state: None,
+                    updated_at: Utc::now().to_rfc3339(),
+                },
+            )
+            .expect("seed active thread");
+        }
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-reserved".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-reserved".into()),
+                last_module_id: Some("module-reserved".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed reservation");
+
+        assert_eq!(
+            recover_relay_codex_thread_registry_on_restart_in(&connection)
+                .expect("restart recovery"),
+            1
+        );
+        let live = get_relay_module(&connection, "module-live")
+            .expect("read live module")
+            .expect("live module");
+        assert_eq!(live.phase, "RECOVERY_REQUIRED");
+        assert_eq!(
+            live.codex_recovery_reason.as_deref(),
+            Some("THREAD_REACQUIRE_REQUIRED")
+        );
+        let terminal = get_relay_module(&connection, "module-terminal")
+            .expect("read terminal module")
+            .expect("terminal module");
+        assert_eq!(terminal.phase, "COMPLETED");
+        for (thread_id, module_id) in [
+            ("thread-live", "module-live"),
+            ("thread-terminal", "module-terminal"),
+        ] {
+            let record = get_relay_codex_thread(&connection, thread_id)
+                .expect("read registry")
+                .expect("registry record");
+            assert_eq!(record.state, RelayCodexThreadState::Unavailable);
+            assert_eq!(record.owner_module_id, None);
+            assert_eq!(record.last_module_id.as_deref(), Some(module_id));
+        }
+        assert_eq!(
+            get_relay_codex_thread(&connection, "thread-reserved")
+                .expect("read reserved")
+                .expect("reserved record")
+                .state,
+            RelayCodexThreadState::Reserved
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no relay messages"),
+            0
+        );
+        assert_eq!(
+            recover_relay_codex_thread_registry_on_restart_in(&connection)
+                .expect("idempotent restart recovery"),
+            0
+        );
+    }
+
+    #[test]
+    fn relay_codex_restart_reacquire_needs_no_pending_p1_and_restores_previous_phase() {
+        for previous_phase in ["READY", "WAITING_FOR_CHATGPT", "WAITING_FOR_ACCEPTANCE"] {
+            let connection = relay_connection();
+            insert_relay_module(&connection, "module-a", "恢复模块");
+            connection
+                .execute(
+                    "UPDATE relay_modules
+                     SET phase = 'RECOVERY_REQUIRED', codex_thread_id = 'thread-a',
+                         codex_recovery_reason = 'THREAD_REACQUIRE_REQUIRED',
+                         codex_recovery_previous_phase = ?1
+                     WHERE id = 'module-a'",
+                    [previous_phase],
+                )
+                .expect("seed restart recovery");
+            upsert_relay_codex_thread(
+                &connection,
+                &RelayCodexThreadRecord {
+                    thread_id: "thread-a".into(),
+                    working_directory: r"G:\workspace".into(),
+                    state: RelayCodexThreadState::Unavailable,
+                    owner_module_id: None,
+                    last_module_id: Some("module-a".into()),
+                    reservation_previous_state: None,
+                    updated_at: Utc::now().to_rfc3339(),
+                },
+            )
+            .expect("seed unavailable registry");
+            let module = get_relay_module(&connection, "module-a")
+                .expect("read module")
+                .expect("module exists");
+            assert_eq!(
+                allowed_relay_codex_recovery_actions_in(
+                    &connection,
+                    &module,
+                    RelayCodexRecoveryRuntimeState::None,
+                )
+                .expect("authorize no-P1 reacquire"),
+                vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
+            );
+            confirm_relay_codex_thread_acquisition_in(
+                &connection,
+                "module-a",
+                "thread-a",
+                RelayCodexAcquisitionKind::ReacquireUnavailable,
+            )
+            .expect("confirm reacquire");
+            let restored = get_relay_module(&connection, "module-a")
+                .expect("read restored module")
+                .expect("module exists");
+            assert_eq!(restored.phase, previous_phase);
+            assert_eq!(restored.codex_recovery_reason, None);
+        }
+    }
+
+    #[test]
+    fn relay_codex_restart_reacquire_preserves_existing_recovery_authorization() {
+        for (reason, expected_actions) in [
+            (
+                "TURN_START_FAILED",
+                vec![RelayCodexRecoveryAllowedAction::RetryTurnStart],
+            ),
+            ("TURN_START_UNKNOWN", Vec::new()),
+        ] {
+            let connection = relay_connection();
+            insert_relay_module(&connection, "module-a", "恢复模块");
+            let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "P1")
+                .expect("create pending P1");
+            connection
+                .execute(
+                    "UPDATE relay_modules
+                     SET phase = 'RECOVERY_REQUIRED', codex_thread_id = 'thread-a',
+                         codex_recovery_reason = ?1
+                     WHERE id = 'module-a'",
+                    [reason],
+                )
+                .expect("seed existing recovery reason");
+            upsert_relay_codex_thread(
+                &connection,
+                &RelayCodexThreadRecord {
+                    thread_id: "thread-a".into(),
+                    working_directory: r"G:\workspace".into(),
+                    state: RelayCodexThreadState::Active,
+                    owner_module_id: Some("module-a".into()),
+                    last_module_id: Some("module-a".into()),
+                    reservation_previous_state: None,
+                    updated_at: Utc::now().to_rfc3339(),
+                },
+            )
+            .expect("seed active registry");
+
+            assert_eq!(
+                recover_relay_codex_thread_registry_on_restart_in(&connection)
+                    .expect("restart recovery"),
+                1
+            );
+            let interrupted = get_relay_module(&connection, "module-a")
+                .expect("read interrupted module")
+                .expect("module exists");
+            assert_eq!(interrupted.codex_recovery_reason.as_deref(), Some(reason));
+            assert_eq!(
+                allowed_relay_codex_recovery_actions_in(
+                    &connection,
+                    &interrupted,
+                    RelayCodexRecoveryRuntimeState::CurrentIdle,
+                )
+                .expect("authorize reacquire first"),
+                vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
+            );
+
+            confirm_relay_codex_thread_acquisition_in(
+                &connection,
+                "module-a",
+                "thread-a",
+                RelayCodexAcquisitionKind::ReacquireUnavailable,
+            )
+            .expect("confirm reacquire");
+            let recovered = get_relay_module(&connection, "module-a")
+                .expect("read recovered module")
+                .expect("module exists");
+            assert_eq!(recovered.codex_recovery_reason.as_deref(), Some(reason));
+            assert_eq!(
+                allowed_relay_codex_recovery_actions_in(
+                    &connection,
+                    &recovered,
+                    RelayCodexRecoveryRuntimeState::CurrentIdle,
+                )
+                .expect("restore original recovery authorization"),
+                expected_actions
+            );
+            assert_eq!(
+                pending_relay_codex_cycle_in(&connection, "module-a")
+                    .expect("P1 must remain untouched")
+                    .id,
+                cycle.id
+            );
+        }
+    }
+
+    #[test]
+    fn relay_codex_running_cycle_restart_stays_recovery_without_replay() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "运行模块");
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 1, "P1").expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start cycle");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Active,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed active registry");
+
+        assert_eq!(
+            recover_relay_codex_thread_registry_on_restart_in(&connection)
+                .expect("restart recovery"),
+            1
+        );
+        confirm_relay_codex_thread_acquisition_in(
+            &connection,
+            "module-a",
+            "thread-a",
+            RelayCodexAcquisitionKind::ReacquireUnavailable,
+        )
+        .expect("confirm reacquire");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("read module")
+            .expect("module exists");
+        assert_eq!(module.phase, "RECOVERY_REQUIRED");
+        assert_eq!(
+            module.codex_recovery_reason.as_deref(),
+            Some("THREAD_REACQUIRE_REQUIRED")
+        );
+        assert!(allowed_relay_codex_recovery_actions_in(
+            &connection,
+            &module,
+            RelayCodexRecoveryRuntimeState::CurrentIdle,
+        )
+        .expect("running cycle has no replay action")
+        .is_empty());
+        assert_eq!(
+            list_relay_codex_cycles_in(&connection, "module-a")
+                .expect("read cycle")
+                .into_iter()
+                .next()
+                .expect("cycle exists")
+                .status,
+            "FAILED"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no automatic ChatGPT replay"),
+            0
+        );
+    }
+
+    #[test]
+    fn relay_codex_restart_zombie_clears_cycle_and_unblocks_a_new_turn() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stale", "重启中断模块");
+        let stale_cycle =
+            create_relay_codex_cycle(&connection, "module-stale", 1, "P1").expect("create cycle");
+        mark_relay_codex_turn_started(
+            &connection,
+            &stale_cycle.id,
+            Some("thread-stale"),
+            Some("turn-stale"),
+        )
+        .expect("start stale turn");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-stale".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Active,
+                owner_module_id: Some("module-stale".into()),
+                last_module_id: Some("module-stale".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed active registry");
+
+        assert_eq!(
+            recover_relay_codex_thread_registry_on_restart_in(&connection)
+                .expect("restart recovery"),
+            1
+        );
+        let module = get_relay_module(&connection, "module-stale")
+            .expect("read stale module")
+            .expect("stale module exists");
+        assert_eq!(module.phase, "RECOVERY_REQUIRED");
+        assert_eq!(module.started_cycles, 1);
+        let cycle = get_relay_codex_cycle_by_id(&connection, &stale_cycle.id)
+            .expect("read stale cycle")
+            .expect("stale cycle exists");
+        assert_eq!(cycle.status, "FAILED");
+        assert!(cycle.error_text.as_deref().is_some_and(|error| {
+            error.contains("APP_RESTART_INTERRUPTED") && error.contains("未自动重放")
+        }));
+        assert!(cycle.result_text.is_none());
+        assert!(cycle.outbound_chatgpt_message_id.is_none());
+        let registry = get_relay_codex_thread(&connection, "thread-stale")
+            .expect("read stale registry")
+            .expect("stale registry exists");
+        assert_eq!(registry.state, RelayCodexThreadState::Unavailable);
+        assert!(registry.owner_module_id.is_none());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no replay messages"),
+            0
+        );
+        assert_eq!(
+            relay_channel_snapshot_from_connection(&connection)
+                .expect("stale persisted cycle is not a live runtime")
+                .codex
+                .status,
+            "IDLE"
+        );
+
+        insert_relay_module(&connection, "module-new", "新模块");
+        let new_cycle =
+            create_relay_codex_cycle(&connection, "module-new", 1, "P2").expect("create new cycle");
+        mark_relay_codex_turn_started(
+            &connection,
+            &new_cycle.id,
+            Some("thread-new"),
+            Some("turn-new"),
+        )
+        .expect("stale running index no longer blocks a new confirmed turn");
+    }
+
+    #[test]
+    fn terminate_relay_module_stale_running_cycle_stops_without_waiting_for_a_worker() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stale", "无运行时模块");
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-stale", 1, "P1").expect("create cycle");
+        mark_relay_codex_turn_started(
+            &connection,
+            &cycle.id,
+            Some("thread-unavailable"),
+            Some("turn-stale"),
+        )
+        .expect("seed stale running cycle");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-unavailable".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Unavailable,
+                owner_module_id: None,
+                last_module_id: Some("module-stale".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed unavailable registry");
+        connection
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 1 WHERE id = 'module-stale'",
+                [],
+            )
+            .expect("seed stale stop request from before restart");
+
+        assert_eq!(
+            terminate_relay_module_in(&connection, "module-stale")
+                .expect("stale turn must not request a nonexistent worker stop"),
+            RelayModuleTermination::Stopped
+        );
+        let module = get_relay_module(&connection, "module-stale")
+            .expect("read stopped module")
+            .expect("module exists");
+        assert_eq!(module.phase, "STOPPED");
+        assert!(!module.stop_after_turn);
+        let interrupted = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read interrupted cycle")
+            .expect("cycle exists");
+        assert_eq!(interrupted.status, "FAILED");
+        assert!(interrupted.error_text.as_deref().is_some_and(|error| {
+            error.contains("模块终止时未发现对应的活动 Codex runtime")
+        }));
+        assert!(interrupted.result_text.is_none());
+        assert!(interrupted.outbound_chatgpt_message_id.is_none());
+        assert_eq!(
+            get_relay_codex_thread(&connection, "thread-unavailable")
+                .expect("read unavailable registry")
+                .expect("registry exists")
+                .state,
+            RelayCodexThreadState::Unavailable
+        );
+    }
+
+    #[test]
+    fn relay_codex_thread_release_and_terminal_reservation_restore_are_ownership_scoped() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_thread_id = 'thread-active' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set active thread");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-active".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Active,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed active");
+        assert_eq!(
+            persist_relay_codex_thread_release_outcome_in(
+                &connection,
+                "module-a",
+                true,
+                "test release",
+            )
+            .expect("release active"),
+            RelayCodexThreadReleaseOutcome::Persisted
+        );
+        let released = get_relay_codex_thread(&connection, "thread-active")
+            .expect("read released")
+            .expect("registry record");
+        assert_eq!(released.state, RelayCodexThreadState::Released);
+        assert_eq!(released.owner_module_id, None);
+        assert_eq!(released.last_module_id.as_deref(), Some("module-a"));
+
+        insert_relay_module(&connection, "module-b", "模块 B");
+        connection
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-reserved' WHERE id = 'module-b'",
+                [],
+            )
+            .expect("set reserved target");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-reserved".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-b".into()),
+                last_module_id: Some("module-b".into()),
+                reservation_previous_state: Some("RELEASED".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed reservation");
+        let module_b = get_relay_module(&connection, "module-b")
+            .expect("read module")
+            .expect("module exists");
+        rollback_relay_codex_reservation_on_terminal_in(&connection, &module_b)
+            .expect("restore reservation");
+        let restored = get_relay_codex_thread(&connection, "thread-reserved")
+            .expect("read restored")
+            .expect("registry record");
+        assert_eq!(restored.state, RelayCodexThreadState::Released);
+        assert_eq!(restored.owner_module_id, None);
+    }
+
+    #[test]
+    fn relay_codex_thread_release_outcome_records_failure_only_for_current_owner() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Active,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed current ownership");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("record current ownership on module");
+        assert_eq!(
+            persist_relay_codex_thread_release_outcome_in(
+                &connection,
+                "module-a",
+                false,
+                "release failed",
+            )
+            .expect("persist failure"),
+            RelayCodexThreadReleaseOutcome::Persisted
+        );
+        assert_eq!(
+            get_relay_codex_thread(&connection, "thread-a")
+                .expect("read unavailable thread")
+                .expect("thread exists")
+                .state,
+            RelayCodexThreadState::Unavailable
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = 'module-a' AND event_type = 'CODEX_THREAD_RELEASE_FAILED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count failure event"),
+            1
+        );
+
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-b".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Active,
+                owner_module_id: Some("module-b".into()),
+                last_module_id: Some("module-b".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed foreign ownership");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_thread_id = 'thread-b' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("point module at foreign thread");
+        assert_eq!(
+            persist_relay_codex_thread_release_outcome_in(
+                &connection,
+                "module-a",
+                true,
+                "must not release another module's thread",
+            )
+            .expect("ignore foreign ownership"),
+            RelayCodexThreadReleaseOutcome::NoOwnedActiveThread
+        );
+        let foreign = get_relay_codex_thread(&connection, "thread-b")
+            .expect("read foreign thread")
+            .expect("foreign thread exists");
+        assert_eq!(foreign.state, RelayCodexThreadState::Active);
+        assert_eq!(foreign.owner_module_id.as_deref(), Some("module-b"));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = 'module-a' AND event_type = 'CODEX_THREAD_RELEASED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("no false success event"),
+            0
+        );
+    }
+
+    fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {
+        RelayModuleInput {
+            name: "继续模块".into(),
+            working_directory: r"G:\workspace".into(),
+            max_cycles: 12,
+            max_runtime_minutes: 240,
+            retry_template: "retry".into(),
+            codex_thread_target: target,
+        }
+    }
+
+    #[test]
+    fn relay_codex_tauri_payload_deserializes_camel_case_thread_ids() {
+        let existing: RelayModuleInput = serde_json::from_value(json!({
+            "name": "resume",
+            "workingDirectory": "G:\\\\workspace",
+            "maxCycles": 12,
+            "maxRuntimeMinutes": 240,
+            "retryTemplate": "retry",
+            "codexThreadTarget": {
+                "mode": "EXISTING",
+                "threadId": "thread-a"
+            }
+        }))
+        .expect("browser EXISTING payload");
+        assert!(matches!(
+            existing.codex_thread_target,
+            RelayCodexThreadTargetInput::Existing { ref thread_id } if thread_id == "thread-a"
+        ));
+
+        let recovery: RelayCodexRecoveryAction = serde_json::from_value(json!({
+            "type": "SELECT_EXISTING_THREAD",
+            "threadId": "thread-a"
+        }))
+        .expect("browser recovery payload");
+        assert!(matches!(
+            recovery,
+            RelayCodexRecoveryAction::SelectExistingThread { ref thread_id } if thread_id == "thread-a"
+        ));
+
+        let new_target: RelayModuleInput = serde_json::from_value(json!({
+            "name": "new",
+            "workingDirectory": "G:\\\\workspace",
+            "maxCycles": 12,
+            "maxRuntimeMinutes": 240,
+            "retryTemplate": "retry",
+            "codexThreadTarget": { "mode": "NEW" }
+        }))
+        .expect("browser NEW payload");
+        assert!(matches!(
+            new_target.codex_thread_target,
+            RelayCodexThreadTargetInput::New
+        ));
+    }
+
+    fn selectable_thread(thread_id: &str) -> RelayCodexThreadCandidate {
+        RelayCodexThreadCandidate {
+            thread_id: thread_id.into(),
+            name: Some("已存在对话".into()),
+            source: "cli".into(),
+            status: "idle".into(),
+            branch: None,
+            recency_at: None,
+            selectable: true,
+            disabled_reason: None,
+        }
+    }
+
+    #[test]
+    fn create_relay_module_keeps_new_lazy_and_reserves_existing_atomically() {
+        let connection = relay_connection();
+        let new_module = create_relay_module_in(
+            &connection,
+            &relay_module_input(RelayCodexThreadTargetInput::New),
+            &[],
+        )
+        .expect("create new target");
+        assert_eq!(new_module.resume_thread_id, None);
+        assert_eq!(new_module.codex_thread_id, None);
+
+        let existing_module = create_relay_module_in(
+            &connection,
+            &relay_module_input(RelayCodexThreadTargetInput::Existing {
+                thread_id: "thread-existing".into(),
+            }),
+            &[selectable_thread("thread-existing")],
+        )
+        .expect("reserve eligible existing thread");
+        assert_eq!(
+            existing_module.resume_thread_id.as_deref(),
+            Some("thread-existing")
+        );
+        assert_eq!(existing_module.codex_thread_id, None);
+        let registry = get_relay_codex_thread(&connection, "thread-existing")
+            .expect("registry")
+            .expect("reservation");
+        assert_eq!(registry.state, RelayCodexThreadState::Reserved);
+        assert_eq!(
+            registry.owner_module_id.as_deref(),
+            Some(existing_module.id.as_str())
+        );
+        assert_eq!(registry.reservation_previous_state.as_deref(), Some("NONE"));
+        let counts: (i64, i64, Option<String>) = connection
+            .query_row(
+                "SELECT started_cycles, (SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = relay_modules.id), module_started_at
+                 FROM relay_modules WHERE id = ?1",
+                [&existing_module.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("lazy module facts");
+        assert_eq!(counts, (0, 0, None));
+    }
+
+    #[test]
+    fn create_relay_module_rejects_stale_or_racing_existing_targets_without_partial_module() {
+        let connection = relay_connection();
+        let target = RelayCodexThreadTargetInput::Existing {
+            thread_id: "thread-race".into(),
+        };
+        assert!(
+            create_relay_module_in(&connection, &relay_module_input(target.clone()), &[]).is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_modules", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no stale module"),
+            0
+        );
+        create_relay_module_in(
+            &connection,
+            &relay_module_input(target.clone()),
+            &[selectable_thread("thread-race")],
+        )
+        .expect("first contender");
+        assert!(create_relay_module_in(
+            &connection,
+            &relay_module_input(target),
+            &[selectable_thread("thread-race")],
+        )
+        .is_err());
+        let modules: i64 = connection
+            .query_row("SELECT COUNT(*) FROM relay_modules", [], |row| row.get(0))
+            .expect("one winning module");
+        assert_eq!(modules, 1);
+    }
+
+    fn insert_relay_module(connection: &Connection, id: &str, name: &str) {
+        connection.execute(
+            "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
+             VALUES (?1, ?2, 'G:\\workspace', 12, 240, 'retry', 'READY', 0, 0, '2026-08-17T00:00:00Z', '2026-08-17T00:00:00Z')",
+            params![id, name],
+        ).expect("relay module");
+    }
+
+    fn insert_relay_message(
+        connection: &Connection,
+        id: &str,
+        module_id: &str,
+        sequence_number: i64,
+        delivery_state: &str,
+        created_at: &str,
+    ) {
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at)
+             VALUES (?1, ?2, ?3, 'TO_CHATGPT', 'AUTOMATION', ?1, ?4, ?5)",
+            params![id, module_id, sequence_number, delivery_state, created_at],
+        ).expect("relay message");
+    }
+
+    fn insert_relay_codex_cycle(
+        connection: &Connection,
+        id: &str,
+        module_id: &str,
+        cycle_number: i64,
+        outbound_chatgpt_message_id: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO relay_codex_cycles (
+                id, module_id, cycle_number, status, prompt_text,
+                outbound_chatgpt_message_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'WAITING_TO_SEND_CODEX', 'Codex prompt', ?4, ?5, ?5)",
+            params![
+                id,
+                module_id,
+                cycle_number,
+                outbound_chatgpt_message_id,
+                "2026-08-17T00:00:00Z"
+            ],
+        )
+    }
+
+    #[test]
+    fn terminal_relay_chatgpt_reply_persists_delivery_without_restarting_automation() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-stopped", 1, "已完成的 Codex 工作")
+                .expect("create Codex cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("record Codex turn");
+        mark_relay_codex_result_received(&connection, &cycle.id, "Codex final text")
+            .expect("record Codex result");
+        let automation_request_id = queue_relay_codex_result_to_chatgpt(&connection, &cycle.id)
+            .expect("queue Codex result");
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim automation message")
+        {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.id, automation_request_id),
+            _ => panic!("automation message must be in flight"),
+        }
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("stop module");
+
+        let prompt_reply = "@@@CODEX_PROMPT@@@\n不得启动新的 Codex 回合\n@@@END_CODEX_PROMPT@@@";
+        let stopped_outcome =
+            process_relay_chatgpt_reply_in(&connection, Some(&automation_request_id), prompt_reply)
+                .expect("persist stopped automation reply");
+        assert!(stopped_outcome.terminal_ignored);
+
+        let linked_cycle = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read linked cycle")
+            .expect("linked cycle exists");
+        assert_eq!(linked_cycle.status, "DELIVERED_TO_CHATGPT");
+        let automation_delivery: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [&automation_request_id],
+                |row| row.get(0),
+            )
+            .expect("automation delivery");
+        assert_eq!(automation_delivery, "DELIVERED");
+
+        queue_relay_message_in(
+            &connection,
+            "module-completed",
+            RelayMessageKind::Manual,
+            "手动消息",
+        )
+        .expect("queue manual message");
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim manual message") {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.kind, "MANUAL"),
+            _ => panic!("manual message must be in flight"),
+        };
+        let manual_request_id: String = connection
+            .query_row(
+                "SELECT id FROM relay_messages
+                 WHERE module_id = 'module-completed' AND direction = 'TO_CHATGPT'
+                   AND delivery_state = 'SENT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("manual request id");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("complete module");
+        let completed_outcome =
+            process_relay_chatgpt_reply_in(&connection, Some(&manual_request_id), prompt_reply)
+                .expect("persist completed manual reply");
+        assert!(completed_outcome.terminal_ignored);
+
+        for (module_id, request_id, expected_phase) in [
+            ("module-stopped", automation_request_id.as_str(), "STOPPED"),
+            ("module-completed", manual_request_id.as_str(), "COMPLETED"),
+        ] {
+            let phase: String = connection
+                .query_row(
+                    "SELECT phase FROM relay_modules WHERE id = ?1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("terminal phase");
+            assert_eq!(phase, expected_phase);
+            let invalid_reply_count: i64 = connection
+                .query_row(
+                    "SELECT invalid_reply_count FROM relay_modules WHERE id = ?1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("invalid reply count");
+            assert_eq!(invalid_reply_count, 0);
+            let persisted_reply: String = connection
+                .query_row(
+                    "SELECT text FROM relay_messages
+                     WHERE module_id = ?1 AND direction = 'FROM_CHATGPT'
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("persisted ChatGPT reply");
+            assert_eq!(persisted_reply, prompt_reply);
+            let delivery: String = connection
+                .query_row(
+                    "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                    [request_id],
+                    |row| row.get(0),
+                )
+                .expect("outbound delivery");
+            assert_eq!(delivery, "DELIVERED");
+            let late_events: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'LATE_CHATGPT_REPLY_IGNORED'",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("late reply audit event");
+            assert_eq!(late_events, 1);
+            let retries: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'CONTROL_RETRY'",
+                    [module_id],
+                    |row| row.get(0),
+                )
+                .expect("retry count");
+            assert_eq!(retries, 0);
+        }
+        let stopped_cycles: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = 'module-stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stopped cycle count");
+        let stopped_turns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = 'module-stopped' AND direction = 'TO_CODEX'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stopped turn count");
+        assert_eq!(stopped_cycles, 1);
+        assert_eq!(stopped_turns, 0);
+    }
+
+    #[test]
+    fn relay_codex_release_acknowledges_and_only_clears_the_matching_session() {
+        let (sender, receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }));
+        let worker = std::thread::spawn(move || match receiver.recv().expect("release command") {
+            RelayCodexCommand::Release { acknowledgement } => acknowledgement
+                .send(Ok(()))
+                .expect("acknowledge idle release"),
+            RelayCodexCommand::StartTurn { .. } => panic!("release must not start a turn"),
+        });
+
+        release_relay_codex_session(&sessions, "module-a", std::time::Duration::from_millis(100))
+            .expect("idle release is acknowledged");
+        worker.join().expect("worker exits");
+        assert!(clear_relay_codex_session_if_matches(&sessions, "module-a"));
+        assert!(sessions.lock().expect("session lock").is_none());
+
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("persist thread id");
+        let thread_id: Option<String> = connection
+            .query_row(
+                "SELECT codex_thread_id FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read thread id");
+        assert_eq!(thread_id.as_deref(), Some("thread-a"));
+
+        release_relay_codex_session(&sessions, "module-a", std::time::Duration::from_millis(100))
+            .expect("repeat release without a session is a no-op");
+
+        let (next_sender, _next_receiver) = std_mpsc::channel();
+        *sessions.lock().expect("session lock") = Some(RelayCodexSession {
+            module_id: "module-b".into(),
+            commands: next_sender,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        assert!(!clear_relay_codex_session_if_matches(&sessions, "module-a"));
+        assert_eq!(
+            sessions
+                .lock()
+                .expect("session lock")
+                .as_ref()
+                .map(|session| session.module_id.as_str()),
+            Some("module-b")
+        );
+    }
+
+    #[test]
+    fn relay_codex_release_does_not_send_release_to_a_running_turn() {
+        let (sender, receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+
+        let error = release_relay_codex_session(
+            &sessions,
+            "module-a",
+            std::time::Duration::from_millis(20),
+        )
+        .expect_err("a running turn must not be released");
+
+        assert!(error.contains("仍在运行"));
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn terminate_running_relay_codex_failure_makes_the_matching_session_releasable() {
+        let (sender, receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+
+        assert!(mark_relay_codex_session_turn_inactive(
+            &sessions, "module-a"
+        ));
+        let worker = std::thread::spawn(move || match receiver.recv().expect("release command") {
+            RelayCodexCommand::Release { acknowledgement } => acknowledgement
+                .send(Ok(()))
+                .expect("acknowledge failed-turn release"),
+            RelayCodexCommand::StartTurn { .. } => panic!("failed turn must only schedule release"),
+        });
+        release_relay_codex_session(&sessions, "module-a", std::time::Duration::from_millis(100))
+            .expect("failed turn session is releasable after turn activity is cleared");
+        worker.join().expect("release worker joins");
+    }
+
+    #[test]
+    fn terminal_relay_modules_are_skipped_without_changing_active_global_fifo() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+        insert_relay_module(&connection, "module-active-a", "活动模块 A");
+        insert_relay_module(&connection, "module-active-b", "活动模块 B");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("mark stopped");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("mark completed");
+        insert_relay_message(
+            &connection,
+            "terminal-stopped",
+            "module-stopped",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:01Z",
+        );
+        insert_relay_message(
+            &connection,
+            "terminal-completed",
+            "module-completed",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:02Z",
+        );
+        insert_relay_message(
+            &connection,
+            "active-first",
+            "module-active-a",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:03Z",
+        );
+        insert_relay_message(
+            &connection,
+            "active-second",
+            "module-active-b",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:04Z",
+        );
+
+        let claimed = match claim_next_relay_message_for_dispatch(&connection)
+            .expect("claim next active message")
+        {
+            RelayDispatchClaim::Message(message) => message,
+            _ => panic!("an active queued message should be selected"),
+        };
+
+        assert_eq!(claimed.id, "active-first");
+        let terminal_states: Vec<String> = ["terminal-stopped", "terminal-completed"]
+            .iter()
+            .map(|id| {
+                connection
+                    .query_row(
+                        "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .expect("terminal message state")
+            })
+            .collect();
+        assert_eq!(terminal_states, ["QUEUED", "QUEUED"]);
+    }
+
+    #[test]
+    fn terminal_relay_modules_reject_new_queue_messages() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("mark stopped");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("mark completed");
+
+        for module_id in ["module-stopped", "module-completed"] {
+            let error = queue_relay_message_in(
+                &connection,
+                module_id,
+                RelayMessageKind::Manual,
+                "不得发送到终态模块",
+            )
+            .expect_err("terminal modules must reject new queue messages");
+            assert_eq!(error, "模块已经结束，不能再发送消息。");
+        }
+        let queued_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM relay_messages", [], |row| row.get(0))
+            .expect("queued count");
+        assert_eq!(queued_count, 0);
+    }
+
+    #[test]
+    fn terminal_relay_recovery_never_resets_phase_to_ready() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("mark completed");
+        insert_relay_message(
+            &connection,
+            "unknown-terminal",
+            "module-completed",
+            1,
+            "UNKNOWN",
+            "2026-08-17T00:00:01Z",
+        );
+
+        resolve_unknown_relay_message_without_resend(&connection, "unknown-terminal")
+            .expect("explicitly resolve legacy unknown message");
+
+        let phase: String = connection
+            .query_row(
+                "SELECT phase FROM relay_modules WHERE id = 'module-completed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal phase");
+        assert_eq!(phase, "COMPLETED");
+    }
+
+    #[test]
+    fn terminal_relay_adapter_failure_keeps_terminal_phase() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("mark stopped");
+        insert_relay_message(
+            &connection,
+            "sent-terminal",
+            "module-stopped",
+            1,
+            "SENT",
+            "2026-08-18T00:00:00Z",
+        );
+
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            "sent-terminal",
+            "CHATGPT_ADAPTER_FAILURE",
+            "适配器失败",
+        )
+        .expect("terminal sent message can still become explicitly recoverable");
+
+        let phase: String = connection
+            .query_row(
+                "SELECT phase FROM relay_modules WHERE id = 'module-stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal phase");
+        assert_eq!(phase, "STOPPED");
+    }
+
+    #[test]
+    fn accept_relay_module_requires_waiting_for_acceptance_without_local_blockers() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+
+        let not_waiting = accept_relay_module_in(&connection, "module-a")
+            .expect_err("only a module waiting for acceptance may be accepted");
+        assert!(not_waiting.contains("等待人工验收"));
+
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'WAITING_FOR_ACCEPTANCE' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("mark module waiting for acceptance");
+        insert_relay_message(
+            &connection,
+            "unknown-a",
+            "module-a",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:00Z",
+        );
+        let local_unknown = accept_relay_module_in(&connection, "module-a")
+            .expect_err("local unknown delivery must block acceptance");
+        assert!(local_unknown.contains("不确定送达"));
+
+        connection
+            .execute("DELETE FROM relay_messages WHERE id = 'unknown-a'", [])
+            .expect("remove local recovery fixture");
+        connection
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 1 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("mark termination requested");
+        let terminating = accept_relay_module_in(&connection, "module-a")
+            .expect_err("a terminating module must not be accepted");
+        assert!(terminating.contains("正在终止"));
+        connection
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 0 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("clear termination fixture");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:01Z",
+        );
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None)
+            .expect("insert cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-a'",
+                [],
+            )
+            .expect("mark cycle running");
+        let running = accept_relay_module_in(&connection, "module-a")
+            .expect_err("a running Codex cycle must block acceptance");
+        assert!(running.contains("当前 Codex 回合仍在运行"));
+
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_COMPLETED' WHERE id = 'cycle-a'",
+                [],
+            )
+            .expect("complete cycle");
+        accept_relay_module_in(&connection, "module-a")
+            .expect("other module recovery must not block acceptance");
+    }
+
+    #[test]
+    fn accept_relay_module_completes_once_and_preserves_sent_thread_and_history() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'WAITING_FOR_ACCEPTANCE', codex_thread_id = 'thread-a'
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+        insert_relay_message(
+            &connection,
+            "queued-a",
+            "module-a",
+            1,
+            "QUEUED",
+            "2026-08-18T00:00:00Z",
+        );
+        insert_relay_message(
+            &connection,
+            "sent-a",
+            "module-a",
+            2,
+            "SENT",
+            "2026-08-18T00:00:01Z",
+        );
+
+        accept_relay_module_in(&connection, "module-a").expect("accept module");
+        let module: (String, Option<String>) = connection
+            .query_row(
+                "SELECT phase, codex_thread_id FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("accepted module");
+        assert_eq!(module.0, "COMPLETED");
+        assert_eq!(module.1.as_deref(), Some("thread-a"));
+        let messages: Vec<(String, String, String)> = connection
+            .prepare("SELECT id, text, delivery_state FROM relay_messages WHERE module_id = 'module-a' ORDER BY sequence_number")
+            .expect("message query")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("message rows")
+            .collect::<Result<_, _>>()
+            .expect("collect messages");
+        assert_eq!(
+            messages,
+            vec![
+                ("queued-a".into(), "queued-a".into(), "FAILED".into()),
+                ("sent-a".into(), "sent-a".into(), "SENT".into()),
+            ]
+        );
+        let accepted_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = 'MODULE_ACCEPTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("accepted audit count");
+        let cancelled_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = 'CHATGPT_QUEUED_MESSAGE_CANCELLED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("queued cancellation audit count");
+        assert_eq!(accepted_events, 1);
+        assert_eq!(cancelled_events, 1);
+
+        accept_relay_module_in(&connection, "module-a")
+            .expect("repeated acceptance is an idempotent success");
+        let repeated_accepted_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = 'MODULE_ACCEPTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("repeated accepted audit count");
+        assert_eq!(repeated_accepted_events, 1);
+        assert!(queue_relay_message_in(
+            &connection,
+            "module-a",
+            RelayMessageKind::Automation,
+            "不应排队",
+        )
+        .is_err());
+
+        insert_relay_module(&connection, "module-stopped", "已终止模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-stopped'",
+                [],
+            )
+            .expect("stop fixture");
+        let stopped = accept_relay_module_in(&connection, "module-stopped")
+            .expect_err("stopped modules cannot be accepted");
+        assert!(stopped.contains("已终止"));
+    }
+
+    #[test]
+    fn relay_acceptance_feedback_requires_waiting_phase_and_nonempty_text() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+
+        let phase_error =
+            submit_relay_acceptance_feedback_in(&connection, "module-a", "请继续处理验收反馈。")
+                .expect_err("only modules waiting for acceptance may submit feedback");
+        assert!(phase_error.contains("等待人工验收"));
+
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'WAITING_FOR_ACCEPTANCE' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+        let empty_error = submit_relay_acceptance_feedback_in(&connection, "module-a", "  ")
+            .expect_err("blank feedback must be rejected");
+        assert!(empty_error.contains("不能为空"));
+    }
+
+    #[test]
+    fn relay_acceptance_feedback_queues_once_and_waits_for_chatgpt() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'WAITING_FOR_ACCEPTANCE', codex_thread_id = 'thread-a', started_cycles = 1
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+
+        let message_id = submit_relay_acceptance_feedback_in(
+            &connection,
+            "module-a",
+            "  请根据验收反馈继续。  ",
+        )
+        .expect("queue acceptance feedback");
+        let message: (String, String, String, i64) = connection
+            .query_row(
+                "SELECT kind, text, delivery_state, sequence_number
+                 FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("queued feedback message");
+        assert_eq!(
+            message,
+            (
+                "AUTOMATION".into(),
+                "请根据验收反馈继续。".into(),
+                "QUEUED".into(),
+                1
+            )
+        );
+        let module: (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT phase, codex_thread_id, started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after feedback");
+        assert_eq!(module.0, "WAITING_FOR_CHATGPT");
+        assert_eq!(module.1.as_deref(), Some("thread-a"));
+        assert_eq!(module.2, 1);
+        for event_type in ["CHATGPT_MESSAGE_QUEUED", "ACCEPTANCE_FEEDBACK_QUEUED"] {
+            let event_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = ?1",
+                    [event_type],
+                    |row| row.get(0),
+                )
+                .expect("feedback audit event");
+            assert_eq!(event_count, 1, "{event_type} must be recorded once");
+        }
+
+        let duplicate =
+            submit_relay_acceptance_feedback_in(&connection, "module-a", "不应加入第二条反馈。")
+                .expect_err("feedback may only be submitted once per acceptance pause");
+        assert!(duplicate.contains("等待人工验收"));
+        let message_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'module-a' AND direction = 'TO_CHATGPT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("feedback message count");
+        assert_eq!(message_count, 1);
+    }
+
+    #[test]
+    fn relay_acceptance_feedback_can_queue_behind_global_unknown_without_bypassing_it() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'WAITING_FOR_ACCEPTANCE' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+        insert_relay_message(
+            &connection,
+            "unknown-a",
+            "module-a",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:00Z",
+        );
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:01Z",
+        );
+
+        let message_id =
+            submit_relay_acceptance_feedback_in(&connection, "module-a", "请继续处理。")
+                .expect("feedback is safe to queue while recovery is pending");
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection).expect("claim state"),
+            RelayDispatchClaim::RecoveryBlocked(2)
+        ));
+        let state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .expect("feedback remains queued");
+        assert_eq!(state, "QUEUED");
+    }
+
+    #[test]
+    fn relay_acceptance_feedback_follow_up_prompt_counts_only_after_turn_confirmation() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'WAITING_FOR_ACCEPTANCE', codex_thread_id = 'thread-a', started_cycles = 1
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare acceptance");
+        submit_relay_acceptance_feedback_in(&connection, "module-a", "请继续修复验收发现的问题。")
+            .expect("queue feedback");
+
+        let control = relay_protocol::parse_terminal_control_block(
+            "已收到验收反馈。\n\n@@@CODEX_PROMPT@@@\n继续处理验收反馈。\n@@@END_CODEX_PROMPT@@@",
+        )
+        .expect("valid follow-up CODEX_PROMPT");
+        let relay_protocol::ControlBlock::CodexPrompt(prompt) = control else {
+            panic!("expected a CODEX_PROMPT");
+        };
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 2, &prompt)
+            .expect("create follow-up cycle");
+        mark_relay_codex_turn_starting_in(&connection, "module-a")
+            .expect("start follow-up Codex turn");
+
+        let (sender, receiver) = std_mpsc::channel();
+        let session = RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(AtomicBool::new(false)),
+        };
+        send_relay_codex_start_turn(&session, &cycle.id, &prompt)
+            .expect("the existing module worker accepts the follow-up turn");
+        match receiver.recv().expect("follow-up worker command") {
+            RelayCodexCommand::StartTurn {
+                cycle_id,
+                prompt: received_prompt,
+            } => {
+                assert_eq!(cycle_id, cycle.id);
+                assert_eq!(received_prompt, prompt);
+            }
+            RelayCodexCommand::Release { .. } => {
+                panic!("follow-up feedback must not release worker")
+            }
+        }
+        assert!(session.turn_active.load(Ordering::SeqCst));
+        let module: (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT phase, codex_thread_id, started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after follow-up prompt");
+        assert_eq!(module.0, "CODEX_STARTING");
+        assert_eq!(module.1.as_deref(), Some("thread-a"));
+        assert_eq!(module.2, 1);
+
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-b"))
+            .expect("confirmed follow-up turn");
+        let started_cycles: i64 = connection
+            .query_row(
+                "SELECT started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("confirmed cycle count");
+        assert_eq!(started_cycles, 2);
+    }
+
+    #[test]
+    fn terminate_idle_relay_module_stops_only_safe_non_running_modules() {
+        let connection = relay_connection();
+        for (id, phase) in [
+            ("module-ready", "READY"),
+            ("module-acceptance", "WAITING_FOR_ACCEPTANCE"),
+            ("module-blocked", "BLOCKED"),
+            ("module-recovery", "RECOVERY_REQUIRED"),
+            ("module-chatgpt", "WAITING_FOR_CHATGPT"),
+        ] {
+            insert_relay_module(&connection, id, id);
+            connection
+                .execute(
+                    "UPDATE relay_modules SET phase = ?2 WHERE id = ?1",
+                    params![id, phase],
+                )
+                .expect("prepare idle phase");
+            connection
+                .execute(
+                    "UPDATE relay_modules SET codex_thread_id = 'thread-kept' WHERE id = ?1",
+                    [id],
+                )
+                .expect("retain thread id");
+            insert_relay_message(
+                &connection,
+                &format!("queued-{id}"),
+                id,
+                1,
+                "QUEUED",
+                "2026-08-18T00:00:00Z",
+            );
+            insert_relay_message(
+                &connection,
+                &format!("sent-{id}"),
+                id,
+                2,
+                "SENT",
+                "2026-08-18T00:00:01Z",
+            );
+
+            assert_eq!(
+                terminate_relay_module_in(&connection, id).expect("terminate idle module"),
+                RelayModuleTermination::Stopped
+            );
+            let module: (String, Option<String>) = connection
+                .query_row(
+                    "SELECT phase, codex_thread_id FROM relay_modules WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("stopped module");
+            assert_eq!(module.0, "STOPPED");
+            assert_eq!(module.1.as_deref(), Some("thread-kept"));
+            let message_states: Vec<(String, String, String)> = connection
+                .prepare(
+                    "SELECT id, text, delivery_state FROM relay_messages
+                     WHERE module_id = ?1 ORDER BY sequence_number",
+                )
+                .expect("message query")
+                .query_map([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("message rows")
+                .collect::<Result<_, _>>()
+                .expect("collect messages");
+            assert_eq!(
+                message_states,
+                vec![
+                    (
+                        format!("queued-{id}"),
+                        format!("queued-{id}"),
+                        "FAILED".into()
+                    ),
+                    (format!("sent-{id}"), format!("sent-{id}"), "SENT".into()),
+                ]
+            );
+            let termination_events: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'MODULE_TERMINATED'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("termination event count");
+            let cancelled_events: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'CHATGPT_QUEUED_MESSAGE_CANCELLED'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("queued cancellation count");
+            assert_eq!(termination_events, 1);
+            assert_eq!(cancelled_events, 1);
+            assert_eq!(
+                terminate_relay_module_in(&connection, id).expect("repeat termination is inert"),
+                RelayModuleTermination::AlreadyStopped
+            );
+            let repeated_events: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_events
+                     WHERE module_id = ?1 AND event_type = 'MODULE_TERMINATED'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("repeated termination event count");
+            assert_eq!(repeated_events, 1);
+            assert!(queue_relay_message_in(
+                &connection,
+                id,
+                RelayMessageKind::Manual,
+                "终态模块不得发送",
+            )
+            .is_err());
+        }
+
+        insert_relay_module(&connection, "module-unknown", "本模块不确定送达");
+        insert_relay_message(
+            &connection,
+            "unknown-local",
+            "module-unknown",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:02Z",
+        );
+        let unknown_error = terminate_relay_module_in(&connection, "module-unknown")
+            .expect_err("local unknown must block termination");
+        assert!(unknown_error.contains("不确定送达"));
+
+        insert_relay_module(&connection, "module-other-unknown", "其他模块不确定送达");
+        insert_relay_message(
+            &connection,
+            "unknown-other",
+            "module-other-unknown",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:03Z",
+        );
+        insert_relay_module(&connection, "module-safe", "可终止模块");
+        terminate_relay_module_in(&connection, "module-safe")
+            .expect("other module unknown must not block termination");
+
+        insert_relay_module(&connection, "module-running", "运行模块");
+        insert_relay_codex_cycle(&connection, "cycle-running", "module-running", 1, None)
+            .expect("insert cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-running'",
+                [],
+            )
+            .expect("mark running cycle");
+        assert_eq!(
+            terminate_relay_module_with_active_turn_in(&connection, "module-running", true)
+                .expect("Task 6 records a stop request for a running Codex turn"),
+            RelayModuleTermination::StopRequested
+        );
+
+        insert_relay_module(&connection, "module-completed", "已完成模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED' WHERE id = 'module-completed'",
+                [],
+            )
+            .expect("complete module");
+        let completed_error = terminate_relay_module_in(&connection, "module-completed")
+            .expect_err("completed module cannot be stopped");
+        assert!(completed_error.contains("已验收完成"));
+    }
+
+    #[test]
+    fn terminate_running_relay_codex_persists_stop_intent_and_finishes_without_returning_result() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-running", "运行模块");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'CODEX_RUNNING', codex_thread_id = 'thread-kept'
+                 WHERE id = 'module-running'",
+                [],
+            )
+            .expect("mark module running");
+        insert_relay_message(
+            &connection,
+            "queued-before-stop",
+            "module-running",
+            1,
+            "QUEUED",
+            "2026-08-18T00:00:00Z",
+        );
+        insert_relay_codex_cycle(&connection, "cycle-running", "module-running", 1, None)
+            .expect("insert running cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-running'",
+                [],
+            )
+            .expect("mark cycle running");
+
+        assert_eq!(
+            terminate_relay_module_with_active_turn_in(&connection, "module-running", true)
+                .expect("running turn accepts a stop request"),
+            RelayModuleTermination::StopRequested
+        );
+        let stop_requested: (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT phase, stop_after_turn, codex_thread_id
+                 FROM relay_modules WHERE id = 'module-running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after stop request");
+        assert_eq!(stop_requested.0, "CODEX_RUNNING");
+        assert_eq!(stop_requested.1, 1);
+        assert_eq!(stop_requested.2.as_deref(), Some("thread-kept"));
+        let queued_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = 'queued-before-stop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("queued message state");
+        assert_eq!(queued_state, "FAILED");
+        let stop_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events
+                 WHERE module_id = 'module-running' AND event_type = 'MODULE_STOP_REQUESTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stop request count");
+        assert_eq!(stop_events, 1);
+        assert!(matches!(
+            terminate_relay_module_with_active_turn_in(&connection, "module-running", true),
+            Ok(RelayModuleTermination::AlreadyStopRequested)
+        ));
+
+        assert_eq!(
+            complete_relay_codex_turn_in(
+                &connection,
+                "module-running",
+                "cycle-running",
+                "最终结果仍需保留。",
+            )
+            .expect("running turn may naturally complete after termination"),
+            RelayCodexTurnCompletion::StoppedAfterTurn
+        );
+        let stopped: (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT phase, stop_after_turn, codex_thread_id
+                 FROM relay_modules WHERE id = 'module-running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("stopped module");
+        assert_eq!(stopped.0, "STOPPED");
+        assert_eq!(stopped.1, 0);
+        assert_eq!(stopped.2.as_deref(), Some("thread-kept"));
+        let cycle: (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, result_text, outbound_chatgpt_message_id
+                 FROM relay_codex_cycles WHERE id = 'cycle-running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("completed cycle");
+        assert_eq!(cycle.0, "CODEX_COMPLETED");
+        assert_eq!(cycle.1.as_deref(), Some("最终结果仍需保留。"));
+        assert!(cycle.2.is_none());
+        let from_codex_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = 'module-running' AND direction = 'FROM_CODEX'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("saved final text count");
+        let outbound_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = 'module-running' AND direction = 'TO_CHATGPT'
+                   AND id != 'queued-before-stop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("result outbound count");
+        assert_eq!(from_codex_count, 1);
+        assert_eq!(outbound_count, 0);
+    }
+
+    #[test]
+    fn terminate_running_relay_codex_finishes_once_and_keeps_stop_semantics_for_failure() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-complete", "完成竞态模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'CODEX_RUNNING', stop_after_turn = 1
+                 WHERE id = 'module-complete'",
+                [],
+            )
+            .expect("prepare completion stop request");
+        insert_relay_codex_cycle(&connection, "cycle-complete", "module-complete", 1, None)
+            .expect("insert completion cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-complete'",
+                [],
+            )
+            .expect("mark completion cycle running");
+
+        for _ in 0..2 {
+            assert_eq!(
+                complete_relay_codex_turn_in(
+                    &connection,
+                    "module-complete",
+                    "cycle-complete",
+                    "同一份最终结果。",
+                )
+                .expect("completion interleaving remains idempotent"),
+                RelayCodexTurnCompletion::StoppedAfterTurn
+            );
+        }
+        let final_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = 'module-complete' AND direction = 'FROM_CODEX'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("one final history row");
+        assert_eq!(final_rows, 1);
+
+        insert_relay_module(&connection, "module-failed", "失败收尾模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'CODEX_RUNNING', stop_after_turn = 1
+                 WHERE id = 'module-failed'",
+                [],
+            )
+            .expect("prepare failed stop request");
+        insert_relay_codex_cycle(&connection, "cycle-failed", "module-failed", 1, None)
+            .expect("insert failure cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET status = 'CODEX_RUNNING' WHERE id = 'cycle-failed'",
+                [],
+            )
+            .expect("mark failure cycle running");
+        fail_relay_codex_cycle(&connection, "cycle-failed", "App Server 失败")
+            .expect("record actual failure");
+        assert!(
+            finalize_relay_module_stop_after_turn_in(&connection, "module-failed")
+                .expect("finish stop after actual failure")
+        );
+        let failed: (String, String, i64) = connection
+            .query_row(
+                "SELECT module.phase, cycle.status, module.stop_after_turn
+                 FROM relay_modules AS module
+                 JOIN relay_codex_cycles AS cycle ON cycle.module_id = module.id
+                 WHERE module.id = 'module-failed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("failed stop result");
+        assert_eq!(failed, ("STOPPED".into(), "FAILED".into(), 0));
+
+        insert_relay_module(&connection, "module-no-new-turn", "禁止新回合模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 1 WHERE id = 'module-no-new-turn'",
+                [],
+            )
+            .expect("prepare stop requested module");
+        let module = get_relay_module(&connection, "module-no-new-turn")
+            .expect("read module")
+            .expect("module exists");
+        assert_eq!(
+            relay_codex_start_block_reason(&module),
+            Some("模块正在终止，不能启动新的 Codex 回合。")
+        );
+    }
+
+    #[test]
+    fn terminate_running_relay_codex_exposes_completed_result_without_chatgpt_return() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'STOPPED' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("stop module");
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None)
+            .expect("insert cycle");
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles
+                 SET status = 'CODEX_COMPLETED', result_text = '已完成', codex_completed_at = '2026-08-18T00:00:00Z'
+                 WHERE id = 'cycle-a'",
+                [],
+            )
+            .expect("complete cycle without outbound");
+
+        let cycles = list_relay_codex_cycles_in(&connection, "module-a")
+            .expect("list stopped module cycles");
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(
+            cycles[0].block_reason.as_deref(),
+            Some("模块已由用户终止，结果未回传 ChatGPT")
+        );
+    }
+
+    #[test]
+    fn relay_codex_cycle_enforces_one_cycle_number_per_module() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None).expect("first cycle");
+        let duplicate = insert_relay_codex_cycle(&connection, "cycle-b", "module-a", 1, None);
+
+        assert!(duplicate.is_err(), "a module cycle number must be unique");
+    }
+
+    #[test]
+    fn relay_codex_cycle_create_and_read_helpers_preserve_initial_state() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_message(
+            &connection,
+            "outbound-a",
+            "module-a",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:00Z",
+        );
+
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+        assert_eq!(cycle.status, "WAITING_TO_SEND_CODEX");
+        assert_eq!(cycle.prompt_text, "请只回复 RELAY_E2E_OK");
+        assert!(cycle.codex_thread_id.is_none());
+        assert!(cycle.codex_turn_id.is_none());
+        assert!(cycle.result_text.is_none());
+        assert!(cycle.outbound_chatgpt_message_id.is_none());
+        assert!(cycle.error_text.is_none());
+        assert!(cycle.codex_started_at.is_none());
+        assert!(cycle.codex_completed_at.is_none());
+        assert!(cycle.relay_queued_at.is_none());
+        assert!(cycle.relay_delivered_at.is_none());
+        assert!(cycle.block_reason.is_none());
+        DateTime::parse_from_rfc3339(&cycle.created_at).expect("UTC RFC3339 created timestamp");
+        DateTime::parse_from_rfc3339(&cycle.updated_at).expect("UTC RFC3339 updated timestamp");
+
+        let by_id = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read cycle")
+            .expect("cycle exists");
+        assert_eq!(by_id.id, cycle.id);
+        assert!(
+            get_relay_codex_cycle_by_outbound_message(&connection, "outbound-a")
+                .expect("read unlinked message")
+                .is_none()
+        );
+
+        connection
+            .execute(
+                "UPDATE relay_codex_cycles SET outbound_chatgpt_message_id = ?1 WHERE id = ?2",
+                params!["outbound-a", &cycle.id],
+            )
+            .expect("link outbound message");
+        let by_outbound = get_relay_codex_cycle_by_outbound_message(&connection, "outbound-a")
+            .expect("read linked message")
+            .expect("cycle is linked");
+        assert_eq!(by_outbound.id, cycle.id);
+    }
+
+    #[test]
+    fn relay_codex_cycle_enforces_one_outbound_message_per_cycle() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_message(
+            &connection,
+            "outbound-a",
+            "module-a",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:00Z",
+        );
+
+        insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, Some("outbound-a"))
+            .expect("first linked cycle");
+        let duplicate =
+            insert_relay_codex_cycle(&connection, "cycle-b", "module-a", 2, Some("outbound-a"));
+
+        assert!(
+            duplicate.is_err(),
+            "an outbound message must link to only one cycle"
+        );
+    }
+
+    #[test]
+    fn relay_codex_lifecycle_persists_result_and_queues_it_once() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("mark turn started");
+        let running = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read running cycle")
+            .expect("cycle exists");
+        assert_eq!(running.status, "CODEX_RUNNING");
+        assert_eq!(running.codex_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(running.codex_turn_id.as_deref(), Some("turn-a"));
+        assert!(running.codex_started_at.is_some());
+
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("mark final text");
+        let completed = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read completed cycle")
+            .expect("cycle exists");
+        assert_eq!(completed.status, "CODEX_COMPLETED");
+        assert_eq!(completed.result_text.as_deref(), Some("RELAY_E2E_OK"));
+        assert!(completed.codex_completed_at.is_some());
+
+        let outbound_message_id = queue_relay_codex_result_to_chatgpt(&connection, &cycle.id)
+            .expect("queue Codex result");
+        let repeated_message_id = queue_relay_codex_result_to_chatgpt(&connection, &cycle.id)
+            .expect("repeat queue is idempotent");
+        assert_eq!(repeated_message_id, outbound_message_id);
+
+        let queued = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read queued cycle")
+            .expect("cycle exists");
+        assert_eq!(queued.status, "WAITING_FOR_CHATGPT");
+        assert_eq!(
+            queued.outbound_chatgpt_message_id.as_deref(),
+            Some(outbound_message_id.as_str())
+        );
+        assert!(queued.relay_queued_at.is_some());
+        let result_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = ?1 AND direction = 'TO_CHATGPT' AND kind = 'AUTOMATION'",
+                ["module-a"],
+                |row| row.get(0),
+            )
+            .expect("count result messages");
+        assert_eq!(result_messages, 1);
+
+        let event_types: Vec<String> = connection
+            .prepare(
+                "SELECT event_type FROM relay_events WHERE module_id = 'module-a'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .expect("prepare events")
+            .query_map([], |row| row.get(0))
+            .expect("query events")
+            .collect::<Result<_, _>>()
+            .expect("read events");
+        assert!(event_types
+            .iter()
+            .any(|event| event == "CODEX_TURN_STARTED"));
+        assert!(event_types
+            .iter()
+            .any(|event| event == "CODEX_RESULT_RECEIVED"));
+        assert!(event_types
+            .iter()
+            .any(|event| event == "CODEX_RESULT_QUEUED_TO_CHATGPT"));
+    }
+
+    #[test]
+    fn relay_codex_lifecycle_turn_failure_persists_failure_without_result() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请执行失败路径")
+            .expect("create cycle");
+
+        fail_relay_codex_cycle(&connection, &cycle.id, "无法启动 Codex App Server")
+            .expect("record start failure");
+
+        let failed = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read failed cycle")
+            .expect("cycle exists");
+        assert_eq!(failed.status, "FAILED");
+        assert_eq!(
+            failed.error_text.as_deref(),
+            Some("无法启动 Codex App Server")
+        );
+        assert!(failed.result_text.is_none());
+        assert!(failed.outbound_chatgpt_message_id.is_none());
+        let outbound_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages
+                 WHERE module_id = ?1 AND direction = 'TO_CHATGPT'",
+                ["module-a"],
+                |row| row.get(0),
+            )
+            .expect("count outbound messages");
+        assert_eq!(outbound_count, 0);
+        let failure_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events
+                 WHERE module_id = ?1 AND event_type = 'CODEX_TURN_FAILED'",
+                ["module-a"],
+                |row| row.get(0),
+            )
+            .expect("count failure events");
+        assert_eq!(failure_events, 1);
+    }
+
+    #[test]
+    fn codex_cycle_chatgpt_delivery_tracks_fifo_claim_and_matching_reply_once() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start turn");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("persist result");
+        let message_id =
+            queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+
+        let message = match claim_next_relay_message_for_dispatch(&connection)
+            .expect("claim global FIFO message")
+        {
+            RelayDispatchClaim::Message(message) => message,
+            _ => panic!("Codex result should be claimed for dispatch"),
+        };
+        assert_eq!(message.id, message_id);
+        let sending = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read sending cycle")
+            .expect("cycle exists");
+        assert_eq!(sending.status, "SENDING_TO_CHATGPT");
+
+        connection
+            .execute(
+                "UPDATE relay_messages SET delivery_state = 'DELIVERED', delivered_at = ?2 WHERE id = ?1",
+                params![&message_id, "2026-08-17T00:00:02Z"],
+            )
+            .expect("accept matching chatgptReply");
+        sync_codex_cycle_for_chatgpt_message_state(&connection, &message_id, "DELIVERED", None)
+            .expect("sync matching reply delivery");
+
+        let delivered = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read delivered cycle")
+            .expect("cycle exists");
+        assert_eq!(delivered.status, "DELIVERED_TO_CHATGPT");
+        assert!(delivered.relay_delivered_at.is_some());
+        let send_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events
+                 WHERE module_id = 'module-a' AND event_type = 'CODEX_RESULT_SEND_STARTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count send-start events");
+        let delivered_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_events
+                 WHERE module_id = 'module-a' AND event_type = 'CODEX_RESULT_DELIVERED_TO_CHATGPT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count delivered events");
+        assert_eq!(send_events, 1);
+        assert_eq!(delivered_events, 1);
+    }
+
+    #[test]
+    fn codex_cycle_chatgpt_delivery_restart_marks_result_unknown_without_rerunning_codex() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start turn");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("persist result");
+        let message_id =
+            queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim result") {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.id, message_id),
+            _ => panic!("Codex result should be in flight before restart"),
+        }
+
+        mark_uncertain_relay_deliveries(&connection).expect("restart recovery");
+
+        let uncertain = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read uncertain cycle")
+            .expect("cycle exists");
+        assert_eq!(uncertain.status, "WAITING_FOR_CHATGPT");
+        assert_eq!(uncertain.result_text.as_deref(), Some("RELAY_E2E_OK"));
+        assert!(uncertain.error_text.is_some());
+        let outbound_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'module-a' AND direction = 'TO_CHATGPT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count outbound results");
+        let cycle_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = 'module-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count cycles");
+        assert_eq!(outbound_count, 1);
+        assert_eq!(cycle_count, 1);
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection),
+            Ok(RelayDispatchClaim::RecoveryBlocked(1))
+        ));
+    }
+
+    #[test]
+    fn codex_cycle_chatgpt_delivery_explicit_recovery_reuses_or_abandons_the_linked_result() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "请只回复 RELAY_E2E_OK")
+            .expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start turn");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("persist result");
+        let message_id =
+            queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim result") {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.id, message_id),
+            _ => panic!("Codex result should be in flight"),
+        }
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            &message_id,
+            "CHATGPT_TRANSPORT_FAILURE",
+            "transport outcome unknown",
+        )
+        .expect("mark result uncertain");
+
+        requeue_unknown_relay_message(&connection, &message_id).expect("explicit resend");
+        let requeued = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read requeued cycle")
+            .expect("cycle exists");
+        assert_eq!(requeued.status, "WAITING_FOR_CHATGPT");
+        assert_eq!(
+            requeued.outbound_chatgpt_message_id.as_deref(),
+            Some(message_id.as_str())
+        );
+
+        match claim_next_relay_message_for_dispatch(&connection).expect("claim explicit resend") {
+            RelayDispatchClaim::Message(message) => assert_eq!(message.id, message_id),
+            _ => panic!("explicit resend must reuse the original result message"),
+        }
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            &message_id,
+            "CHATGPT_TRANSPORT_FAILURE",
+            "transport outcome unknown again",
+        )
+        .expect("mark retried result uncertain");
+        resolve_unknown_relay_message_without_resend(&connection, &message_id)
+            .expect("explicitly continue without resending");
+
+        let failed = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read failed cycle")
+            .expect("cycle exists");
+        assert_eq!(failed.status, "FAILED");
+        assert_eq!(failed.result_text.as_deref(), Some("RELAY_E2E_OK"));
+        let outbound_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'module-a' AND direction = 'TO_CHATGPT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count outbound results");
+        assert_eq!(
+            outbound_count, 1,
+            "continue without resend must not allocate a replacement"
+        );
+        let message_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .expect("read original message state");
+        assert_eq!(message_state, "FAILED");
+    }
+
+    #[test]
+    fn relay_channel_snapshot_is_idle_without_in_flight_chatgpt_or_running_codex() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+
+        let snapshot = relay_channel_snapshot_from_connection(&connection)
+            .expect("read idle channel snapshot");
+
+        assert_eq!(snapshot.chatgpt.status, "IDLE");
+        assert_eq!(snapshot.chatgpt.recovery_blocker_count, 0);
+        assert!(snapshot.chatgpt.active_message_id.is_none());
+        assert_eq!(snapshot.codex.status, "IDLE");
+        assert!(snapshot.codex.active_module_id.is_none());
+    }
+
+    #[test]
+    fn relay_channel_snapshot_reports_sent_message_as_chatgpt_in_flight() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_message(
+            &connection,
+            "message-a",
+            "module-a",
+            1,
+            "SENT",
+            "2026-08-17T00:00:00Z",
+        );
+
+        let snapshot = relay_channel_snapshot_from_connection(&connection)
+            .expect("read in-flight channel snapshot");
+
+        assert_eq!(snapshot.chatgpt.status, "IN_FLIGHT");
+        assert_eq!(
+            snapshot.chatgpt.active_module_id.as_deref(),
+            Some("module-a")
+        );
+        assert_eq!(
+            snapshot.chatgpt.active_module_name.as_deref(),
+            Some("模块 A")
+        );
+        assert_eq!(
+            snapshot.chatgpt.active_message_id.as_deref(),
+            Some("message-a")
+        );
+        assert_eq!(snapshot.chatgpt.active_kind.as_deref(), Some("AUTOMATION"));
+        assert_eq!(snapshot.chatgpt.active_phase.as_deref(), Some("SENT"));
+        assert_eq!(snapshot.chatgpt.recovery_blocker_count, 0);
+    }
+
+    #[test]
+    fn relay_channel_snapshot_gives_unknown_priority_over_sent_message() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_message(
+            &connection,
+            "sent-a",
+            "module-a",
+            1,
+            "SENT",
+            "2026-08-17T00:00:00Z",
+        );
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-17T00:00:01Z",
+        );
+
+        let snapshot = relay_channel_snapshot_from_connection(&connection)
+            .expect("read recovery-blocked channel snapshot");
+
+        assert_eq!(snapshot.chatgpt.status, "RECOVERY_BLOCKED");
+        assert_eq!(snapshot.chatgpt.recovery_blocker_count, 1);
+        assert_eq!(
+            snapshot.chatgpt.active_message_id.as_deref(),
+            Some("unknown-b")
+        );
+        assert_eq!(snapshot.chatgpt.active_phase.as_deref(), Some("UNKNOWN"));
+    }
+
+    #[test]
+    fn relay_channel_snapshot_reports_the_single_running_codex_cycle() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 4, "执行任务").expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
+            .expect("start cycle");
+
+        let snapshot = relay_channel_snapshot_from_connection_with_live_runtime(
+            &connection,
+            Some(&RelayCodexLiveRuntime {
+                module_id: "module-a".into(),
+                turn_active: true,
+            }),
+        )
+        .expect("read running Codex snapshot");
+
+        assert_eq!(snapshot.codex.status, "RUNNING");
+        assert_eq!(snapshot.codex.active_module_id.as_deref(), Some("module-a"));
+        assert_eq!(snapshot.codex.active_module_name.as_deref(), Some("模块 A"));
+        assert_eq!(snapshot.codex.cycle_number, Some(4));
+        assert_eq!(snapshot.codex.codex_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(snapshot.codex.codex_turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(
+            snapshot.codex.cycle_status.as_deref(),
+            Some("CODEX_RUNNING")
+        );
+    }
+
+    #[test]
+    fn relay_channel_snapshot_explains_when_completed_cycle_waits_for_another_module() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_message(
+            &connection,
+            "sent-b",
+            "module-b",
+            1,
+            "SENT",
+            "2026-08-17T00:00:00Z",
+        );
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 1, "执行任务").expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), None)
+            .expect("start cycle");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("complete cycle");
+        queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+
+        let cycles =
+            list_relay_codex_cycles_in(&connection, "module-a").expect("list module cycles");
+
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].status, "WAITING_FOR_CHATGPT");
+        assert_eq!(
+            cycles[0].block_reason.as_deref(),
+            Some("ChatGPT 通道当前被模块「模块 B」占用（消息 sent-b）。")
+        );
+    }
+
+    #[test]
+    fn relay_channel_snapshot_explains_recovery_blockers_for_waiting_cycles() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-17T00:00:00Z",
+        );
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 1, "执行任务").expect("create cycle");
+        mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), None)
+            .expect("start cycle");
+        mark_relay_codex_result_received(&connection, &cycle.id, "RELAY_E2E_OK")
+            .expect("complete cycle");
+        queue_relay_codex_result_to_chatgpt(&connection, &cycle.id).expect("queue result");
+
+        let cycles =
+            list_relay_codex_cycles_in(&connection, "module-a").expect("list module cycles");
+
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(
+            cycles[0].block_reason.as_deref(),
+            Some("存在待人工处理的不确定送达消息（1 条）。")
+        );
+    }
+
+    #[test]
+    fn adapter_failure_marks_relay_delivery_unknown_without_parsing_or_retrying() {
+        let connection = relay_connection();
+        let now = "2026-08-17T00:00:00Z";
+        connection.execute(
+            "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
+             VALUES ('relay-1', 'Relay', 'G:\\workspace', 12, 240, 'retry', 'READY', 0, 0, ?1, ?1)",
+            [now],
+        ).expect("relay module");
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at)
+             VALUES ('outgoing-1', 'relay-1', 1, 'TO_CHATGPT', 'AUTOMATION', 'request', 'SENT', ?1)",
+            [now],
+        ).expect("outgoing relay message");
+
+        pause_relay_for_uncertain_delivery(
+            &connection,
+            "outgoing-1",
+            "CHATGPT_ADAPTER_FAILURE",
+            "adapter failed after the send may have started",
+        )
+        .expect("adapter failure is recorded");
+
+        let (delivery_state, phase, invalid_reply_count): (String, String, i64) = connection.query_row(
+            "SELECT message.delivery_state, module.phase, module.invalid_reply_count
+             FROM relay_messages AS message JOIN relay_modules AS module ON module.id = message.module_id
+             WHERE message.id = 'outgoing-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).expect("relay state");
+        assert_eq!(delivery_state, "UNKNOWN");
+        assert_eq!(phase, "RECOVERY_REQUIRED");
+        assert_eq!(invalid_reply_count, 0);
+
+        let incoming_replies: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'relay-1' AND direction = 'FROM_CHATGPT'",
+            [],
+            |row| row.get(0),
+        ).expect("incoming reply count");
+        let queued_retries: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE module_id = 'relay-1' AND direction = 'TO_CHATGPT' AND delivery_state = 'QUEUED'",
+            [],
+            |row| row.get(0),
+        ).expect("retry count");
+        assert_eq!(incoming_replies, 0);
+        assert_eq!(queued_retries, 0);
+    }
+
+    #[test]
+    fn unknown_relay_delivery_only_requeues_after_an_explicit_user_action() {
+        let connection = relay_connection();
+        let now = "2026-08-17T00:00:00Z";
+        connection.execute(
+            "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
+             VALUES ('relay-1', 'Relay', 'G:\\workspace', 12, 240, 'retry', 'RECOVERY_REQUIRED', 0, 0, ?1, ?1)",
+            [now],
+        ).expect("relay module");
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at)
+             VALUES ('outgoing-1', 'relay-1', 1, 'TO_CHATGPT', 'AUTOMATION', 'request', 'UNKNOWN', ?1)",
+            [now],
+        ).expect("unknown relay message");
+
+        requeue_unknown_relay_message(&connection, "outgoing-1")
+            .expect("explicit resend requeues the message");
+
+        let (delivery_state, phase): (String, String) = connection.query_row(
+            "SELECT message.delivery_state, module.phase
+             FROM relay_messages AS message JOIN relay_modules AS module ON module.id = message.module_id
+             WHERE message.id = 'outgoing-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("requeued relay state");
+        assert_eq!(delivery_state, "QUEUED");
+        assert_eq!(phase, "READY");
+    }
+
+    #[test]
+    fn all_global_unknown_blockers_remain_visible_until_each_is_explicitly_resolved() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        insert_relay_module(&connection, "module-c", "模块 C");
+        insert_relay_message(
+            &connection,
+            "unknown-a",
+            "module-a",
+            4,
+            "UNKNOWN",
+            "2026-08-17T00:00:01Z",
+        );
+        insert_relay_message(
+            &connection,
+            "queued-b",
+            "module-b",
+            1,
+            "QUEUED",
+            "2026-08-17T00:00:02Z",
+        );
+        insert_relay_message(
+            &connection,
+            "unknown-c",
+            "module-c",
+            2,
+            "UNKNOWN",
+            "2026-08-17T00:00:03Z",
+        );
+
+        let blockers = list_relay_recovery_messages_in(&connection).expect("all recovery blockers");
+        assert_eq!(blockers.len(), 2);
+        assert_eq!(blockers[0].module_name, "模块 A");
+        assert_eq!(blockers[1].module_name, "模块 C");
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection),
+            Ok(RelayDispatchClaim::RecoveryBlocked(2))
+        ));
+
+        resolve_unknown_relay_message_without_resend(&connection, "unknown-a")
+            .expect("explicit continue without resend");
+        let remaining = list_relay_recovery_messages_in(&connection).expect("remaining blocker");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].message_id, "unknown-c");
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection),
+            Ok(RelayDispatchClaim::RecoveryBlocked(1))
+        ));
+
+        resolve_unknown_relay_message_without_resend(&connection, "unknown-c")
+            .expect("resolve final blocker without resending it");
+        let old_message_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = 'unknown-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("old message state");
+        assert_eq!(old_message_state, "FAILED");
+        let message =
+            match claim_next_relay_message_for_dispatch(&connection).expect("queue resumes") {
+                RelayDispatchClaim::Message(message) => message,
+                _ => panic!("the queued message must dispatch after every UNKNOWN is resolved"),
+            };
+        assert_eq!(message.id, "queued-b");
+        record_relay_message_dispatched(&connection, &message).expect("dispatch event");
+        let events: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-b' AND event_type IN ('CHATGPT_SEND_STARTED', 'CHATGPT_SEND_DISPATCHED')",
+            [], |row| row.get(0),
+        ).expect("dispatch event count");
+        assert_eq!(events, 2);
+    }
+
+    #[test]
+    fn explicit_resend_requeues_only_the_selected_unknown_message_once() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_message(
+            &connection,
+            "unknown-a",
+            "module-a",
+            1,
+            "UNKNOWN",
+            "2026-08-17T00:00:01Z",
+        );
+
+        requeue_unknown_relay_message(&connection, "unknown-a").expect("explicit resend");
+        let message = match claim_next_relay_message_for_dispatch(&connection)
+            .expect("requeued message dispatches")
+        {
+            RelayDispatchClaim::Message(message) => message,
+            _ => panic!("the selected message must be the only dispatch candidate"),
+        };
+        assert_eq!(message.id, "unknown-a");
+        let resend_events: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM relay_events WHERE module_id = 'module-a' AND event_type = 'CHATGPT_EXPLICIT_RESEND'",
+            [], |row| row.get(0),
+        ).expect("explicit resend count");
+        assert_eq!(resend_events, 1);
+    }
+
+    #[test]
+    fn restart_marks_sent_relay_messages_unknown_without_requeueing_them() {
+        let connection = relay_connection();
+        let now = "2026-08-17T00:00:00Z";
+        connection.execute(
+            "INSERT INTO relay_modules (id, name, working_directory, max_cycles, max_runtime_minutes, retry_template, phase, invalid_reply_count, started_cycles, created_at, updated_at)
+             VALUES ('relay-1', 'Relay', 'G:\\workspace', 12, 240, 'retry', 'READY', 0, 0, ?1, ?1)",
+            [now],
+        ).expect("relay module");
+        connection.execute(
+            "INSERT INTO relay_messages (id, module_id, sequence_number, direction, kind, text, delivery_state, created_at)
+             VALUES ('outgoing-1', 'relay-1', 1, 'TO_CHATGPT', 'AUTOMATION', 'request', 'SENT', ?1)",
+            [now],
+        ).expect("sent relay message");
+
+        mark_uncertain_relay_deliveries(&connection).expect("restart recovery");
+
+        let delivery_state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = 'outgoing-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("recovered delivery state");
+        let queued_messages: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_messages WHERE delivery_state = 'QUEUED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("queued message count");
+        assert_eq!(delivery_state, "UNKNOWN");
+        assert_eq!(queued_messages, 0);
     }
 
     #[test]
@@ -3191,6 +12404,7 @@ pub fn run() {
             let connection = create_connection(app.handle())?;
             pause_unfinished_orchestrations(&connection)?;
             mark_uncertain_relay_deliveries(&connection)?;
+            recover_relay_codex_thread_registry_on_restart_in(&connection)?;
             let chatgpt_bridge = Arc::new(ChatGptBridge::new());
             start_chatgpt_bridge(app.handle().clone(), chatgpt_bridge.clone())?;
             app.manage(AppState {
@@ -3211,9 +12425,20 @@ pub fn run() {
             get_chatgpt_pairing,
             send_chatgpt_message,
             create_relay_module,
+            list_relay_codex_threads_for_cwd,
+            recover_relay_codex,
+            get_relay_codex_thread_state,
+            accept_relay_module,
+            terminate_relay_module,
+            submit_relay_acceptance_feedback,
             list_relay_modules,
             list_relay_messages,
+            list_relay_codex_cycles,
+            get_relay_channel_snapshot,
+            list_relay_recovery_messages,
             queue_relay_message,
+            retry_unknown_relay_message,
+            continue_unknown_relay_message_without_resend,
             start_module_orchestration,
             get_orchestration_snapshot,
             apply_acceptance_action
