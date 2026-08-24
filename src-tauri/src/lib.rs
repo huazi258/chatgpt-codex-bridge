@@ -740,62 +740,66 @@ fn release_relay_codex_runtime(app: &AppHandle, module_id: &str) -> Result<(), S
     )
 }
 
-fn mark_relay_codex_thread_released_in(
-    connection: &Connection,
-    module_id: &str,
-) -> Result<(), String> {
-    let module =
-        get_relay_module(connection, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
-    let Some(thread_id) = module.codex_thread_id.as_deref() else {
-        return Ok(());
-    };
-    connection
-        .execute(
-            "UPDATE relay_codex_threads
-             SET state = 'RELEASED', owner_module_id = NULL, last_module_id = ?2,
-                 reservation_previous_state = NULL, updated_at = ?3
-             WHERE thread_id = ?1 AND state = 'ACTIVE' AND owner_module_id = ?2",
-            params![thread_id, module_id, Utc::now().to_rfc3339()],
-        )
-        .map_err(|error| format!("无法登记 Codex 对话已释放：{error}"))?;
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayCodexThreadReleaseOutcome {
+    Persisted,
+    NoOwnedActiveThread,
 }
 
-fn mark_relay_codex_thread_release_unknown_in(
+fn persist_relay_codex_thread_release_outcome_in(
     connection: &Connection,
     module_id: &str,
-) -> Result<(), String> {
+    confirmed: bool,
+    detail: &str,
+) -> Result<RelayCodexThreadReleaseOutcome, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始 Codex 对话释放结果事务：{error}"))?;
     let module =
-        get_relay_module(connection, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+        get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
     let Some(thread_id) = module.codex_thread_id.as_deref() else {
-        return Ok(());
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交 Codex 对话释放结果事务：{error}"))?;
+        return Ok(RelayCodexThreadReleaseOutcome::NoOwnedActiveThread);
     };
-    connection
+    let state = if confirmed { "RELEASED" } else { "UNAVAILABLE" };
+    let changed = transaction
         .execute(
             "UPDATE relay_codex_threads
-             SET state = 'UNAVAILABLE', owner_module_id = NULL, last_module_id = ?2,
-                 reservation_previous_state = NULL, updated_at = ?3
+             SET state = ?3, owner_module_id = NULL, last_module_id = ?2,
+                 reservation_previous_state = NULL, updated_at = ?4
              WHERE thread_id = ?1 AND state = 'ACTIVE' AND owner_module_id = ?2",
-            params![thread_id, module_id, Utc::now().to_rfc3339()],
+            params![thread_id, module_id, state, Utc::now().to_rfc3339()],
         )
-        .map_err(|error| format!("无法登记 Codex 对话释放结果不确定：{error}"))?;
-    Ok(())
+        .map_err(|error| format!("无法登记 Codex 对话释放结果：{error}"))?;
+    if changed != 1 {
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交 Codex 对话释放结果事务：{error}"))?;
+        return Ok(RelayCodexThreadReleaseOutcome::NoOwnedActiveThread);
+    }
+    append_relay_event(
+        &transaction,
+        module_id,
+        if confirmed {
+            "CODEX_THREAD_RELEASED"
+        } else {
+            "CODEX_THREAD_RELEASE_FAILED"
+        },
+        detail,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 对话释放结果事务：{error}"))?;
+    Ok(RelayCodexThreadReleaseOutcome::Persisted)
 }
 
-fn release_relay_codex_target_on_terminal_in(
+fn rollback_relay_codex_reservation_on_terminal_in(
     connection: &Connection,
     module: &RelayModuleRecord,
 ) -> Result<(), String> {
-    if let Some(thread_id) = module.codex_thread_id.as_deref() {
-        connection
-            .execute(
-                "UPDATE relay_codex_threads
-                 SET state = 'RELEASED', owner_module_id = NULL, last_module_id = ?2,
-                     reservation_previous_state = NULL, updated_at = ?3
-                 WHERE thread_id = ?1 AND state = 'ACTIVE' AND owner_module_id = ?2",
-                params![thread_id, &module.id, Utc::now().to_rfc3339()],
-            )
-            .map_err(|error| format!("无法释放 Codex 对话登记：{error}"))?;
+    if module.codex_thread_id.is_some() {
         return Ok(());
     }
     let Some(thread_id) = module.resume_thread_id.as_deref() else {
@@ -3340,7 +3344,7 @@ fn accept_relay_module_in(
             &format!("requestId={message_id}; 模块已验收完成，消息未发送。"),
         )?;
     }
-    release_relay_codex_target_on_terminal_in(&transaction, &module)?;
+    rollback_relay_codex_reservation_on_terminal_in(&transaction, &module)?;
     transaction
         .execute(
             "UPDATE relay_modules SET phase = 'COMPLETED', updated_at = ?2 WHERE id = ?1",
@@ -3466,7 +3470,7 @@ fn terminate_relay_module_with_active_turn_in(
         )?;
         RelayModuleTermination::StopRequested
     } else {
-        release_relay_codex_target_on_terminal_in(&transaction, &module)?;
+        rollback_relay_codex_reservation_on_terminal_in(&transaction, &module)?;
         transaction
             .execute(
                 "UPDATE relay_modules
@@ -3624,11 +3628,10 @@ fn accept_relay_module(
                 .connection
                 .lock()
                 .map_err(|_| "数据库锁已损坏。".to_string())?;
-            mark_relay_codex_thread_released_in(&connection, &module_id)?;
-            append_relay_event(
+            let _ = persist_relay_codex_thread_release_outcome_in(
                 &connection,
                 &module_id,
-                "CODEX_THREAD_RELEASED",
+                true,
                 "模块已验收完成，Codex 对话已释放。",
             )?;
         }
@@ -3637,11 +3640,10 @@ fn accept_relay_module(
                 .connection
                 .lock()
                 .map_err(|_| "数据库锁已损坏。".to_string())?;
-            mark_relay_codex_thread_release_unknown_in(&connection, &module_id)?;
-            append_relay_event(
+            let _ = persist_relay_codex_thread_release_outcome_in(
                 &connection,
                 &module_id,
-                "CODEX_THREAD_RELEASE_FAILED",
+                false,
                 &format!("模块已验收完成，但 Codex 对话释放失败：{error}"),
             )?;
             let _ = app.emit(
@@ -3699,11 +3701,10 @@ fn terminate_relay_module(
                 .connection
                 .lock()
                 .map_err(|_| "数据库锁已损坏。".to_string())?;
-            mark_relay_codex_thread_released_in(&connection, &module_id)?;
-            append_relay_event(
+            let _ = persist_relay_codex_thread_release_outcome_in(
                 &connection,
                 &module_id,
-                "CODEX_THREAD_RELEASED",
+                true,
                 "模块已终止，Codex 对话已释放。",
             )?;
         }
@@ -3712,11 +3713,10 @@ fn terminate_relay_module(
                 .connection
                 .lock()
                 .map_err(|_| "数据库锁已损坏。".to_string())?;
-            mark_relay_codex_thread_release_unknown_in(&connection, &module_id)?;
-            append_relay_event(
+            let _ = persist_relay_codex_thread_release_outcome_in(
                 &connection,
                 &module_id,
-                "CODEX_THREAD_RELEASE_FAILED",
+                false,
                 &format!("模块已终止，但 Codex 对话释放失败：{error}"),
             )?;
             let _ = app.emit(
@@ -5398,26 +5398,7 @@ fn relay_codex_worker(
     );
     let release_result = transport.shutdown();
     let state = app.state::<AppState>();
-    let cleared_session = clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
-    if release_acknowledgement.is_none() && cleared_session {
-        if let Ok(connection) = state.connection.lock() {
-            let stopped = connection
-                .query_row(
-                    "SELECT phase = 'STOPPED' FROM relay_modules WHERE id = ?1",
-                    [&module_id],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap_or(false);
-            if stopped {
-                let _ = append_relay_event(
-                    &connection,
-                    &module_id,
-                    "CODEX_THREAD_RELEASED",
-                    "模块已终止，Codex 对话已在当前回合收尾后释放。",
-                );
-            }
-        }
-    }
+    clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
     if let Some(acknowledgement) = release_acknowledgement {
         let _ = acknowledgement.send(release_result);
     }
@@ -6132,17 +6113,20 @@ fn finish_stopped_relay_codex_runtime(app: AppHandle, module_id: String, cycle_i
         let state = app.state::<AppState>();
         let release_result = release_relay_codex_runtime(&app, &module_id);
         if let Ok(connection) = state.connection.lock() {
-            let (event_type, detail) = match release_result {
-                Ok(()) => (
-                    "CODEX_THREAD_RELEASED",
-                    "模块已终止，当前 Codex 回合结束后已释放 Codex 对话。".to_string(),
+            let _ = match release_result {
+                Ok(()) => persist_relay_codex_thread_release_outcome_in(
+                    &connection,
+                    &module_id,
+                    true,
+                    "模块已终止，当前 Codex 回合结束后已释放 Codex 对话。",
                 ),
-                Err(error) => (
-                    "CODEX_THREAD_RELEASE_FAILED",
-                    format!("模块已终止，但 Codex 对话释放失败：{error}"),
+                Err(error) => persist_relay_codex_thread_release_outcome_in(
+                    &connection,
+                    &module_id,
+                    false,
+                    &format!("模块已终止，但 Codex 对话释放失败：{error}"),
                 ),
             };
-            let _ = append_relay_event(&connection, &module_id, event_type, &detail);
         }
         emit_relay_codex_changed(&app, &module_id, &cycle_id, "STOPPED");
         let _ = app.emit(
@@ -8890,7 +8874,16 @@ mod tests {
             },
         )
         .expect("seed active");
-        mark_relay_codex_thread_released_in(&connection, "module-a").expect("release active");
+        assert_eq!(
+            persist_relay_codex_thread_release_outcome_in(
+                &connection,
+                "module-a",
+                true,
+                "test release",
+            )
+            .expect("release active"),
+            RelayCodexThreadReleaseOutcome::Persisted
+        );
         let released = get_relay_codex_thread(&connection, "thread-active")
             .expect("read released")
             .expect("registry record");
@@ -8921,7 +8914,7 @@ mod tests {
         let module_b = get_relay_module(&connection, "module-b")
             .expect("read module")
             .expect("module exists");
-        release_relay_codex_target_on_terminal_in(&connection, &module_b)
+        rollback_relay_codex_reservation_on_terminal_in(&connection, &module_b)
             .expect("restore reservation");
         let restored = get_relay_codex_thread(&connection, "thread-reserved")
             .expect("read restored")
