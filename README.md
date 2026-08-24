@@ -129,6 +129,7 @@ npm install --registry=https://registry.npmjs.org
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 npm run tauri -- dev
 ```
+或者双击 Start Bridge.cmd
 
 启动成功后，会打开一个中文桌面界面。
 
