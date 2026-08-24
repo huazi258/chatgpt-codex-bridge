@@ -3258,24 +3258,37 @@ fn create_relay_module(
     if !Path::new(input.working_directory.trim()).is_dir() {
         return Err("所选 Codex 工作目录不存在。".into());
     }
-    let candidates = match &input.codex_thread_target {
-        RelayCodexThreadTargetInput::New => Vec::new(),
-        RelayCodexThreadTargetInput::Existing { .. } => {
-            let registry = {
-                let connection = state
-                    .connection
-                    .lock()
-                    .map_err(|_| "数据库锁已损坏。".to_string())?;
-                list_relay_codex_threads(&connection)?
-            };
-            discover_relay_codex_threads_for_cwd(input.working_directory.trim(), &registry)?
-        }
+    let registry = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        list_relay_codex_threads(&connection)?
     };
+    let candidates =
+        revalidate_relay_codex_thread_target_for_creation(&state.relay_codex, &input, &registry)?;
     let connection = state
         .connection
         .lock()
         .map_err(|_| "数据库锁已损坏。".to_string())?;
     create_relay_module_in(&connection, &input, &candidates)
+}
+
+fn revalidate_relay_codex_thread_target_for_creation(
+    sessions: &Mutex<Option<RelayCodexSession>>,
+    input: &RelayModuleInput,
+    registry: &[RelayCodexThreadRecord],
+) -> Result<Vec<RelayCodexThreadCandidate>, String> {
+    match &input.codex_thread_target {
+        RelayCodexThreadTargetInput::New => Ok(Vec::new()),
+        RelayCodexThreadTargetInput::Existing { .. } => {
+            discover_relay_codex_threads_for_cwd_guarded(
+                sessions,
+                input.working_directory.trim(),
+                registry,
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8747,6 +8760,47 @@ mod tests {
         )
         .expect_err("occupied runtime rejects discovery");
         assert!(error.contains("不能同时发现对话"));
+    }
+
+    #[test]
+    fn relay_codex_creation_revalidation_uses_the_runtime_discovery_guard() {
+        let (sender, _receiver) = std_mpsc::channel();
+        let sessions = Mutex::new(Some(RelayCodexSession {
+            module_id: "module-a".into(),
+            commands: sender,
+            turn_active: Arc::new(AtomicBool::new(false)),
+        }));
+        let connection = relay_connection();
+        let mut new_input = relay_module_input(RelayCodexThreadTargetInput::New);
+        new_input.working_directory = r"G:\definitely-not-a-working-directory".into();
+        assert!(
+            revalidate_relay_codex_thread_target_for_creation(&sessions, &new_input, &[])
+                .expect("NEW does not discover")
+                .is_empty()
+        );
+
+        let existing_input = relay_module_input(RelayCodexThreadTargetInput::Existing {
+            thread_id: "thread-existing".into(),
+        });
+        let error =
+            revalidate_relay_codex_thread_target_for_creation(&sessions, &existing_input, &[])
+                .expect_err("occupied runtime rejects creation revalidation before discovery");
+        assert!(error.contains("不能同时发现对话"));
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_modules", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no module created after rejected revalidation"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_codex_threads", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("no thread reservation after rejected revalidation"),
+            0
+        );
     }
 
     #[test]
