@@ -1,319 +1,131 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { CodexCommunicationPanel } from './components/CodexCommunicationPanel';
-import { GlobalChannelStatus } from './components/GlobalChannelStatus';
-import { RelayAcceptancePanel } from './components/RelayAcceptancePanel';
-import { RelayModuleActions } from './components/RelayModuleActions';
-import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
-import { RelayCodexThreadCandidateList } from './components/RelayCodexThreadCandidateList';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { Conversation } from './components/Conversation';
+import { Modal } from './components/Modal';
+import { NewSessionForm } from './components/NewSessionForm';
 import { RelayCodexRecoveryPanel } from './components/RelayCodexRecoveryPanel';
-import type { RelayCodexRecoveryAction, RelayCodexThreadCandidate, RelayCodexThreadStateSnapshot, RelayCodexThreadTarget, RelayModuleCreationInput, RelayThreadResumeModuleFields } from './relay-thread-resume';
-
-type RelayKind = 'MANUAL' | 'AUTOMATION';
-
-interface PairingInfo { endpoint: string; pairingSecret: string; paired: boolean; }
-interface BridgeStatus { phase: string; detail: string; }
-interface RelayModule extends RelayThreadResumeModuleFields {
-  id: string; name: string; workingDirectory: string; maxCycles: number; maxRuntimeMinutes: number;
-  retryTemplate: string; phase: string; invalidReplyCount: number; startedCycles: number;
-  stopAfterTurn: boolean;
-}
-interface RelayMessage {
-  id: string; sequenceNumber: number; direction: 'TO_CHATGPT' | 'FROM_CHATGPT' | 'TO_CODEX' | 'FROM_CODEX';
-  kind: 'MANUAL' | 'AUTOMATION' | 'SYSTEM'; text: string; deliveryState: string;
-}
-interface RelayRecoveryMessage {
-  messageId: string; moduleId: string; moduleName: string; sequenceNumber: number; kind: RelayKind; createdAt: string;
-}
+import { SessionInspector } from './components/SessionInspector';
+import { SessionSidebar } from './components/SessionSidebar';
+import { TopBar } from './components/TopBar';
+import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
+import type { RelayCodexRecoveryAction, RelayCodexThreadCandidate, RelayCodexThreadStateSnapshot, RelayCodexThreadTarget, RelayModuleCreationInput } from './relay-thread-resume';
+import { terminalPhases, type BridgeStatus, type PairingInfo, type RelayKind, type RelayMessage, type RelayModule, type RelayRecoveryMessage } from './relay-ui';
 
 const defaultRetry = '请根据既定格式，在回复最后且仅输出一个有效控制块：@@@CODEX_PROMPT@@@、@@@MODULE_DONE@@@ 或 @@@BLOCKED@@@。';
-const terminalPhases = new Set(['COMPLETED', 'STOPPED']);
+const emptyDraft = { name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry };
 
 export default function App() {
   const [modules, setModules] = useState<RelayModule[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [isCreatingModule, setIsCreatingModule] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [messages, setMessages] = useState<RelayMessage[]>([]);
   const [recoveryMessages, setRecoveryMessages] = useState<RelayRecoveryMessage[]>([]);
-  const [codexCycles, setCodexCycles] = useState<RelayCodexCycle[]>([]);
-  const [channelSnapshot, setChannelSnapshot] = useState<RelayChannelSnapshot | null>(null);
+  const [cycles, setCycles] = useState<RelayCodexCycle[]>([]);
+  const [snapshot, setSnapshot] = useState<RelayChannelSnapshot | null>(null);
   const [pairing, setPairing] = useState<PairingInfo | null>(null);
   const [bridge, setBridge] = useState<BridgeStatus | null>(null);
   const [notice, setNotice] = useState('正在加载本地传话状态…');
   const [busy, setBusy] = useState(false);
-  const [draft, setDraft] = useState({ name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry });
-  const [codexThreadTarget, setCodexThreadTarget] = useState<RelayCodexThreadTarget>({ mode: 'NEW' });
-  const [threadCandidates, setThreadCandidates] = useState<RelayCodexThreadCandidate[] | null>(null);
-  const [threadRefreshBusy, setThreadRefreshBusy] = useState(false);
-  const [codexRecoveryState, setCodexRecoveryState] = useState<RelayCodexThreadStateSnapshot | null>(null);
+  const [draft, setDraft] = useState(emptyDraft);
+  const [target, setTarget] = useState<RelayCodexThreadTarget>({ mode: 'NEW' });
+  const [candidates, setCandidates] = useState<RelayCodexThreadCandidate[] | null>(null);
+  const [refreshingThreads, setRefreshingThreads] = useState(false);
+  const [recoveryState, setRecoveryState] = useState<RelayCodexThreadStateSnapshot | null>(null);
   const [text, setText] = useState('');
   const [kind, setKind] = useState<RelayKind>('MANUAL');
-  const selected = useMemo(
-    () => isCreatingModule ? null : modules.find((item) => item.id === selectedId) ?? null,
-    [isCreatingModule, modules, selectedId],
-  );
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('relay.sidebar.collapsed') === 'true');
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(() => localStorage.getItem('relay.inspector.collapsed') === 'true');
+  const [connectionOpen, setConnectionOpen] = useState(false);
+  const [acceptanceOpen, setAcceptanceOpen] = useState(false);
+  const [acceptanceFeedback, setAcceptanceFeedback] = useState(false);
+  const [feedback, setFeedback] = useState('');
+  const [stopConfirm, setStopConfirm] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<RelayModule | null>(null);
+  const shownAcceptance = useRef<string | null>(null);
+  const selected = useMemo(() => creating ? null : modules.find((module) => module.id === selectedId) ?? null, [creating, modules, selectedId]);
 
-  async function refreshModules(preferredId?: string, preserveCreationView = isCreatingModule) {
+  async function refreshModules(preferredId?: string, preserveCreation = creating) {
     const next = await invoke<RelayModule[]>('list_relay_modules');
     setModules(next);
-    if (preferredId) {
-      setSelectedId((next.find((item) => item.id === preferredId) ?? next[0] ?? null)?.id ?? null);
-    } else if (!preserveCreationView) {
-      setSelectedId((next.find((item) => item.id === selectedId) ?? next[0] ?? null)?.id ?? null);
-    }
+    if (preferredId) setSelectedId((next.find((module) => module.id === preferredId) ?? next[0] ?? null)?.id ?? null);
+    else if (!preserveCreation) setSelectedId((next.find((module) => module.id === selectedId) ?? next[0] ?? null)?.id ?? null);
   }
-  async function refreshMessages(moduleId = selectedId) {
-    if (!moduleId) return setMessages([]);
-    setMessages(await invoke<RelayMessage[]>('list_relay_messages', { moduleId }));
-  }
-  async function refreshRecoveryMessages() {
-    const next = await invoke<RelayRecoveryMessage[]>('list_relay_recovery_messages');
-    setRecoveryMessages(next);
-    return next;
-  }
-  async function refreshCodexCycles(moduleId = selectedId) {
-    if (!moduleId) return setCodexCycles([]);
-    setCodexCycles(await invoke<RelayCodexCycle[]>('list_relay_codex_cycles', { moduleId }));
-  }
-  async function refreshChannelSnapshot() {
-    setChannelSnapshot(await invoke<RelayChannelSnapshot>('get_relay_channel_snapshot'));
-  }
+  async function refreshMessages(moduleId = selectedId) { setMessages(moduleId ? await invoke<RelayMessage[]>('list_relay_messages', { moduleId }) : []); }
+  async function refreshCycles(moduleId = selectedId) { setCycles(moduleId ? await invoke<RelayCodexCycle[]>('list_relay_codex_cycles', { moduleId }) : []); }
+  async function refreshRecoveryMessages() { const next = await invoke<RelayRecoveryMessage[]>('list_relay_recovery_messages'); setRecoveryMessages(next); return next; }
+  async function refreshSnapshot() { setSnapshot(await invoke<RelayChannelSnapshot>('get_relay_channel_snapshot')); }
   async function refreshPairing() { setPairing(await invoke<PairingInfo>('get_chatgpt_pairing')); }
+  async function refreshRecoveryState(moduleId = selectedId) { setRecoveryState(moduleId ? await invoke<RelayCodexThreadStateSnapshot>('get_relay_codex_thread_state', { moduleId }) : null); }
+  async function refreshSelected(moduleId = selectedId) { await Promise.all([refreshModules(undefined, false), refreshMessages(moduleId), refreshCycles(moduleId), refreshRecoveryMessages(), refreshSnapshot()]); }
 
-  function resetThreadSelection() {
-    setThreadCandidates(null);
-    setCodexThreadTarget((target) => target.mode === 'EXISTING' ? { mode: 'EXISTING', threadId: '' } : target);
-  }
-  async function refreshCodexRecoveryState(moduleId = selectedId) {
-    if (!moduleId) return setCodexRecoveryState(null);
-    setCodexRecoveryState(await invoke<RelayCodexThreadStateSnapshot>('get_relay_codex_thread_state', { moduleId }));
-  }
-
-  async function refreshCodexThreads() {
-    const workingDirectory = draft.workingDirectory.trim();
-    if (!workingDirectory) return setNotice('请先填写 Codex 工作目录。');
-    setThreadRefreshBusy(true);
-    setThreadCandidates(null);
-    setCodexThreadTarget({ mode: 'EXISTING', threadId: '' });
-    try {
-      setThreadCandidates(await invoke<RelayCodexThreadCandidate[]>('list_relay_codex_threads_for_cwd', { workingDirectory }));
-      setNotice('已刷新 Codex 对话列表，请明确选择一个可继续的对话。');
-    } catch (error) {
-      setNotice(`刷新 Codex 对话失败：${String(error)}`);
-    } finally {
-      setThreadRefreshBusy(false);
-    }
-  }
-
+  useEffect(() => { void Promise.all([refreshModules(), refreshPairing(), refreshRecoveryMessages(), refreshSnapshot()]).then(() => setNotice('本地传话状态已就绪。')).catch((error) => setNotice(`初始化失败：${String(error)}`)); }, []);
+  useEffect(() => { void refreshMessages().catch((error) => setNotice(`无法读取消息历史：${String(error)}`)); void refreshCycles().catch((error) => setNotice(`无法读取 Codex 状态：${String(error)}`)); }, [selectedId]);
+  useEffect(() => { if (selected?.phase === 'RECOVERY_REQUIRED') void refreshRecoveryState(selected.id).catch((error) => setNotice(`无法读取 Codex 恢复状态：${String(error)}`)); else setRecoveryState(null); }, [selected?.id, selected?.phase]);
   useEffect(() => {
-    Promise.all([refreshModules(), refreshPairing(), refreshRecoveryMessages(), refreshChannelSnapshot()])
-      .then(() => setNotice('本地传话状态已就绪。先在 Chrome 扩展中绑定当前 ChatGPT 对话。'))
-      .catch((error) => setNotice(`初始化失败：${String(error)}`));
-  }, []);
-  useEffect(() => {
-    void refreshMessages().catch((error) => setNotice(`无法读取消息历史：${String(error)}`));
-    void refreshCodexCycles().catch((error) => setNotice(`无法读取 Codex 通讯状态：${String(error)}`));
-  }, [selectedId]);
-  useEffect(() => {
-    if (selected?.phase === 'RECOVERY_REQUIRED') {
-      void refreshCodexRecoveryState(selected.id).catch((error) => setNotice(`无法读取 Codex 恢复状态：${String(error)}`));
-    } else {
-      setCodexRecoveryState(null);
-    }
+    if (selected?.phase === 'WAITING_FOR_ACCEPTANCE' && shownAcceptance.current !== selected.id) { shownAcceptance.current = selected.id; setAcceptanceOpen(true); setAcceptanceFeedback(false); }
+    if (selected?.phase !== 'WAITING_FOR_ACCEPTANCE') shownAcceptance.current = null;
   }, [selected?.id, selected?.phase]);
+  useEffect(() => { localStorage.setItem('relay.sidebar.collapsed', String(sidebarCollapsed)); }, [sidebarCollapsed]);
+  useEffect(() => { localStorage.setItem('relay.inspector.collapsed', String(inspectorCollapsed)); }, [inspectorCollapsed]);
   useEffect(() => {
-    let stopStatus: (() => void) | undefined;
-    let stopControl: (() => void) | undefined;
-    let stopCodex: (() => void) | undefined;
-    void listen<BridgeStatus>('chatgpt-status', (event) => {
-      setBridge(event.payload); void refreshPairing().catch(() => undefined); void refreshMessages().catch(() => undefined); void refreshRecoveryMessages().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
-    }).then((unsubscribe) => { stopStatus = unsubscribe; });
-    void listen<{ type: string; reason?: string }>('relay-control', (event) => {
-      setNotice(`已处理 ChatGPT 控制回复：${event.payload.type}${event.payload.reason ? `：${event.payload.reason}` : ''}`);
-      void refreshModules().catch(() => undefined); void refreshMessages().catch(() => undefined); void refreshRecoveryMessages().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
-    }).then((unsubscribe) => { stopControl = unsubscribe; });
-    void listen<{ moduleId: string }>('relay-codex', (event) => {
-      void refreshModules().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
-      if (selected?.phase === 'RECOVERY_REQUIRED' && event.payload.moduleId === selected.id) {
-        void refreshCodexRecoveryState(selected.id).catch(() => undefined);
-      }
-    }).then((unsubscribe) => { stopCodex = unsubscribe; });
+    let stopStatus: (() => void) | undefined; let stopControl: (() => void) | undefined; let stopCodex: (() => void) | undefined;
+    void listen<BridgeStatus>('chatgpt-status', (event) => { setBridge(event.payload); void refreshPairing(); void refreshSelected(); }).then((unsubscribe) => { stopStatus = unsubscribe; });
+    void listen<{ type: string; reason?: string }>('relay-control', (event) => { setNotice(`已处理控制回复：${event.payload.type}${event.payload.reason ? `：${event.payload.reason}` : ''}`); void refreshSelected(); }).then((unsubscribe) => { stopControl = unsubscribe; });
+    void listen<{ moduleId: string }>('relay-codex', () => { void refreshSelected(); }).then((unsubscribe) => { stopCodex = unsubscribe; });
     return () => { stopStatus?.(); stopControl?.(); stopCodex?.(); };
-  }, [selected?.id, selected?.phase, selectedId]);
+  }, [selectedId]);
 
-  async function createModule(event: FormEvent) {
+  async function refreshThreads() {
+    if (!draft.workingDirectory.trim()) return setNotice('请先填写 Codex 工作目录。');
+    setRefreshingThreads(true); setCandidates(null); setTarget({ mode: 'EXISTING', threadId: '' });
+    try { setCandidates(await invoke<RelayCodexThreadCandidate[]>('list_relay_codex_threads_for_cwd', { workingDirectory: draft.workingDirectory.trim() })); setNotice('已刷新可继续的 Codex 对话。'); }
+    catch (error) { setNotice(`刷新 Codex 对话失败：${String(error)}`); } finally { setRefreshingThreads(false); }
+  }
+  function updateDraft(next: typeof draft) { if (next.workingDirectory !== draft.workingDirectory) { setCandidates(null); if (target.mode === 'EXISTING') setTarget({ mode: 'EXISTING', threadId: '' }); } setDraft(next); }
+  async function createSession(event: FormEvent) {
     event.preventDefault();
-    if (!draft.name.trim() || !draft.workingDirectory.trim()) return setNotice('请填写模块名称和 Codex 工作目录。');
+    if (!draft.name.trim() || !draft.workingDirectory.trim()) return setNotice('请填写会话名称和 Codex 工作目录。');
+    if (target.mode === 'EXISTING' && !target.threadId) return setNotice('请刷新并选择要继续的 Codex 对话。');
     setBusy(true);
     try {
-      if (codexThreadTarget.mode === 'EXISTING' && !codexThreadTarget.threadId) {
-        return setNotice('请刷新并选择要继续的 Codex 对话。');
-      }
-      const input: RelayModuleCreationInput = {
-        name: draft.name.trim(), workingDirectory: draft.workingDirectory.trim(), maxCycles: Number(draft.maxCycles),
-        maxRuntimeMinutes: Number(draft.maxRuntimeMinutes), retryTemplate: draft.retryTemplate.trim(), codexThreadTarget,
-      };
-      const module = await invoke<RelayModule>('create_relay_module', { input });
-      await refreshModules(module.id, false);
-      setIsCreatingModule(false);
-      setDraft({ name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry });
-      setCodexThreadTarget({ mode: 'NEW' });
-      setThreadCandidates(null);
-      setNotice(codexThreadTarget.mode === 'NEW'
-        ? `已创建“${module.name}”；收到首个有效 Codex 提示后才会创建 Codex 对话。`
-        : `已创建“${module.name}”并保留所选 Codex 对话；收到首个有效 Codex 提示后才会继续。`);
+      const input: RelayModuleCreationInput = { name: draft.name.trim(), workingDirectory: draft.workingDirectory.trim(), maxCycles: Number(draft.maxCycles), maxRuntimeMinutes: Number(draft.maxRuntimeMinutes), retryTemplate: draft.retryTemplate.trim(), codexThreadTarget: target };
+      const created = await invoke<RelayModule>('create_relay_module', { input });
+      await refreshModules(created.id, false); setCreating(false); setDraft(emptyDraft); setTarget({ mode: 'NEW' }); setCandidates(null);
+      setNotice(`已创建“${created.name}”；会话仍在等待第一条消息。`);
     } catch (error) { setNotice(`创建失败：${String(error)}`); } finally { setBusy(false); }
   }
-
   async function send(event: FormEvent) {
     event.preventDefault();
-    if (!selected) return setNotice('请先创建或选择一个传话模块。');
-    if (!pairing?.paired) return setNotice('请先在 Chrome 扩展中绑定 ChatGPT 标签页。');
-    if (!text.trim()) return setNotice('请输入要发送给 ChatGPT 的内容。');
+    if (!selected || !text.trim()) return setNotice('请输入要发送给 ChatGPT 的内容。');
+    if (!pairing?.paired) { setConnectionOpen(true); return setNotice('请先在 Chrome 扩展中绑定 ChatGPT 标签页。'); }
     setBusy(true);
-    try {
-      await invoke('queue_relay_message', { moduleId: selected.id, kind, text: text.trim() });
-      setText('');
-      const blockers = await refreshRecoveryMessages();
-      setNotice(blockers.length > 0
-        ? '存在待人工处理的不确定送达消息；当前消息已安全入队，待你明确处理全部不确定消息后才会发送。'
-        : kind === 'MANUAL' ? '手动消息已入队；其回复只展示，不会触发 Codex。' : '自动化请求已入队；其对应回复将按控制块规则处理。');
-      await Promise.all([refreshMessages(selected.id), refreshCodexCycles(selected.id), refreshChannelSnapshot()]);
-    } catch (error) { setNotice(`发送失败：${String(error)}`); } finally { setBusy(false); }
+    try { await invoke('queue_relay_message', { moduleId: selected.id, kind, text: text.trim() }); setText(''); const blockers = await refreshRecoveryMessages(); setNotice(blockers.length ? '消息已安全入队；请先处理所有不确定送达。' : kind === 'MANUAL' ? '聊天消息已入队，不会解析控制块。' : '自动化请求已入队，其回复会按控制块处理。'); await Promise.all([refreshMessages(selected.id), refreshCycles(selected.id), refreshSnapshot()]); }
+    catch (error) { setNotice(`发送失败：${String(error)}`); } finally { setBusy(false); }
   }
+  async function retryUnknown(messageId: string) { setBusy(true); try { await invoke('retry_unknown_relay_message', { messageId }); setNotice('已按你的明确指令重发消息。'); await refreshSelected(); } catch (error) { setNotice(`无法重发不确定消息：${String(error)}`); } finally { setBusy(false); } }
+  async function continueUnknown(messageId: string) { setBusy(true); try { await invoke('continue_unknown_relay_message_without_resend', { messageId }); setNotice('已确认不重发该消息。'); await refreshSelected(); } catch (error) { setNotice(`无法解除不确定消息阻塞：${String(error)}`); } finally { setBusy(false); } }
+  async function recover(action: RelayCodexRecoveryAction) { if (!selected) return; setBusy(true); try { await invoke('recover_relay_codex', { moduleId: selected.id, action }); setNotice('已提交 Codex 对话恢复操作。'); } catch (error) { setNotice(`Codex 对话恢复失败：${String(error)}`); throw error; } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
+  async function accept() { if (!selected) return; setBusy(true); try { await invoke('accept_relay_module', { moduleId: selected.id }); setAcceptanceOpen(false); setNotice('会话已验收完成。'); } catch (error) { setNotice(`验收会话失败：${String(error)}`); } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
+  async function submitFeedback() { if (!selected || !feedback.trim()) return; setBusy(true); try { await invoke('submit_relay_acceptance_feedback', { moduleId: selected.id, text: feedback.trim() }); setFeedback(''); setAcceptanceOpen(false); setNotice('验收反馈已进入 ChatGPT 自动化队列。'); } catch (error) { setNotice(`提交验收反馈失败：${String(error)}`); } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
+  async function terminate() { if (!selected) return; setBusy(true); try { await invoke('terminate_relay_module', { moduleId: selected.id }); setStopConfirm(false); setNotice('已请求终止会话。'); } catch (error) { setNotice(`终止会话失败：${String(error)}`); } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
+  async function deleteSession() { if (!deleteTarget) return; setBusy(true); try { await invoke('delete_relay_module', { moduleId: deleteTarget.id }); const remaining = modules.filter((module) => module.id !== deleteTarget.id); setDeleteTarget(null); setCreating(false); await refreshModules(remaining[0]?.id, false); setNotice('会话已删除；工作目录中的项目文件未被修改。'); } catch (error) { setNotice(`删除会话失败：${String(error)}`); } finally { setBusy(false); } }
+  async function openDirectory(session: RelayModule) { try { await invoke('open_relay_working_directory', { moduleId: session.id }); } catch (error) { setNotice(`无法打开工作目录：${String(error)}`); } }
 
-  async function retryUnknownMessage(messageId: string) {
-    setBusy(true);
-    try {
-      await invoke('retry_unknown_relay_message', { messageId });
-      setNotice('已按你的明确指令重新发送该不确定消息。');
-      await Promise.all([refreshMessages(selectedId), refreshRecoveryMessages(), refreshModules(), refreshCodexCycles(selectedId), refreshChannelSnapshot()]);
-    } catch (error) { setNotice(`无法重发不确定消息：${String(error)}`); } finally { setBusy(false); }
-  }
-
-  async function continueUnknownMessageWithoutResend(messageId: string) {
-    setBusy(true);
-    try {
-      await invoke('continue_unknown_relay_message_without_resend', { messageId });
-      setNotice('已确认不重发该不确定消息；系统会在所有不确定消息均处理后继续队列。');
-      await Promise.all([refreshMessages(selectedId), refreshRecoveryMessages(), refreshModules(), refreshCodexCycles(selectedId), refreshChannelSnapshot()]);
-    } catch (error) { setNotice(`无法解除不确定消息阻塞：${String(error)}`); } finally { setBusy(false); }
-  }
-
-  async function refreshAfterModuleAction(moduleId: string) {
-    await Promise.all([
-      refreshModules(undefined, false),
-      refreshMessages(moduleId),
-      refreshRecoveryMessages(),
-      refreshCodexCycles(moduleId),
-      refreshChannelSnapshot(),
-      refreshCodexRecoveryState(moduleId),
-    ]);
-  }
-
-  async function recoverSelectedCodexThread(action: RelayCodexRecoveryAction) {
-    if (!selected) return;
-    setBusy(true);
-    try {
-      await invoke('recover_relay_codex', { moduleId: selected.id, action });
-      setNotice('已提交 Codex 对话恢复操作；请依据后端返回的下一步继续。');
-    } catch (error) {
-      const detail = String(error);
-      setNotice(`Codex 对话恢复失败：${detail}`);
-      throw error;
-    } finally {
-      try {
-        await refreshAfterModuleAction(selected.id);
-      } catch (error) {
-        setNotice(`无法刷新 Codex 恢复状态：${String(error)}`);
-      }
-      setBusy(false);
-    }
-  }
-
-  async function acceptSelectedModule() {
-    if (!selected) return;
-    setBusy(true);
-    try {
-      await invoke('accept_relay_module', { moduleId: selected.id });
-      setNotice('模块已验收完成。');
-    } catch (error) {
-      const detail = String(error);
-      setNotice(`验收模块失败：${detail}`);
-      throw error;
-    } finally {
-      try {
-        await refreshAfterModuleAction(selected.id);
-      } catch (error) {
-        setNotice(`无法刷新模块状态：${String(error)}`);
-      }
-      setBusy(false);
-    }
-  }
-
-  async function submitAcceptanceFeedback(text: string) {
-    if (!selected) return;
-    setBusy(true);
-    try {
-      await invoke('submit_relay_acceptance_feedback', { moduleId: selected.id, text });
-      setNotice('验收反馈已进入 ChatGPT 自动化队列。');
-    } catch (error) {
-      const detail = String(error);
-      setNotice(`提交验收反馈失败：${detail}`);
-      throw error;
-    } finally {
-      try {
-        await refreshAfterModuleAction(selected.id);
-      } catch (error) {
-        setNotice(`无法刷新模块状态：${String(error)}`);
-      }
-      setBusy(false);
-    }
-  }
-
-  async function terminateSelectedModule() {
-    if (!selected) return;
-    setBusy(true);
-    try {
-      await invoke('terminate_relay_module', { moduleId: selected.id });
-      setNotice('已请求终止模块。');
-    } catch (error) {
-      const detail = String(error);
-      setNotice(`终止模块失败：${detail}`);
-      throw error;
-    } finally {
-      try {
-        await refreshAfterModuleAction(selected.id);
-      } catch (error) {
-        setNotice(`无法刷新模块状态：${String(error)}`);
-      }
-      setBusy(false);
-    }
-  }
-
-  return <main className="shell relay-shell">
-    <aside className="sidebar">
-      <div><p className="eyebrow">CONVERSATION RELAY V2</p><h1>传话模块</h1><p className="muted">一个模块对应一个 ChatGPT 对话和一个由中间件持有的 Codex 对话。</p></div>
-      <p className={`bridge-state ${pairing?.paired ? 'online' : 'offline'}`}>{pairing?.paired ? 'ChatGPT 已连接' : 'ChatGPT 未连接'}</p>
-      <nav aria-label="传话模块列表"><p className="section-label">模块 · {modules.length}</p><button className={`new-module-entry ${isCreatingModule || modules.length === 0 ? 'selected' : ''}`} type="button" onClick={() => { setSelectedId(null); setIsCreatingModule(true); setNotice('请填写新模块的信息。'); }} disabled={busy}>新建模块</button>{modules.length === 0 ? <p className="empty">还没有传话模块。</p> : modules.map((module) => <button className={`module-card ${!isCreatingModule && module.id === selectedId ? 'selected' : ''}`} key={module.id} onClick={() => { setIsCreatingModule(false); setSelectedId(module.id); setNotice(`已打开“${module.name}”。`); }} disabled={busy}><strong>{module.name}</strong><span>{module.phase}</span></button>)}</nav>
-    </aside>
-    <section className="workspace relay-workspace">
-      <header><div><p className="eyebrow">受控文本传话</p><h2>{selected?.name ?? '创建传话模块'}</h2></div><span className="status-pill">{selected?.phase ?? 'READY'}</span></header>
-      <p className="notice" role="status">{notice}</p>
-      <section className="form-section connection-card"><div><h3>ChatGPT 浏览器连接</h3><p className="execution-status">{bridge?.detail ?? '在 Chrome 扩展中选择当前已登录的 ChatGPT 对话后配对。'}</p></div><label>本机地址<input readOnly value={pairing?.endpoint ?? '正在启动…'} /></label><label>一次性配对密钥<input readOnly value={pairing?.pairingSecret ?? '正在生成…'} /></label><button className="secondary" type="button" onClick={() => void refreshPairing().catch((error) => setNotice(String(error)))} disabled={busy}>刷新连接状态</button></section>
-      {recoveryMessages.length > 0 ? <section className="form-section uncertain-delivery"><h3>待人工处理的不确定送达消息</h3><p>存在待人工处理的不确定送达消息</p><p className="execution-status">为遵守不确定送达规则，所有消息会保持安全阻塞，直到你逐条明确决定。</p>{recoveryMessages.map((message) => <article className="message system" key={message.messageId}><header><strong>{message.moduleName} · 第 {message.sequenceNumber} 条 · {message.kind === 'MANUAL' ? '手动' : '自动化'}</strong><span>UNKNOWN</span></header><div className="uncertain-delivery"><button className="secondary" disabled={busy} type="button" onClick={() => void retryUnknownMessage(message.messageId)}>明确重发这条消息</button><button className="secondary" disabled={busy} type="button" onClick={() => void continueUnknownMessageWithoutResend(message.messageId)}>不重发并继续</button></div></article>)}</section> : null}
-      {!selected ? <form className="form-section" onSubmit={createModule}><h3>新建模块</h3><label>模块名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="例如：中间件 V2 实现" /></label><label>Codex 工作目录<input value={draft.workingDirectory} onChange={(event) => { setDraft({ ...draft, workingDirectory: event.target.value }); resetThreadSelection(); }} placeholder="G:\\projects\\your-project" /></label><fieldset className="codex-thread-target"><legend>Codex 对话</legend><label><input type="radio" name="codex-thread-target" checked={codexThreadTarget.mode === 'NEW'} onChange={() => { setCodexThreadTarget({ mode: 'NEW' }); setThreadCandidates(null); }} />新建 Codex 对话<span>收到本模块第一份有效 Codex 提示后才创建。</span></label><label><input type="radio" name="codex-thread-target" checked={codexThreadTarget.mode === 'EXISTING'} onChange={() => { setCodexThreadTarget({ mode: 'EXISTING', threadId: '' }); setThreadCandidates(null); }} />继续现有 Codex 对话<span>先选择此工作目录下可继续的 Codex 对话；创建模块时只保留，不会立即继续执行。</span></label></fieldset>{codexThreadTarget.mode === 'EXISTING' ? <section className="codex-thread-picker"><div className="inline-actions"><button className="secondary" type="button" disabled={busy || threadRefreshBusy || !draft.workingDirectory.trim()} onClick={() => void refreshCodexThreads()}>{threadRefreshBusy ? '正在刷新…' : '刷新对话'}</button></div>{threadCandidates === null ? <p className="execution-status">请刷新对话后再选择；工作目录变更后需要重新刷新。</p> : <RelayCodexThreadCandidateList candidates={threadCandidates} selectedThreadId={codexThreadTarget.threadId} busy={busy || threadRefreshBusy} onSelect={(threadId) => setCodexThreadTarget({ mode: 'EXISTING', threadId })} />}</section> : null}<div className="budget-grid"><label>最大自动循环次数<input inputMode="numeric" value={draft.maxCycles} onChange={(event) => setDraft({ ...draft, maxCycles: event.target.value })} /></label><label>模块最长时间（分钟）<input inputMode="numeric" value={draft.maxRuntimeMinutes} onChange={(event) => setDraft({ ...draft, maxRuntimeMinutes: event.target.value })} /></label></div><label>协议重试模板<textarea rows={3} value={draft.retryTemplate} onChange={(event) => setDraft({ ...draft, retryTemplate: event.target.value })} /></label><button className="primary" disabled={busy || threadRefreshBusy || (codexThreadTarget.mode === 'EXISTING' && (!threadCandidates || !codexThreadTarget.threadId))} type="submit">创建传话模块</button></form> : <>
-        <GlobalChannelStatus snapshot={channelSnapshot} />
-        <section className="form-section relay-summary"><div><h3>模块状态</h3><p className="execution-status">工作目录：{selected.workingDirectory}</p></div><p className="execution-status">已开始循环：{selected.startedCycles} / {selected.maxCycles} · 最长运行：{selected.maxRuntimeMinutes} 分钟 · 无效自动化回复：{selected.invalidReplyCount}</p>{selected.codexThreadId ? <p className="protocol-result">已获取 Codex 对话 · {selected.codexThreadId.slice(0, 12)}</p> : selected.resumeThreadId ? <p className="protocol-result">已选择现有对话 · {selected.resumeThreadId.slice(0, 12)}</p> : <p className="execution-status">新 Codex 对话 · 尚未创建</p>}</section>
-        {selected.phase === 'COMPLETED' ? <section className="form-section relay-terminal-notice"><h3>已验收完成</h3><p className="execution-status">该模块已完成验收，保留历史记录且不会再发送消息或启动 Codex。</p></section> : null}
-        {selected.phase === 'STOPPED' ? <section className="form-section relay-terminal-notice"><h3>已终止</h3><p className="execution-status">该模块已由用户终止，保留历史记录且不会再发送消息或启动 Codex。</p></section> : null}
-        {selected.phase === 'RECOVERY_REQUIRED' ? <RelayCodexRecoveryPanel snapshot={codexRecoveryState} busy={busy} onAction={recoverSelectedCodexThread} /> : null}
-        {selected.phase === 'WAITING_FOR_ACCEPTANCE' ? <RelayAcceptancePanel blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onAccept={acceptSelectedModule} onSubmitFeedback={submitAcceptanceFeedback} /> : null}
-        <RelayModuleActions phase={selected.phase} stopAfterTurn={selected.stopAfterTurn} blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onTerminate={terminateSelectedModule} />
-        <CodexCommunicationPanel cycles={codexCycles} />
-        <section className="form-section conversation"><h3>常驻 ChatGPT 对话</h3><div className="message-history" aria-live="polite">{messages.filter((message) => message.direction === 'TO_CHATGPT' || message.direction === 'FROM_CHATGPT').length === 0 ? <p className="empty light">历史将在本次传话开始后显示。</p> : messages.filter((message) => message.direction === 'TO_CHATGPT' || message.direction === 'FROM_CHATGPT').map((message) => <article className={`message ${message.direction.toLowerCase()} ${message.kind.toLowerCase()}`} key={message.id}><header><strong>{message.direction === 'FROM_CHATGPT' ? 'ChatGPT' : '你 → ChatGPT'}</strong><span>{message.kind === 'MANUAL' ? '手动' : '自动化'} · {message.deliveryState}</span></header><pre>{message.text}</pre>{message.direction === 'TO_CHATGPT' && message.deliveryState === 'UNKNOWN' ? <div className="uncertain-delivery"><p>这条消息的送达结果不确定，系统没有自动重发。</p><button className="secondary" disabled={busy} type="button" onClick={() => void retryUnknownMessage(message.id)}>明确重发这条消息</button><button className="secondary" disabled={busy} type="button" onClick={() => void continueUnknownMessageWithoutResend(message.id)}>不重发并继续</button></div> : null}</article>)}</div>{!terminalPhases.has(selected.phase) ? <form className="composer" onSubmit={send}><div className="mode-switch"><button className={kind === 'MANUAL' ? 'selected' : ''} type="button" onClick={() => setKind('MANUAL')}>手动聊天</button><button className={kind === 'AUTOMATION' ? 'selected' : ''} type="button" onClick={() => setKind('AUTOMATION')}>发送自动化请求</button></div><textarea rows={4} value={text} onChange={(event) => setText(event.target.value)} placeholder={kind === 'MANUAL' ? '这条消息只用于和 ChatGPT 沟通，不解析控制块。' : '明确要求 ChatGPT 给出下一个控制块；仅这条消息的回复会参与自动化。'} /><button className="primary" disabled={busy} type="submit">{busy ? '正在处理…' : '发送给 ChatGPT'}</button></form> : null}</section>
-      </>}
-    </section>
+  const canTerminate = Boolean(selected && !terminalPhases.has(selected.phase) && !selected.stopAfterTurn);
+  return <main className="relay-app">
+    <SessionSidebar sessions={modules} selectedId={selectedId} creating={creating} collapsed={sidebarCollapsed} busy={busy} onCollapsedChange={setSidebarCollapsed} onCreate={() => { setSelectedId(null); setCreating(true); setNotice('请填写新会话的基本信息。'); }} onSelect={(id) => { setCreating(false); setSelectedId(id); }} onOpenDirectory={(session) => void openDirectory(session)} onDelete={setDeleteTarget} />
+    <div className="relay-main"><TopBar selected={selected} snapshot={snapshot} pairing={pairing} bridge={bridge} canTerminate={canTerminate} stopping={busy} onConnectionDetails={() => setConnectionOpen(true)} onOpenAcceptance={() => setAcceptanceOpen(true)} onTerminate={() => setStopConfirm(true)} />
+      <div className="main-content">{creating || !selected ? <NewSessionForm draft={draft} target={target} candidates={candidates} busy={busy} refreshingThreads={refreshingThreads} onDraftChange={updateDraft} onTargetChange={(next) => { setTarget(next); setCandidates(next.mode === 'EXISTING' ? candidates : null); }} onRefreshThreads={() => void refreshThreads()} onSubmit={createSession} /> : <>
+        {!pairing?.paired ? <button className="pairing-nudge" type="button" onClick={() => setConnectionOpen(true)}>ChatGPT 未配对 · 打开连接详情</button> : null}
+        {selected.phase === 'RECOVERY_REQUIRED' ? <RelayCodexRecoveryPanel snapshot={recoveryState} busy={busy} onAction={recover} /> : null}
+        <Conversation session={selected} messages={messages} cycles={cycles} recoveryMessages={recoveryMessages} notice={notice} text={text} kind={kind} busy={busy} onTextChange={setText} onKindChange={setKind} onSend={send} onRetryUnknown={(id) => void retryUnknown(id)} onContinueUnknown={(id) => void continueUnknown(id)} />
+      </>}</div>
+    </div>
+    {selected && !creating ? <SessionInspector session={selected} cycles={cycles} snapshot={snapshot} collapsed={inspectorCollapsed} onCollapsedChange={setInspectorCollapsed} onOpenDirectory={() => void openDirectory(selected)} /> : null}
+    {connectionOpen ? <Modal title="ChatGPT 连接详情" onClose={() => setConnectionOpen(false)}><p>{bridge?.detail ?? '在 Chrome 扩展中选择当前已登录的 ChatGPT 对话后配对。'}</p><label>本机地址<input readOnly value={pairing?.endpoint ?? '正在启动…'} /></label><label>一次性配对密钥<input readOnly value={pairing?.pairingSecret ?? '正在生成…'} /></label><button type="button" onClick={() => void refreshPairing().catch((error) => setNotice(String(error)))}>刷新连接状态</button></Modal> : null}
+    {acceptanceOpen && selected?.phase === 'WAITING_FOR_ACCEPTANCE' ? <Modal title={acceptanceFeedback ? '验收反馈' : '等待人工验收'} onClose={() => setAcceptanceOpen(false)}>{acceptanceFeedback ? <><p>请说明需要继续处理或补充验证的内容。</p><label>验收反馈<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="输入反馈…" rows={5} /></label><div className="modal-actions"><button type="button" onClick={() => setAcceptanceFeedback(false)}>取消</button><button className="primary" type="button" disabled={busy || !feedback.trim()} onClick={() => void submitFeedback()}>提交并继续</button></div></> : <><p>ChatGPT 已请求结束当前会话。请检查代码、测试和执行结果。</p>{recoveryMessages.some((message) => message.moduleId === selected.id) ? <p className="message-warning">请先处理本会话的不确定送达消息。</p> : null}<div className="modal-actions"><button type="button" onClick={() => setAcceptanceFeedback(true)}>继续处理</button><button className="primary" type="button" disabled={busy || recoveryMessages.some((message) => message.moduleId === selected.id)} onClick={() => void accept()}>接受并完成</button></div></>}</Modal> : null}
+    {stopConfirm && selected ? <Modal title="终止当前会话？" onClose={() => setStopConfirm(false)}><p>这将停止自动循环，但会保留已有的会话和执行记录。</p>{selected.phase === 'CODEX_RUNNING' ? <p>当前 Codex 回合会自然结束；其结果不会回传 ChatGPT。</p> : null}<div className="modal-actions"><button type="button" onClick={() => setStopConfirm(false)}>取消</button><button className="danger" type="button" disabled={busy} onClick={() => void terminate()}>终止会话</button></div></Modal> : null}
+    {deleteTarget ? <Modal title={`删除“${deleteTarget.name}”？`} onClose={() => setDeleteTarget(null)}><p>此操作会删除该会话的消息历史和运行状态，但不会删除工作目录中的任何项目文件。</p><div className="modal-actions"><button type="button" onClick={() => setDeleteTarget(null)}>取消</button><button className="danger" type="button" disabled={busy} onClick={() => void deleteSession()}>删除会话</button></div></Modal> : null}
   </main>;
 }

@@ -3930,6 +3930,119 @@ fn list_relay_modules(state: State<'_, AppState>) -> Result<Vec<RelayModuleRecor
     Ok(modules)
 }
 
+fn delete_relay_module_in(connection: &Connection, module_id: &str) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始删除会话事务：{error}"))?;
+    let module =
+        get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话会话不存在。".to_string())?;
+    if matches!(module.phase.as_str(), "CODEX_STARTING" | "CODEX_RUNNING") {
+        return Err("请先终止当前会话，再进行删除。".into());
+    }
+    let running_cycles: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = ?1 AND status = 'CODEX_RUNNING'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查会话运行状态：{error}"))?;
+    if running_cycles > 0 {
+        return Err("请先终止当前会话，再进行删除。".into());
+    }
+    if module.codex_thread_id.is_some() {
+        let active_owned: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM relay_codex_threads
+                 WHERE owner_module_id = ?1 AND state = 'ACTIVE'",
+                [module_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("无法检查 Codex 对话归属：{error}"))?;
+        if active_owned > 0 {
+            return Err("请先终止当前会话，再进行删除。".into());
+        }
+    }
+    rollback_relay_codex_reservation_on_terminal_in(&transaction, &module)?;
+    transaction
+        .execute(
+            "UPDATE relay_codex_threads SET last_module_id = NULL
+             WHERE last_module_id = ?1",
+            [module_id],
+        )
+        .map_err(|error| format!("无法解除 Codex 对话历史引用：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE relay_codex_threads SET owner_module_id = NULL
+             WHERE owner_module_id = ?1 AND state NOT IN ('RESERVED', 'ACTIVE')",
+            [module_id],
+        )
+        .map_err(|error| format!("无法解除 Codex 对话归属引用：{error}"))?;
+    transaction
+        .execute("DELETE FROM relay_events WHERE module_id = ?1", [module_id])
+        .map_err(|error| format!("无法删除会话事件：{error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM relay_codex_cycles WHERE module_id = ?1",
+            [module_id],
+        )
+        .map_err(|error| format!("无法删除 Codex 循环：{error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM relay_messages WHERE module_id = ?1",
+            [module_id],
+        )
+        .map_err(|error| format!("无法删除会话消息：{error}"))?;
+    let deleted = transaction
+        .execute("DELETE FROM relay_modules WHERE id = ?1", [module_id])
+        .map_err(|error| format!("无法删除会话：{error}"))?;
+    if deleted != 1 {
+        return Err("传话会话不存在。".into());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交会话删除：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_relay_module(state: State<'_, AppState>, module_id: String) -> Result<(), String> {
+    let live_session = state
+        .relay_codex
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?
+        .as_ref()
+        .is_some_and(|session| session.module_id == module_id);
+    if live_session {
+        return Err("请先终止当前会话，再进行删除。".into());
+    }
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    delete_relay_module_in(&connection, &module_id)
+}
+
+#[tauri::command]
+fn open_relay_working_directory(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<(), String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    let module =
+        get_relay_module(&connection, &module_id)?.ok_or_else(|| "传话会话不存在。".to_string())?;
+    if !Path::new(&module.working_directory).is_dir() {
+        return Err("所选 Codex 工作目录不存在。".into());
+    }
+    Command::new("explorer")
+        .arg(&module.working_directory)
+        .spawn()
+        .map_err(|error| format!("无法打开工作目录：{error}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn list_relay_messages(
     state: State<'_, AppState>,
@@ -12432,6 +12545,8 @@ pub fn run() {
             terminate_relay_module,
             submit_relay_acceptance_feedback,
             list_relay_modules,
+            delete_relay_module,
+            open_relay_working_directory,
             list_relay_messages,
             list_relay_codex_cycles,
             get_relay_channel_snapshot,
