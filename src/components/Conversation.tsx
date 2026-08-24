@@ -20,7 +20,8 @@ interface ConversationProps {
 }
 
 export type ConversationTimelineItem =
-  | { type: 'message'; message: RelayMessage; cycle?: RelayCodexCycle }
+  | { type: 'cycle-divider'; cycle: RelayCodexCycle }
+  | { type: 'message'; message: RelayMessage }
   | { type: 'forwarded-codex-result'; message: RelayMessage }
   | { type: 'cycle-status'; cycle: RelayCodexCycle };
 
@@ -28,26 +29,43 @@ export type ConversationTimelineItem =
 export function buildConversationTimeline(messages: RelayMessage[], cycles: RelayCodexCycle[]): ConversationTimelineItem[] {
   const orderedMessages = [...messages].sort((left, right) => left.sequenceNumber - right.sequenceNumber);
   const orderedCycles = [...cycles].sort((left, right) => left.cycleNumber - right.cycleNumber);
+  const cycleByOutboundMessageId = new Map(
+    orderedCycles.flatMap((cycle) => cycle.outboundChatgptMessageId ? [[cycle.outboundChatgptMessageId, cycle] as const] : []),
+  );
+  const cycleByPromptMessageId = new Map<string, RelayCodexCycle>();
+  let promptCycleIndex = 0;
+  for (const message of orderedMessages) {
+    if (message.direction === 'TO_CODEX' && orderedCycles[promptCycleIndex]) cycleByPromptMessageId.set(message.id, orderedCycles[promptCycleIndex++]);
+  }
+  const resultCycleByMessageId = new Map<string, RelayCodexCycle>();
+  const promptCycles = new Set(cycleByPromptMessageId.values());
+  for (const message of orderedMessages) {
+    if (message.direction !== 'FROM_CODEX') continue;
+    const cycle = orderedCycles.find((candidate) => promptCycles.has(candidate) && candidate.resultText === message.text && ![...resultCycleByMessageId.values()].includes(candidate));
+    if (cycle) resultCycleByMessageId.set(message.id, cycle);
+  }
   const items: ConversationTimelineItem[] = [];
-  let nextCycle = 0;
-  let lastCodexResult: string | null = null;
 
   for (const message of orderedMessages) {
     if (message.direction === 'TO_CODEX') {
-      items.push({ type: 'message', message, cycle: orderedCycles[nextCycle++] });
+      const cycle = cycleByPromptMessageId.get(message.id);
+      if (cycle) items.push({ type: 'cycle-divider', cycle });
+      items.push({ type: 'message', message });
+      if (cycle && ![...resultCycleByMessageId.values()].includes(cycle)) items.push({ type: 'cycle-status', cycle });
       continue;
     }
-    if (message.direction === 'TO_CHATGPT' && message.kind === 'AUTOMATION' && lastCodexResult === message.text) {
+    if (message.direction === 'TO_CHATGPT' && cycleByOutboundMessageId.has(message.id)) {
       items.push({ type: 'forwarded-codex-result', message });
       continue;
     }
     items.push({ type: 'message', message });
-    if (message.direction === 'FROM_CODEX') lastCodexResult = message.text;
+    const cycle = resultCycleByMessageId.get(message.id);
+    if (cycle) items.push({ type: 'cycle-status', cycle });
   }
 
   // Without a TO_CODEX record, a cycle cannot be placed reliably. Keep only its
   // status visible, never a duplicate prompt/result body.
-  for (; nextCycle < orderedCycles.length; nextCycle += 1) items.push({ type: 'cycle-status', cycle: orderedCycles[nextCycle] });
+  for (const cycle of orderedCycles) if (!promptCycles.has(cycle)) items.push({ type: 'cycle-divider', cycle }, { type: 'cycle-status', cycle });
   return items;
 }
 
@@ -61,7 +79,22 @@ function messageTitle(message: RelayMessage): string {
 }
 
 function CycleDivider({ cycle }: { cycle: RelayCodexCycle }) {
-  return <><div className="cycle-divider"><span>第 {cycle.cycleNumber} 轮 · Cycle {cycle.cycleNumber}</span></div><p className={`inline-system ${cycle.status === 'FAILED' ? 'failed' : ''}`}>{cycle.status === 'CODEX_COMPLETED' ? '✓ Codex 已完成本轮任务' : codexCycleStatusLabel(cycle.status)}{cycle.errorText ? `：${cycle.errorText}` : ''}</p></>;
+  return <div className="cycle-divider"><span>第 {cycle.cycleNumber} 轮 · Cycle {cycle.cycleNumber}</span></div>;
+}
+
+function CycleStatus({ cycle }: { cycle: RelayCodexCycle }) {
+  return <p className={`inline-system ${cycle.status === 'FAILED' ? 'failed' : ''}`}>{cycle.status === 'CODEX_COMPLETED' ? '✓ Codex 已完成本轮任务' : codexCycleStatusLabel(cycle.status)}{cycle.errorText ? `：${cycle.errorText}` : ''}</p>;
+}
+
+function outboundDeliveryLabel(deliveryState: string): string {
+  switch (deliveryState) {
+    case 'QUEUED': return 'Codex 结果等待回传 ChatGPT';
+    case 'SENT': return 'Codex 结果正在回传 ChatGPT';
+    case 'DELIVERED': return 'Codex 结果已回传 ChatGPT';
+    case 'UNKNOWN': return 'Codex 结果回传状态不确定';
+    case 'FAILED': return 'Codex 结果未回传 ChatGPT';
+    default: return `Codex 结果回传状态：${deliveryState}`;
+  }
 }
 
 export function Conversation(props: ConversationProps) {
@@ -76,11 +109,11 @@ export function Conversation(props: ConversationProps) {
       </article>)}
       {!timeline.length ? <div className="conversation-empty"><span>✦</span><h2>开始一段受控会话</h2><p>发送聊天消息，或切换到自动化以请求 ChatGPT 输出控制块。</p></div> : null}
       {timeline.map((item) => {
-        if (item.type === 'cycle-status') return <section className="automation-step" key={item.cycle.id}><CycleDivider cycle={item.cycle} /></section>;
-        if (item.type === 'forwarded-codex-result') return <p className="inline-system" key={item.message.id}>Codex 结果已回传 ChatGPT</p>;
-        const { message, cycle } = item;
+        if (item.type === 'cycle-divider') return <section className="automation-step" key={`divider-${item.cycle.id}`}><CycleDivider cycle={item.cycle} /></section>;
+        if (item.type === 'cycle-status') return <CycleStatus key={`status-${item.cycle.id}`} cycle={item.cycle} />;
+        if (item.type === 'forwarded-codex-result') return <p className="inline-system" key={item.message.id}>{outboundDeliveryLabel(item.message.deliveryState)}</p>;
+        const { message } = item;
         return <section className="automation-step" key={message.id}>
-          {cycle ? <CycleDivider cycle={cycle} /> : null}
           <article className={`timeline-message ${message.direction.toLowerCase()}`}>
             <header><span className="message-role">{messageTitle(message)}</span><span>{message.kind === 'MANUAL' ? '聊天' : message.kind === 'AUTOMATION' ? '自动化' : '系统'} · {message.deliveryState}</span></header>
             <pre>{message.text}</pre>
