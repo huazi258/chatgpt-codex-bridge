@@ -12,7 +12,7 @@ import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observabilit
 import type { RelayCodexRecoveryAction, RelayCodexThreadCandidate, RelayCodexThreadStateSnapshot, RelayCodexThreadTarget, RelayModuleCreationInput } from './relay-thread-resume';
 import { terminalPhases, type BridgeStatus, type PairingInfo, type RelayKind, type RelayMessage, type RelayModule, type RelayRecoveryMessage } from './relay-ui';
 
-const defaultRetry = '请根据既定格式，在回复最后且仅输出一个有效控制块：@@@CODEX_PROMPT@@@、@@@MODULE_DONE@@@ 或 @@@BLOCKED@@@。';
+const defaultRetry = '请根据既定格式，在回复最后且仅输出一个有效控制块：@@@CODEX_PROMPT@@@、@@@MODULE_DONE@@@ 或 @@@BLOCKED@@@。正在等待 Codex 用户输入时可使用 @@@CODEX_INPUT@@@。';
 const emptyDraft = { name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry };
 
 export default function App() {

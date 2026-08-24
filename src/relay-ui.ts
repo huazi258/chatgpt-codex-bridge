@@ -14,6 +14,7 @@ export interface RelayModule extends RelayThreadResumeModuleFields {
   invalidReplyCount: number;
   startedCycles: number;
   stopAfterTurn: boolean;
+  moduleStartedAt?: string | null;
 }
 
 export interface RelayMessage {

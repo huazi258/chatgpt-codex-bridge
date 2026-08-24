@@ -3936,7 +3936,24 @@ fn delete_relay_module_in(connection: &Connection, module_id: &str) -> Result<()
         .map_err(|error| format!("无法开始删除会话事务：{error}"))?;
     let module =
         get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话会话不存在。".to_string())?;
-    if matches!(module.phase.as_str(), "CODEX_STARTING" | "CODEX_RUNNING") {
+    let unknown_messages: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE module_id = ?1 AND delivery_state = 'UNKNOWN'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查会话不确定送达消息：{error}"))?;
+    if unknown_messages > 0 {
+        return Err("请先处理该会话的不确定送达消息，再终止并删除会话。".into());
+    }
+    let sent_messages: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE module_id = ?1 AND delivery_state = 'SENT'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查会话发送状态：{error}"))?;
+    if sent_messages > 0 || !matches!(module.phase.as_str(), "READY" | "COMPLETED" | "STOPPED") {
         return Err("请先终止当前会话，再进行删除。".into());
     }
     let running_cycles: i64 = transaction
@@ -3949,18 +3966,16 @@ fn delete_relay_module_in(connection: &Connection, module_id: &str) -> Result<()
     if running_cycles > 0 {
         return Err("请先终止当前会话，再进行删除。".into());
     }
-    if module.codex_thread_id.is_some() {
-        let active_owned: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM relay_codex_threads
-                 WHERE owner_module_id = ?1 AND state = 'ACTIVE'",
-                [module_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("无法检查 Codex 对话归属：{error}"))?;
-        if active_owned > 0 {
-            return Err("请先终止当前会话，再进行删除。".into());
-        }
+    let active_owned: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_codex_threads
+             WHERE owner_module_id = ?1 AND state = 'ACTIVE'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查 Codex 对话归属：{error}"))?;
+    if active_owned > 0 {
+        return Err("请先终止当前会话，再进行删除。".into());
     }
     rollback_relay_codex_reservation_on_terminal_in(&transaction, &module)?;
     transaction
@@ -10281,6 +10296,145 @@ mod tests {
                 "2026-08-17T00:00:00Z"
             ],
         )
+    }
+
+    #[test]
+    fn delete_relay_module_allows_only_terminal_or_empty_ready_sessions() {
+        for phase in ["READY", "COMPLETED", "STOPPED"] {
+            let connection = relay_connection();
+            let module_id = format!("delete-{phase}");
+            insert_relay_module(&connection, &module_id, "可删除会话");
+            connection
+                .execute(
+                    "UPDATE relay_modules SET phase = ?2 WHERE id = ?1",
+                    params![module_id, phase],
+                )
+                .expect("set terminal phase");
+            if phase == "COMPLETED" {
+                insert_relay_message(
+                    &connection,
+                    "delete-message",
+                    &module_id,
+                    1,
+                    "DELIVERED",
+                    "2026-08-17T00:00:00Z",
+                );
+                insert_relay_codex_cycle(&connection, "delete-cycle", &module_id, 1, None)
+                    .expect("cycle");
+            }
+            delete_relay_module_in(&connection, &module_id).expect("delete safe session");
+            let remaining: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_modules WHERE id = ?1",
+                    [&module_id],
+                    |row| row.get(0),
+                )
+                .expect("module count");
+            assert_eq!(remaining, 0, "{phase} should be deletable");
+            if phase == "COMPLETED" {
+                let child_rows: i64 = connection
+                    .query_row(
+                        "SELECT (SELECT COUNT(*) FROM relay_messages WHERE module_id = ?1) +
+                         (SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = ?1)",
+                        [&module_id],
+                        |row| row.get(0),
+                    )
+                    .expect("child count");
+                assert_eq!(child_rows, 0, "deleted sessions must not leave relay rows");
+            }
+        }
+    }
+
+    #[test]
+    fn delete_relay_module_rejects_pending_states_and_delivery_uncertainty() {
+        for phase in [
+            "WAITING_FOR_CHATGPT",
+            "WAITING_FOR_ACCEPTANCE",
+            "BLOCKED",
+            "RECOVERY_REQUIRED",
+            "CODEX_RUNNING",
+        ] {
+            let connection = relay_connection();
+            let module_id = format!("pending-{phase}");
+            insert_relay_module(&connection, &module_id, "待处理会话");
+            connection
+                .execute(
+                    "UPDATE relay_modules SET phase = ?2 WHERE id = ?1",
+                    params![module_id, phase],
+                )
+                .expect("set pending phase");
+            assert_eq!(
+                delete_relay_module_in(&connection, &module_id).unwrap_err(),
+                "请先终止当前会话，再进行删除。"
+            );
+        }
+
+        for delivery_state in ["SENT", "UNKNOWN"] {
+            let connection = relay_connection();
+            insert_relay_module(&connection, "pending-delivery", "待确认送达");
+            insert_relay_message(
+                &connection,
+                "pending-message",
+                "pending-delivery",
+                1,
+                delivery_state,
+                "2026-08-17T00:00:00Z",
+            );
+            let error = delete_relay_module_in(&connection, "pending-delivery").unwrap_err();
+            if delivery_state == "UNKNOWN" {
+                assert_eq!(error, "请先处理该会话的不确定送达消息，再终止并删除会话。");
+            } else {
+                assert_eq!(error, "请先终止当前会话，再进行删除。");
+            }
+        }
+
+        let connection = relay_connection();
+        insert_relay_module(&connection, "active-thread", "活动 Codex 对话");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED', codex_thread_id = 'thread-active'
+                 WHERE id = 'active-thread'",
+                [],
+            )
+            .expect("set acquired thread");
+        connection
+            .execute(
+                "INSERT INTO relay_codex_threads (
+                    thread_id, working_directory, state, owner_module_id, last_module_id,
+                    reservation_previous_state, updated_at
+                 ) VALUES ('thread-active', 'G:\\workspace', 'ACTIVE', 'active-thread',
+                    'active-thread', NULL, '2026-08-17T00:00:00Z')",
+                [],
+            )
+            .expect("active owned thread");
+        assert_eq!(
+            delete_relay_module_in(&connection, "active-thread").unwrap_err(),
+            "请先终止当前会话，再进行删除。"
+        );
+    }
+
+    #[test]
+    fn delete_relay_module_never_touches_working_directory_files() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "safe-delete", "安全删除");
+        let directory = std::env::temp_dir().join(format!("relay-delete-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create working directory");
+        let sentinel = directory.join("keep-me.txt");
+        fs::write(&sentinel, "project file").expect("write project file");
+        connection
+            .execute(
+                "UPDATE relay_modules SET working_directory = ?2 WHERE id = ?1",
+                params!["safe-delete", directory.to_string_lossy()],
+            )
+            .expect("set working directory");
+
+        delete_relay_module_in(&connection, "safe-delete").expect("delete session only");
+        assert_eq!(
+            fs::read_to_string(&sentinel).expect("sentinel remains"),
+            "project file"
+        );
+        fs::remove_file(&sentinel).expect("remove test file");
+        fs::remove_dir(&directory).expect("remove test directory");
     }
 
     #[test]
