@@ -915,7 +915,10 @@ struct CodexTurnResult {
 #[serde(tag = "mode", rename_all = "SCREAMING_SNAKE_CASE")]
 enum RelayCodexThreadTargetInput {
     New,
-    Existing { thread_id: String },
+    Existing {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+    },
 }
 
 impl Default for RelayCodexThreadTargetInput {
@@ -1082,7 +1085,10 @@ enum RelayCodexRecoveryAction {
     ReacquireThread,
     StartNewThread,
     RetryTurnStart,
-    SelectExistingThread { thread_id: String },
+    SelectExistingThread {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -9413,6 +9419,50 @@ mod tests {
             retry_template: "retry".into(),
             codex_thread_target: target,
         }
+    }
+
+    #[test]
+    fn relay_codex_tauri_payload_deserializes_camel_case_thread_ids() {
+        let existing: RelayModuleInput = serde_json::from_value(json!({
+            "name": "resume",
+            "workingDirectory": "G:\\\\workspace",
+            "maxCycles": 12,
+            "maxRuntimeMinutes": 240,
+            "retryTemplate": "retry",
+            "codexThreadTarget": {
+                "mode": "EXISTING",
+                "threadId": "thread-a"
+            }
+        }))
+        .expect("browser EXISTING payload");
+        assert!(matches!(
+            existing.codex_thread_target,
+            RelayCodexThreadTargetInput::Existing { ref thread_id } if thread_id == "thread-a"
+        ));
+
+        let recovery: RelayCodexRecoveryAction = serde_json::from_value(json!({
+            "type": "SELECT_EXISTING_THREAD",
+            "threadId": "thread-a"
+        }))
+        .expect("browser recovery payload");
+        assert!(matches!(
+            recovery,
+            RelayCodexRecoveryAction::SelectExistingThread { ref thread_id } if thread_id == "thread-a"
+        ));
+
+        let new_target: RelayModuleInput = serde_json::from_value(json!({
+            "name": "new",
+            "workingDirectory": "G:\\\\workspace",
+            "maxCycles": 12,
+            "maxRuntimeMinutes": 240,
+            "retryTemplate": "retry",
+            "codexThreadTarget": { "mode": "NEW" }
+        }))
+        .expect("browser NEW payload");
+        assert!(matches!(
+            new_target.codex_thread_target,
+            RelayCodexThreadTargetInput::New
+        ));
     }
 
     fn selectable_thread(thread_id: &str) -> RelayCodexThreadCandidate {
