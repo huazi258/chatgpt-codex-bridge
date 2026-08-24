@@ -163,6 +163,56 @@ enum RelayCodexCommand {
     },
 }
 
+/// The worker owns App Server I/O; its host owns durable relay side effects.
+/// Keeping this boundary narrow lets the protocol loop be exercised without a
+/// Tauri application or SQLite connection.
+trait RelayCodexWorkerHost {
+    fn thread_ready(&mut self, module_id: &str, thread_id: &str);
+    fn turn_started(
+        &mut self,
+        module_id: &str,
+        cycle_id: &str,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<(), String>;
+    fn turn_completed(&mut self, module_id: &str, cycle_id: &str, summary: &str);
+    fn failed(&mut self, module_id: &str, cycle_id: Option<&str>, reason: String);
+}
+
+struct TauriRelayCodexWorkerHost {
+    app: AppHandle,
+}
+
+impl TauriRelayCodexWorkerHost {
+    fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl RelayCodexWorkerHost for TauriRelayCodexWorkerHost {
+    fn thread_ready(&mut self, module_id: &str, thread_id: &str) {
+        relay_codex_thread_ready(&self.app, module_id, thread_id);
+    }
+
+    fn turn_started(
+        &mut self,
+        module_id: &str,
+        cycle_id: &str,
+        thread_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<(), String> {
+        relay_codex_turn_started(&self.app, module_id, cycle_id, thread_id, turn_id)
+    }
+
+    fn turn_completed(&mut self, module_id: &str, cycle_id: &str, summary: &str) {
+        relay_codex_turn_completed(&self.app, module_id, cycle_id, summary);
+    }
+
+    fn failed(&mut self, module_id: &str, cycle_id: Option<&str>, reason: String) {
+        relay_codex_failed(&self.app, module_id, cycle_id, reason);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RelayCodexOutstandingRpc {
     Initialize,
@@ -4208,18 +4258,19 @@ fn relay_codex_worker(
     commands: std_mpsc::Receiver<RelayCodexCommand>,
     turn_active: Arc<AtomicBool>,
 ) {
+    let mut host = TauriRelayCodexWorkerHost::new(app.clone());
     let command = codex_command();
     let mut transport = match RelayCodexProcessTransport::spawn(&command, &working_directory) {
         Ok(transport) => transport,
         Err(error) => {
-            relay_codex_failed(&app, &module_id, Some(initial_cycle_id.as_str()), error);
+            host.failed(&module_id, Some(initial_cycle_id.as_str()), error);
             return;
         }
     };
     if let Err(error) = transport.send_json(
         json!({ "method": "initialize", "id": 1, "params": { "clientInfo": { "name": "chatgpt-codex-middleware", "title": "ChatGPT × Codex Middleware", "version": env!("CARGO_PKG_VERSION") } } }),
     ) {
-        relay_codex_failed(&app, &module_id, Some(initial_cycle_id.as_str()), error);
+        host.failed(&module_id, Some(initial_cycle_id.as_str()), error);
         return;
     }
 
@@ -4236,8 +4287,7 @@ fn relay_codex_worker(
                 RelayCodexCommand::StartTurn { cycle_id, prompt } => {
                     turn_active.store(true, Ordering::SeqCst);
                     if active_cycle_id.is_some() && pending_turn.is_none() && thread_id.is_some() {
-                        relay_codex_failed(
-                            &app,
+                        host.failed(
                             &module_id,
                             Some(cycle_id.as_str()),
                             "上一 Codex 回合尚未结束，不能启动新的回合。".into(),
@@ -4249,7 +4299,7 @@ fn relay_codex_worker(
                         if let Err(error) = transport.send_json(
                             json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
                         ) {
-                            relay_codex_failed(&app, &module_id, active_cycle_id.as_deref(), error);
+                            host.failed(&module_id, active_cycle_id.as_deref(), error);
                             break 'worker;
                         }
                         outstanding = Some((
@@ -4278,12 +4328,12 @@ fn relay_codex_worker(
         }
         match transport.recv_event(std::time::Duration::from_millis(100)) {
             RelayCodexTransportEvent::ProtocolError(error) => {
-                relay_codex_failed(&app, &module_id, active_cycle_id.as_deref(), error);
+                host.failed(&module_id, active_cycle_id.as_deref(), error);
                 break;
             }
             RelayCodexTransportEvent::Timeout => continue,
             RelayCodexTransportEvent::Closed(detail) => {
-                relay_codex_failed(&app, &module_id, active_cycle_id.as_deref(), detail);
+                host.failed(&module_id, active_cycle_id.as_deref(), detail);
                 break;
             }
             RelayCodexTransportEvent::Message(message) => {
@@ -4291,8 +4341,7 @@ fn relay_codex_worker(
                     match classify_relay_codex_rpc_response(&message, request_id) {
                         RelayCodexRpcOutcome::Unrelated => {}
                         RelayCodexRpcOutcome::MatchingExplicitError(error) => {
-                            relay_codex_failed(
-                                &app,
+                            host.failed(
                                 &module_id,
                                 active_cycle_id.as_deref(),
                                 format!("Codex App Server 请求被明确拒绝：{error}"),
@@ -4307,8 +4356,7 @@ fn relay_codex_worker(
                                         .and_then(|_| transport.send_json(json!({ "method": "thread/start", "id": 2, "params": {} })))
                                         .is_err()
                                     {
-                            relay_codex_failed(
-                                &app,
+                            host.failed(
                                 &module_id,
                                 active_cycle_id.as_deref(),
                                 "无法初始化 Codex 对话。".into(),
@@ -4324,21 +4372,19 @@ fn relay_codex_worker(
                                     .and_then(Value::as_str)
                                     .map(ToOwned::to_owned);
                                 let Some(thread) = thread_id.as_deref() else {
-                                    relay_codex_failed(
-                                        &app,
+                                    host.failed(
                                         &module_id,
                                         active_cycle_id.as_deref(),
                                         "Codex 未返回对话 ID。".into(),
                                     );
                                     break;
                                 };
-                                relay_codex_thread_ready(&app, &module_id, thread);
+                                host.thread_ready(&module_id, thread);
                                 if let Some((cycle_id, prompt)) = pending_turn.take() {
                                     if let Err(error) = transport.send_json(
                                             json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
                                         ) {
-                                            relay_codex_failed(
-                                                &app,
+                                            host.failed(
                                                 &module_id,
                                                 Some(cycle_id.as_str()),
                                                 error,
@@ -4363,19 +4409,13 @@ fn relay_codex_worker(
                                 outstanding = None;
                                 let turn_id =
                                     message.pointer("/result/turn/id").and_then(Value::as_str);
-                                if let Err(error) = relay_codex_turn_started(
-                                    &app,
+                                if let Err(error) = host.turn_started(
                                     &module_id,
                                     &cycle_id,
                                     Some(&thread_id),
                                     turn_id,
                                 ) {
-                                    relay_codex_failed(
-                                        &app,
-                                        &module_id,
-                                        Some(cycle_id.as_str()),
-                                        error,
-                                    );
+                                    host.failed(&module_id, Some(cycle_id.as_str()), error);
                                     break;
                                 }
                             }
@@ -4406,15 +4446,9 @@ fn relay_codex_worker(
                     if status == "completed" {
                         if let Some(cycle_id) = active_cycle_id.take() {
                             turn_active.store(false, Ordering::SeqCst);
-                            relay_codex_turn_completed(
-                                &app,
-                                &module_id,
-                                &cycle_id,
-                                final_summary.trim(),
-                            );
+                            host.turn_completed(&module_id, &cycle_id, final_summary.trim());
                         } else {
-                            relay_codex_failed(
-                                &app,
+                            host.failed(
                                 &module_id,
                                 None,
                                 "Codex 回合完成事件没有对应的通讯循环。".into(),
@@ -4422,8 +4456,7 @@ fn relay_codex_worker(
                         }
                     } else {
                         turn_active.store(false, Ordering::SeqCst);
-                        relay_codex_failed(
-                            &app,
+                        host.failed(
                             &module_id,
                             active_cycle_id.as_deref(),
                             format!("Codex 回合以 `{status}` 结束。"),
@@ -5943,6 +5976,64 @@ mod tests {
             RelayCodexTransportEvent::Closed("EOF".into()),
             RelayCodexTransportEvent::Closed(_)
         ));
+    }
+
+    #[derive(Default)]
+    struct TestRelayCodexWorkerHost {
+        callbacks: Vec<String>,
+    }
+
+    impl RelayCodexWorkerHost for TestRelayCodexWorkerHost {
+        fn thread_ready(&mut self, module_id: &str, thread_id: &str) {
+            self.callbacks
+                .push(format!("thread_ready:{module_id}:{thread_id}"));
+        }
+
+        fn turn_started(
+            &mut self,
+            module_id: &str,
+            cycle_id: &str,
+            thread_id: Option<&str>,
+            turn_id: Option<&str>,
+        ) -> Result<(), String> {
+            self.callbacks.push(format!(
+                "turn_started:{module_id}:{cycle_id}:{}:{}",
+                thread_id.unwrap_or_default(),
+                turn_id.unwrap_or_default()
+            ));
+            Ok(())
+        }
+
+        fn turn_completed(&mut self, module_id: &str, cycle_id: &str, summary: &str) {
+            self.callbacks
+                .push(format!("turn_completed:{module_id}:{cycle_id}:{summary}"));
+        }
+
+        fn failed(&mut self, module_id: &str, cycle_id: Option<&str>, reason: String) {
+            self.callbacks.push(format!(
+                "failed:{module_id}:{}:{reason}",
+                cycle_id.unwrap_or_default()
+            ));
+        }
+    }
+
+    #[test]
+    fn relay_codex_worker_host_records_domain_callbacks() {
+        let mut host = TestRelayCodexWorkerHost::default();
+        host.thread_ready("module-a", "thread-a");
+        host.turn_started("module-a", "cycle-a", Some("thread-a"), Some("turn-a"))
+            .expect("test host accepts start");
+        host.turn_completed("module-a", "cycle-a", "完成");
+        host.failed("module-a", Some("cycle-b"), "失败".into());
+        assert_eq!(
+            host.callbacks,
+            vec![
+                "thread_ready:module-a:thread-a",
+                "turn_started:module-a:cycle-a:thread-a:turn-a",
+                "turn_completed:module-a:cycle-a:完成",
+                "failed:module-a:cycle-b:失败",
+            ]
+        );
     }
 
     fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {
