@@ -227,6 +227,7 @@ enum RelayCodexOutstandingRpc {
 enum RelayCodexRpcOutcome {
     MatchingSuccess,
     MatchingExplicitError(String),
+    MatchingMalformed(String),
     Unrelated,
 }
 
@@ -243,7 +244,25 @@ fn classify_relay_codex_rpc_response(message: &Value, request_id: i64) -> RelayC
     } else if message.get("result").is_some() {
         RelayCodexRpcOutcome::MatchingSuccess
     } else {
-        RelayCodexRpcOutcome::MatchingExplicitError("响应缺少 result。".into())
+        RelayCodexRpcOutcome::MatchingMalformed("匹配响应缺少 result。".into())
+    }
+}
+
+fn relay_codex_unknown_outstanding_reason(
+    outstanding: Option<&RelayCodexOutstandingRpc>,
+    detail: impl std::fmt::Display,
+) -> String {
+    match outstanding {
+        Some(RelayCodexOutstandingRpc::ThreadStart) => {
+            format!("Codex thread/start 送达结果未知：{detail}")
+        }
+        Some(RelayCodexOutstandingRpc::ThreadResume { .. }) => {
+            format!("Codex thread/resume 送达结果未知：{detail}")
+        }
+        Some(RelayCodexOutstandingRpc::TurnStart { .. }) => {
+            format!("Codex turn/start 送达结果未知：{detail}")
+        }
+        _ => detail.to_string(),
     }
 }
 
@@ -4345,12 +4364,6 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                     }
                     active_cycle_id = Some(cycle_id.clone());
                     if let Some(thread) = thread_id.as_deref() {
-                        if let Err(error) = transport.send_json(
-                            json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
-                        ) {
-                            host.failed(&module_id, active_cycle_id.as_deref(), error);
-                            break 'worker;
-                        }
                         outstanding = Some((
                             next_request_id,
                             RelayCodexOutstandingRpc::TurnStart {
@@ -4358,6 +4371,16 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                                 thread_id: thread.to_string(),
                             },
                         ));
+                        if let Err(error) = transport.send_json(
+                            json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
+                        ) {
+                            host.failed(
+                                module_id,
+                                active_cycle_id.as_deref(),
+                                format!("Codex turn/start 送达结果未知：{error}"),
+                            );
+                            break 'worker;
+                        }
                         next_request_id += 1;
                         final_summary.clear();
                     } else {
@@ -4377,12 +4400,26 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
         }
         match transport.recv_event(std::time::Duration::from_millis(100)) {
             RelayCodexTransportEvent::ProtocolError(error) => {
-                host.failed(&module_id, active_cycle_id.as_deref(), error);
+                host.failed(
+                    module_id,
+                    active_cycle_id.as_deref(),
+                    relay_codex_unknown_outstanding_reason(
+                        outstanding.as_ref().map(|(_, rpc)| rpc),
+                        error,
+                    ),
+                );
                 break;
             }
             RelayCodexTransportEvent::Timeout => continue,
             RelayCodexTransportEvent::Closed(detail) => {
-                host.failed(&module_id, active_cycle_id.as_deref(), detail);
+                host.failed(
+                    module_id,
+                    active_cycle_id.as_deref(),
+                    relay_codex_unknown_outstanding_reason(
+                        outstanding.as_ref().map(|(_, rpc)| rpc),
+                        detail,
+                    ),
+                );
                 break;
             }
             RelayCodexTransportEvent::Message(message) => {
@@ -4397,22 +4434,38 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                             );
                             break;
                         }
-                        RelayCodexRpcOutcome::MatchingSuccess => match rpc {
-                            RelayCodexOutstandingRpc::Initialize => {
-                                outstanding = None;
-                                if transport
-                                        .send_json(json!({ "method": "initialized", "params": {} }))
-                                        .and_then(|_| transport.send_json(json!({ "method": "thread/start", "id": 2, "params": {} })))
-                                        .is_err()
-                                    {
+                        RelayCodexRpcOutcome::MatchingMalformed(error) => {
                             host.failed(
-                                &module_id,
+                                module_id,
                                 active_cycle_id.as_deref(),
-                                "无法初始化 Codex 对话。".into(),
+                                format!("Codex 请求响应无法确认：{error}"),
                             );
                             break;
                         }
+                        RelayCodexRpcOutcome::MatchingSuccess => match rpc {
+                            RelayCodexOutstandingRpc::Initialize => {
+                                outstanding = None;
+                                if let Err(error) = transport
+                                    .send_json(json!({ "method": "initialized", "params": {} }))
+                                {
+                                    host.failed(
+                                        module_id,
+                                        active_cycle_id.as_deref(),
+                                        format!("无法初始化 Codex 对话：{error}"),
+                                    );
+                                    break;
+                                }
                                 outstanding = Some((2, RelayCodexOutstandingRpc::ThreadStart));
+                                if let Err(error) = transport.send_json(
+                                    json!({ "method": "thread/start", "id": 2, "params": {} }),
+                                ) {
+                                    host.failed(
+                                        module_id,
+                                        active_cycle_id.as_deref(),
+                                        format!("Codex thread/start 送达结果未知：{error}"),
+                                    );
+                                    break;
+                                }
                             }
                             RelayCodexOutstandingRpc::ThreadStart => {
                                 outstanding = None;
@@ -4424,22 +4477,13 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                                     host.failed(
                                         &module_id,
                                         active_cycle_id.as_deref(),
-                                        "Codex 未返回对话 ID。".into(),
+                                        "Codex thread/start 送达结果未知：匹配响应未返回有效对话 ID。"
+                                            .into(),
                                     );
                                     break;
                                 };
                                 host.thread_ready(&module_id, thread);
                                 if let Some((cycle_id, prompt)) = pending_turn.take() {
-                                    if let Err(error) = transport.send_json(
-                                            json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
-                                        ) {
-                                            host.failed(
-                                                &module_id,
-                                                Some(cycle_id.as_str()),
-                                                error,
-                                            );
-                                            break;
-                                        }
                                     outstanding = Some((
                                         next_request_id,
                                         RelayCodexOutstandingRpc::TurnStart {
@@ -4447,6 +4491,16 @@ fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
                                             thread_id: thread.to_string(),
                                         },
                                     ));
+                                    if let Err(error) = transport.send_json(
+                                            json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
+                                        ) {
+                                            host.failed(
+                                                module_id,
+                                                Some(cycle_id.as_str()),
+                                                format!("Codex turn/start 送达结果未知：{error}"),
+                                            );
+                                            break;
+                                        }
                                     next_request_id += 1;
                                     final_summary.clear();
                                 }
@@ -6012,12 +6066,13 @@ mod tests {
     struct ScriptedRelayCodexTransport {
         events: VecDeque<RelayCodexTransportEvent>,
         sent: Vec<Value>,
+        send_results: VecDeque<Result<(), String>>,
     }
 
     impl RelayCodexTransport for ScriptedRelayCodexTransport {
         fn send_json(&mut self, value: Value) -> Result<(), String> {
             self.sent.push(value);
-            Ok(())
+            self.send_results.pop_front().unwrap_or(Ok(()))
         }
 
         fn recv_event(&mut self, _timeout: std::time::Duration) -> RelayCodexTransportEvent {
@@ -6109,6 +6164,7 @@ mod tests {
                 RelayCodexTransportEvent::Closed("script complete".into()),
             ]),
             sent: Vec::new(),
+            send_results: VecDeque::new(),
         };
         let mut host = TestRelayCodexWorkerHost::default();
         let turn_active = Arc::new(AtomicBool::new(false));
@@ -6143,6 +6199,108 @@ mod tests {
             .callbacks
             .iter()
             .any(|callback| callback == "turn_completed:module-a:cycle-a:完成"));
+    }
+
+    #[test]
+    fn relay_codex_protocol_marks_malformed_or_disconnected_thread_start_unknown_without_retry() {
+        let (sender, receiver) = std_mpsc::channel();
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "thread": {} } })),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host.callbacks.iter().any(|callback| callback
+            == "failed:module-a:cycle-a:Codex thread/start 送达结果未知：匹配响应未返回有效对话 ID。"));
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/start"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn relay_codex_protocol_keeps_explicit_thread_start_error_distinct_from_unknown() {
+        let (sender, receiver) = std_mpsc::channel();
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 2, "error": { "message": "denied" } }),
+                ),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host.callbacks.iter().any(|callback| callback
+            == "failed:module-a:cycle-a:Codex App Server 请求被明确拒绝：denied"));
+        assert!(!host
+            .callbacks
+            .iter()
+            .any(|callback| callback.contains("送达结果未知")));
+    }
+
+    #[test]
+    fn relay_codex_protocol_arms_thread_start_before_send_failure() {
+        let (sender, receiver) = std_mpsc::channel();
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([RelayCodexTransportEvent::Message(
+                json!({ "id": 1, "result": {} }),
+            )]),
+            sent: Vec::new(),
+            send_results: VecDeque::from([Ok(()), Ok(()), Err("write failed".into())]),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+        run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(host.callbacks.iter().any(|callback| callback
+            == "failed:module-a:cycle-a:Codex thread/start 送达结果未知：write failed"));
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/start"))
+                .count(),
+            1
+        );
     }
 
     fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {
