@@ -3643,14 +3643,19 @@ fn terminate_relay_module_with_active_turn_in(
     Ok(outcome)
 }
 
-fn submit_relay_acceptance_feedback_in(
+fn submit_relay_automation_feedback_in(
     connection: &Connection,
     module_id: &str,
     text: &str,
+    required_phase: &str,
+    empty_text_error: &str,
+    wrong_phase_error: &str,
+    feedback_event_type: &str,
+    feedback_event_detail: &str,
 ) -> Result<String, String> {
     let feedback = text.trim();
     if feedback.is_empty() {
-        return Err("验收反馈不能为空。".into());
+        return Err(empty_text_error.into());
     }
     let transaction = connection
         .unchecked_transaction()
@@ -3667,8 +3672,8 @@ fn submit_relay_acceptance_feedback_in(
         .optional()
         .map_err(|error| format!("无法读取传话模块：{error}"))?
         .ok_or_else(|| "传话模块不存在。".to_string())?;
-    if module.phase != "WAITING_FOR_ACCEPTANCE" {
-        return Err("模块当前未等待人工验收，不能提交验收反馈。".into());
+    if module.phase != required_phase {
+        return Err(wrong_phase_error.into());
     }
     if module.stop_after_turn {
         return Err("模块正在终止，不能提交验收反馈。".into());
@@ -3705,13 +3710,47 @@ fn submit_relay_acceptance_feedback_in(
     append_relay_event_in_transaction(
         &transaction,
         module_id,
-        "ACCEPTANCE_FEEDBACK_QUEUED",
-        &format!("requestId={message_id}; 已将人工验收反馈加入自动化发送队列。"),
+        feedback_event_type,
+        &format!("requestId={message_id}; {feedback_event_detail}"),
     )?;
     transaction
         .commit()
         .map_err(|error| format!("无法提交验收反馈事务：{error}"))?;
     Ok(message_id)
+}
+
+fn submit_relay_acceptance_feedback_in(
+    connection: &Connection,
+    module_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    submit_relay_automation_feedback_in(
+        connection,
+        module_id,
+        text,
+        "WAITING_FOR_ACCEPTANCE",
+        "验收反馈不能为空。",
+        "模块当前未等待人工验收，不能提交验收反馈。",
+        "ACCEPTANCE_FEEDBACK_QUEUED",
+        "已将人工验收反馈加入自动化发送队列。",
+    )
+}
+
+fn submit_relay_blocked_feedback_in(
+    connection: &Connection,
+    module_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    submit_relay_automation_feedback_in(
+        connection,
+        module_id,
+        text,
+        "BLOCKED",
+        "人工回复不能为空。",
+        "模块当前不需要人工处理，不能提交回复。",
+        "BLOCKED_FEEDBACK_QUEUED",
+        "已将人工回复加入自动化发送队列。",
+    )
 }
 
 fn relay_codex_turn_is_active_for_module(
@@ -3908,6 +3947,52 @@ fn submit_relay_acceptance_feedback(
         }),
     );
     dispatch_next_relay_message(&app, &state)
+}
+
+#[tauri::command]
+fn submit_relay_blocked_feedback(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+    text: String,
+) -> Result<(), String> {
+    let message_id = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        submit_relay_blocked_feedback_in(&connection, &module_id, &text)?
+    };
+    let _ = app.emit(
+        "relay-control",
+        json!({
+            "type": "BLOCKED_FEEDBACK_QUEUED",
+            "moduleId": module_id,
+            "requestId": message_id,
+        }),
+    );
+    dispatch_next_relay_message(&app, &state)
+}
+
+#[tauri::command]
+fn get_relay_blocked_reason(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<Option<String>, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    connection
+        .query_row(
+            "SELECT detail FROM relay_events
+             WHERE module_id = ?1 AND event_type IN ('BLOCKED', 'CONTROL_FAILED')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [module_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取人工介入原因：{error}"))
 }
 
 #[tauri::command]
@@ -11141,6 +11226,104 @@ mod tests {
     }
 
     #[test]
+    fn relay_blocked_feedback_requires_blocked_phase_and_queues_one_automation_reply() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        assert!(
+            submit_relay_blocked_feedback_in(&connection, "module-a", "继续处理")
+                .expect_err("only blocked modules accept intervention replies")
+                .contains("不需要人工处理")
+        );
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'BLOCKED', codex_thread_id = 'thread-a', started_cycles = 3
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare blocked module");
+        assert!(
+            submit_relay_blocked_feedback_in(&connection, "module-a", "  ")
+                .expect_err("blank intervention reply")
+                .contains("不能为空")
+        );
+
+        let message_id = submit_relay_blocked_feedback_in(
+            &connection,
+            "module-a",
+            "  等待条件已经满足，请继续。  ",
+        )
+        .expect("queue blocked reply");
+        let message: (String, String, String) = connection
+            .query_row(
+                "SELECT kind, text, delivery_state FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("queued intervention reply");
+        assert_eq!(
+            message,
+            (
+                "AUTOMATION".into(),
+                "等待条件已经满足，请继续。".into(),
+                "QUEUED".into(),
+            )
+        );
+        let module: (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT phase, codex_thread_id, started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after intervention reply");
+        assert_eq!(
+            module,
+            ("WAITING_FOR_CHATGPT".into(), Some("thread-a".into()), 3)
+        );
+        assert!(
+            submit_relay_blocked_feedback_in(&connection, "module-a", "不应重复加入")
+                .expect_err("same blocked occurrence accepts one reply")
+                .contains("不需要人工处理")
+        );
+    }
+
+    #[test]
+    fn relay_blocked_feedback_queues_behind_global_unknown_without_bypassing_it() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'BLOCKED' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare blocked module");
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:00Z",
+        );
+
+        let message_id = submit_relay_blocked_feedback_in(&connection, "module-a", "请继续。")
+            .expect("feedback remains safe to queue");
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection).expect("claim state"),
+            RelayDispatchClaim::RecoveryBlocked(1)
+        ));
+        let state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .expect("blocked reply remains queued");
+        assert_eq!(state, "QUEUED");
+    }
+
+    #[test]
     fn relay_acceptance_feedback_can_queue_behind_global_unknown_without_bypassing_it() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-a", "模块 A");
@@ -12698,6 +12881,8 @@ pub fn run() {
             accept_relay_module,
             terminate_relay_module,
             submit_relay_acceptance_feedback,
+            submit_relay_blocked_feedback,
+            get_relay_blocked_reason,
             list_relay_modules,
             delete_relay_module,
             open_relay_working_directory,

@@ -55,4 +55,16 @@ describe('Conversation timeline', () => {
     expect(screen.getAllByText('相同文本')).toHaveLength(2);
     expect(screen.getByText('Codex 结果回传状态不确定')).toBeTruthy();
   });
+
+  it('保留原始 BLOCKED 回复，并仅追加轻量人工介入状态', () => {
+    render(<Conversation
+      {...baseProps}
+      session={{ ...baseProps.session, phase: 'BLOCKED' }}
+      messages={[{ id: 'blocked-reply', sequenceNumber: 1, direction: 'FROM_CHATGPT', kind: 'AUTOMATION', text: '@@@BLOCKED@@@\n等待 Codex 返回：RELAY_CORE_ROUND_2_OK\n@@@END_BLOCKED@@@', deliveryState: 'DELIVERED' }]}
+      cycles={[]}
+    />);
+
+    expect(screen.getByText(/等待 Codex 返回：RELAY_CORE_ROUND_2_OK/)).toBeTruthy();
+    expect(screen.getByText('⚠ 自动流程已暂停，需要人工处理')).toBeTruthy();
+  });
 });

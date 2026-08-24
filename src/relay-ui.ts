@@ -56,7 +56,7 @@ export function phaseLabel(phase: string): string {
     case 'SENDING_TO_CHATGPT': return '等待 ChatGPT';
     case 'WAITING_FOR_ACCEPTANCE': return '等待验收';
     case 'COMPLETED': return '已完成';
-    case 'BLOCKED':
+    case 'BLOCKED': return '需要人工处理';
     case 'RECOVERY_REQUIRED': return '已阻塞';
     case 'STOPPED': return '已停止';
     case 'FAILED': return '失败';

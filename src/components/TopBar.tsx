@@ -10,11 +10,11 @@ interface TopBarProps {
   canTerminate: boolean;
   stopping: boolean;
   onConnectionDetails: () => void;
-  onOpenAcceptance: () => void;
+  onOpenHumanIntervention: () => void;
   onTerminate: () => void;
 }
 
-export function TopBar({ selected, snapshot, pairing, bridge, canTerminate, stopping, onConnectionDetails, onOpenAcceptance, onTerminate }: TopBarProps) {
+export function TopBar({ selected, snapshot, pairing, bridge, canTerminate, stopping, onConnectionDetails, onOpenHumanIntervention, onTerminate }: TopBarProps) {
   const [details, setDetails] = useState<'chatgpt' | 'codex' | null>(null);
   const chatgpt = snapshot?.chatgpt;
   const codex = snapshot?.codex;
@@ -25,6 +25,11 @@ export function TopBar({ selected, snapshot, pairing, bridge, canTerminate, stop
       : chatgpt?.status === 'IN_FLIGHT'
         ? { className: 'running', label: '● ChatGPT 处理中' }
         : { className: 'healthy', label: '● ChatGPT' };
+  const sessionStatusClass = selected?.phase === 'WAITING_FOR_ACCEPTANCE' || selected?.phase === 'BLOCKED'
+    ? 'session-status channel-status running warning'
+    : selected?.phase === 'FAILED'
+      ? 'session-status channel-status offline'
+      : 'session-status';
   return <header className="topbar">
     <div className="topbar-title"><span className="eyebrow">当前会话</span><strong>{selected?.name ?? '新建会话'}</strong></div>
     <div className="channel-cluster">
@@ -36,7 +41,7 @@ export function TopBar({ selected, snapshot, pairing, bridge, canTerminate, stop
         <button className={`channel-status ${codex?.status === 'RUNNING' ? 'running' : 'healthy'}`} type="button" onClick={() => setDetails(details === 'codex' ? null : 'codex')} title="查看 Codex 通道详情">● Codex {codex?.status === 'RUNNING' ? '运行中' : '就绪'}</button>
         {details === 'codex' ? <div className="channel-popover codex-popover"><strong>Codex 通道</strong><p>Cycle：{codex?.cycleNumber ?? '—'}</p><p>Thread：{shortId(codex?.codexThreadId)}</p><p>Turn：{shortId(codex?.codexTurnId)}</p><p>当前状态：{codex?.cycleStatus ?? '空闲'}</p></div> : null}
       </div>
-      {selected ? <button className="session-status" type="button" onClick={onOpenAcceptance} disabled={selected.phase !== 'WAITING_FOR_ACCEPTANCE'} title={selected.phase === 'WAITING_FOR_ACCEPTANCE' ? '打开人工验收' : undefined}>{phaseLabel(selected.phase)}</button> : null}
+      {selected ? <button className={sessionStatusClass} type="button" onClick={onOpenHumanIntervention} disabled={!['WAITING_FOR_ACCEPTANCE', 'BLOCKED'].includes(selected.phase)} title={selected.phase === 'WAITING_FOR_ACCEPTANCE' ? '打开人工验收' : selected.phase === 'BLOCKED' ? '打开人工介入' : undefined}>{phaseLabel(selected.phase)}</button> : null}
       {canTerminate ? <button className="stop-button" type="button" onClick={onTerminate} disabled={stopping} title="终止当前会话">■</button> : null}
     </div>
   </header>;

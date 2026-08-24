@@ -40,9 +40,13 @@ export default function App() {
   const [acceptanceOpen, setAcceptanceOpen] = useState(false);
   const [acceptanceFeedback, setAcceptanceFeedback] = useState(false);
   const [feedback, setFeedback] = useState('');
+  const [blockedOpen, setBlockedOpen] = useState(false);
+  const [blockedFeedback, setBlockedFeedback] = useState('');
+  const [blockedReason, setBlockedReason] = useState<string | null>(null);
   const [stopConfirm, setStopConfirm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<RelayModule | null>(null);
   const shownAcceptance = useRef<string | null>(null);
+  const shownBlocked = useRef<string | null>(null);
   const selected = useMemo(() => creating ? null : modules.find((module) => module.id === selectedId) ?? null, [creating, modules, selectedId]);
 
   async function refreshModules(preferredId?: string, preserveCreation = creating) {
@@ -57,14 +61,20 @@ export default function App() {
   async function refreshSnapshot() { setSnapshot(await invoke<RelayChannelSnapshot>('get_relay_channel_snapshot')); }
   async function refreshPairing() { setPairing(await invoke<PairingInfo>('get_chatgpt_pairing')); }
   async function refreshRecoveryState(moduleId = selectedId) { setRecoveryState(moduleId ? await invoke<RelayCodexThreadStateSnapshot>('get_relay_codex_thread_state', { moduleId }) : null); }
+  async function refreshBlockedReason(moduleId = selectedId) { setBlockedReason(moduleId ? await invoke<string | null>('get_relay_blocked_reason', { moduleId }) : null); }
   async function refreshSelected(moduleId = selectedId) { await Promise.all([refreshModules(undefined, false), refreshMessages(moduleId), refreshCycles(moduleId), refreshRecoveryMessages(), refreshSnapshot()]); }
 
   useEffect(() => { void Promise.all([refreshModules(), refreshPairing(), refreshRecoveryMessages(), refreshSnapshot()]).then(() => setNotice('本地传话状态已就绪。')).catch((error) => setNotice(`初始化失败：${String(error)}`)); }, []);
   useEffect(() => { void refreshMessages().catch((error) => setNotice(`无法读取消息历史：${String(error)}`)); void refreshCycles().catch((error) => setNotice(`无法读取 Codex 状态：${String(error)}`)); }, [selectedId]);
   useEffect(() => { if (selected?.phase === 'RECOVERY_REQUIRED') void refreshRecoveryState(selected.id).catch((error) => setNotice(`无法读取 Codex 恢复状态：${String(error)}`)); else setRecoveryState(null); }, [selected?.id, selected?.phase]);
+  useEffect(() => { if (selected?.phase === 'BLOCKED') void refreshBlockedReason(selected.id).catch((error) => setNotice(`无法读取人工介入原因：${String(error)}`)); else setBlockedReason(null); }, [selected?.id, selected?.phase]);
   useEffect(() => {
     if (selected?.phase === 'WAITING_FOR_ACCEPTANCE' && shownAcceptance.current !== selected.id) { shownAcceptance.current = selected.id; setAcceptanceOpen(true); setAcceptanceFeedback(false); }
     if (selected?.phase !== 'WAITING_FOR_ACCEPTANCE') shownAcceptance.current = null;
+  }, [selected?.id, selected?.phase]);
+  useEffect(() => {
+    if (selected?.phase === 'BLOCKED' && shownBlocked.current !== selected.id) { shownBlocked.current = selected.id; setBlockedOpen(true); setBlockedFeedback(''); }
+    if (selected?.phase !== 'BLOCKED') shownBlocked.current = null;
   }, [selected?.id, selected?.phase]);
   useEffect(() => { localStorage.setItem('relay.sidebar.collapsed', String(sidebarCollapsed)); }, [sidebarCollapsed]);
   useEffect(() => { localStorage.setItem('relay.inspector.collapsed', String(inspectorCollapsed)); }, [inspectorCollapsed]);
@@ -108,6 +118,7 @@ export default function App() {
   async function recover(action: RelayCodexRecoveryAction) { if (!selected) return; setBusy(true); try { await invoke('recover_relay_codex', { moduleId: selected.id, action }); setNotice('已提交 Codex 对话恢复操作。'); } catch (error) { setNotice(`Codex 对话恢复失败：${String(error)}`); throw error; } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
   async function accept() { if (!selected) return; setBusy(true); try { await invoke('accept_relay_module', { moduleId: selected.id }); setAcceptanceOpen(false); setNotice('会话已验收完成。'); } catch (error) { setNotice(`验收会话失败：${String(error)}`); } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
   async function submitFeedback() { if (!selected || !feedback.trim()) return; setBusy(true); try { await invoke('submit_relay_acceptance_feedback', { moduleId: selected.id, text: feedback.trim() }); setFeedback(''); setAcceptanceOpen(false); setNotice('验收反馈已进入 ChatGPT 自动化队列。'); } catch (error) { setNotice(`提交验收反馈失败：${String(error)}`); } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
+  async function submitBlockedFeedback() { if (!selected || !blockedFeedback.trim()) return; setBusy(true); try { await invoke('submit_relay_blocked_feedback', { moduleId: selected.id, text: blockedFeedback.trim() }); setBlockedFeedback(''); setBlockedOpen(false); setNotice('人工回复已进入 ChatGPT 自动化队列。'); } catch (error) { setNotice(`提交人工回复失败：${String(error)}`); } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
   async function terminate() { if (!selected) return; setBusy(true); try { await invoke('terminate_relay_module', { moduleId: selected.id }); setStopConfirm(false); setNotice('已请求终止会话。'); } catch (error) { setNotice(`终止会话失败：${String(error)}`); } finally { await refreshSelected(selected.id).catch(() => undefined); setBusy(false); } }
   async function deleteSession() { if (!deleteTarget) return; setBusy(true); try { await invoke('delete_relay_module', { moduleId: deleteTarget.id }); const remaining = modules.filter((module) => module.id !== deleteTarget.id); setDeleteTarget(null); setCreating(false); await refreshModules(remaining[0]?.id, false); setNotice('会话已删除；工作目录中的项目文件未被修改。'); } catch (error) { setNotice(`删除会话失败：${String(error)}`); } finally { setBusy(false); } }
   async function openDirectory(session: RelayModule) { try { await invoke('open_relay_working_directory', { moduleId: session.id }); } catch (error) { setNotice(`无法打开工作目录：${String(error)}`); } }
@@ -115,7 +126,7 @@ export default function App() {
   const canTerminate = Boolean(selected && !terminalPhases.has(selected.phase) && !selected.stopAfterTurn);
   return <main className="relay-app">
     <SessionSidebar sessions={modules} selectedId={selectedId} creating={creating} collapsed={sidebarCollapsed} busy={busy} onCollapsedChange={setSidebarCollapsed} onCreate={() => { setSelectedId(null); setCreating(true); setNotice('请填写新会话的基本信息。'); }} onSelect={(id) => { setCreating(false); setSelectedId(id); }} onOpenDirectory={(session) => void openDirectory(session)} onDelete={setDeleteTarget} />
-    <div className="relay-main"><TopBar selected={selected} snapshot={snapshot} pairing={pairing} bridge={bridge} canTerminate={canTerminate} stopping={busy} onConnectionDetails={() => setConnectionOpen(true)} onOpenAcceptance={() => setAcceptanceOpen(true)} onTerminate={() => setStopConfirm(true)} />
+    <div className="relay-main"><TopBar selected={selected} snapshot={snapshot} pairing={pairing} bridge={bridge} canTerminate={canTerminate} stopping={busy} onConnectionDetails={() => setConnectionOpen(true)} onOpenHumanIntervention={() => { if (selected?.phase === 'WAITING_FOR_ACCEPTANCE') setAcceptanceOpen(true); if (selected?.phase === 'BLOCKED') setBlockedOpen(true); }} onTerminate={() => setStopConfirm(true)} />
       <div className="main-content">{creating || !selected ? <NewSessionForm draft={draft} target={target} candidates={candidates} busy={busy} refreshingThreads={refreshingThreads} onDraftChange={updateDraft} onTargetChange={(next) => { setTarget(next); setCandidates(next.mode === 'EXISTING' ? candidates : null); }} onRefreshThreads={() => void refreshThreads()} onSubmit={createSession} /> : <>
         {!pairing?.paired ? <button className="pairing-nudge" type="button" onClick={() => setConnectionOpen(true)}>ChatGPT 未配对 · 打开连接详情</button> : null}
         {selected.phase === 'RECOVERY_REQUIRED' ? <RelayCodexRecoveryPanel snapshot={recoveryState} busy={busy} onAction={recover} /> : null}
@@ -125,6 +136,7 @@ export default function App() {
     {selected && !creating ? <SessionInspector session={selected} cycles={cycles} snapshot={snapshot} collapsed={inspectorCollapsed} onCollapsedChange={setInspectorCollapsed} onOpenDirectory={() => void openDirectory(selected)} /> : null}
     {connectionOpen ? <Modal title="ChatGPT 连接详情" onClose={() => setConnectionOpen(false)}><p>{bridge?.detail ?? '在 Chrome 扩展中选择当前已登录的 ChatGPT 对话后配对。'}</p><label>本机地址<input readOnly value={pairing?.endpoint ?? '正在启动…'} /></label><label>一次性配对密钥<input readOnly value={pairing?.pairingSecret ?? '正在生成…'} /></label><button type="button" onClick={() => void refreshPairing().catch((error) => setNotice(String(error)))}>刷新连接状态</button></Modal> : null}
     {acceptanceOpen && selected?.phase === 'WAITING_FOR_ACCEPTANCE' ? <Modal title={acceptanceFeedback ? '验收反馈' : '等待人工验收'} onClose={() => setAcceptanceOpen(false)}>{acceptanceFeedback ? <><p>请说明需要继续处理或补充验证的内容。</p><label>验收反馈<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="输入反馈…" rows={5} /></label><div className="modal-actions"><button type="button" onClick={() => setAcceptanceFeedback(false)}>取消</button><button className="primary" type="button" disabled={busy || !feedback.trim()} onClick={() => void submitFeedback()}>提交并继续</button></div></> : <><p>ChatGPT 已请求结束当前会话。请检查代码、测试和执行结果。</p>{recoveryMessages.some((message) => message.moduleId === selected.id) ? <p className="message-warning">请先处理本会话的不确定送达消息。</p> : null}<div className="modal-actions"><button type="button" onClick={() => setAcceptanceFeedback(true)}>继续处理</button><button className="primary" type="button" disabled={busy || recoveryMessages.some((message) => message.moduleId === selected.id)} onClick={() => void accept()}>接受并完成</button></div></>}</Modal> : null}
+    {blockedOpen && selected?.phase === 'BLOCKED' ? <Modal title="需要人工处理" onClose={() => setBlockedOpen(false)}><p className="eyebrow">Action Required</p><p>ChatGPT 暂停了当前自动流程，需要你的输入后才能继续。</p><section><strong>原因</strong><pre>{blockedReason ?? '正在读取原因…'}</pre></section><label>回复 ChatGPT<textarea value={blockedFeedback} onChange={(event) => setBlockedFeedback(event.target.value)} placeholder="输入你的回复…" rows={5} /></label><div className="modal-actions"><button type="button" onClick={() => setBlockedOpen(false)}>稍后处理</button><button className="primary" type="button" disabled={busy || !blockedFeedback.trim()} onClick={() => void submitBlockedFeedback()}>提交并继续</button></div></Modal> : null}
     {stopConfirm && selected ? <Modal title="终止当前会话？" onClose={() => setStopConfirm(false)}><p>这将停止自动循环，但会保留已有的会话和执行记录。</p>{selected.phase === 'CODEX_RUNNING' ? <p>当前 Codex 回合会自然结束；其结果不会回传 ChatGPT。</p> : null}<div className="modal-actions"><button type="button" onClick={() => setStopConfirm(false)}>取消</button><button className="danger" type="button" disabled={busy} onClick={() => void terminate()}>终止会话</button></div></Modal> : null}
     {deleteTarget ? <Modal title={`删除“${deleteTarget.name}”？`} onClose={() => setDeleteTarget(null)}><p>此操作会删除该会话的消息历史和运行状态，但不会删除工作目录中的任何项目文件。</p><div className="modal-actions"><button type="button" onClick={() => setDeleteTarget(null)}>取消</button><button className="danger" type="button" disabled={busy} onClick={() => void deleteSession()}>删除会话</button></div></Modal> : null}
   </main>;

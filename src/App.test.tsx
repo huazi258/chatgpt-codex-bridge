@@ -11,10 +11,11 @@ let messages: Record<string, unknown>[];
 let cycles: Record<string, unknown>[];
 let recoveryMessages: Record<string, unknown>[];
 let snapshot: Record<string, unknown>;
-const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+let blockedReason: string | null;
+const { invoke, listeners } = vi.hoisted(() => ({ invoke: vi.fn(), listeners: new Map<string, (event: { payload: unknown }) => void>() }));
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
-vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => undefined) }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async (event: string, listener: (event: { payload: unknown }) => void) => { listeners.set(event, listener); return () => listeners.delete(event); }) }));
 
 invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
   switch (command) {
@@ -24,6 +25,7 @@ invoke.mockImplementation(async (command: string, args?: Record<string, unknown>
     case 'list_relay_codex_cycles': return cycles;
     case 'list_relay_recovery_messages': return recoveryMessages;
     case 'get_relay_channel_snapshot': return snapshot;
+    case 'get_relay_blocked_reason': return blockedReason;
     case 'get_relay_codex_thread_state': return { moduleId: 'one', workingDirectory: 'G:\\project', summary: '需要恢复', allowedActions: [{ type: 'RETRY_RESUME' }] };
     case 'create_relay_module': {
       const input = args?.input as Record<string, unknown>;
@@ -37,6 +39,7 @@ invoke.mockImplementation(async (command: string, args?: Record<string, unknown>
     case 'continue_unknown_relay_message_without_resend': return;
     case 'accept_relay_module': return;
     case 'submit_relay_acceptance_feedback': return;
+    case 'submit_relay_blocked_feedback': modules = modules.map((item) => item.id === args?.moduleId ? { ...item, phase: 'WAITING_FOR_CHATGPT' } : item); return;
     case 'terminate_relay_module': return;
     case 'recover_relay_codex': return;
     case 'open_relay_working_directory': return;
@@ -50,8 +53,10 @@ describe('会话工作台', () => {
     messages = [];
     cycles = [];
     recoveryMessages = [];
+    blockedReason = null;
     snapshot = { chatgpt: { status: 'IDLE', recoveryBlockerCount: 0 }, codex: { status: 'IDLE' } };
     invoke.mockClear();
+    listeners.clear();
     localStorage.clear();
   });
   afterEach(cleanup);
@@ -102,6 +107,33 @@ describe('会话工作台', () => {
     fireEvent.change(screen.getByPlaceholderText('输入反馈…'), { target: { value: '请补充验证' } });
     fireEvent.click(screen.getByRole('button', { name: '提交并继续' }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('submit_relay_acceptance_feedback', { moduleId: 'one', text: '请补充验证' }));
+  });
+
+  it('BLOCKED 自动打开人工介入 Modal，关闭后保持状态且可从顶栏重开', async () => {
+    modules = [module({ phase: 'BLOCKED' })];
+    blockedReason = '等待 Codex 返回：RELAY_CORE_ROUND_2_OK';
+    render(<App />);
+    await screen.findByRole('dialog', { name: '需要人工处理' });
+    expect(await screen.findByText(blockedReason)).toBeTruthy();
+    expect((screen.getByRole('button', { name: '提交并继续' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: '稍后处理' }));
+    expect(screen.queryByRole('dialog', { name: '需要人工处理' })).toBeNull();
+    expect(screen.getByRole('button', { name: '需要人工处理' })).toBeTruthy();
+    listeners.get('chatgpt-status')?.({ payload: { phase: 'CONNECTED', detail: '刷新' } });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '需要人工处理' })).toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: '需要人工处理' }));
+    expect(await screen.findByRole('dialog', { name: '需要人工处理' })).toBeTruthy();
+  });
+
+  it('BLOCKED 回复作为 automation continuation 提交并刷新为等待 ChatGPT', async () => {
+    modules = [module({ phase: 'BLOCKED' })];
+    blockedReason = '需要确认';
+    render(<App />);
+    await screen.findByRole('dialog', { name: '需要人工处理' });
+    fireEvent.change(screen.getByPlaceholderText('输入你的回复…'), { target: { value: '条件已满足，请继续' } });
+    fireEvent.click(screen.getByRole('button', { name: '提交并继续' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('submit_relay_blocked_feedback', { moduleId: 'one', text: '条件已满足，请继续' }));
+    await screen.findByRole('button', { name: '等待 ChatGPT' });
   });
 
   it('终止确认仍调用既有状态机接口', async () => {

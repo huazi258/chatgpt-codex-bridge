@@ -27,7 +27,7 @@ export function SessionSidebar(props: SessionSidebarProps) {
       {props.sessions.length === 0 && !collapsed ? <p className="empty">还没有会话。</p> : null}
       {props.sessions.map((session) => <div className={`session-entry ${!props.creating && props.selectedId === session.id ? 'selected' : ''}`} key={session.id}>
         <button className="session-select" type="button" disabled={props.busy} onClick={() => props.onSelect(session.id)} title={collapsed ? session.name : undefined}>
-          <span className={`phase-dot phase-${session.phase.toLowerCase()}`} />
+          <span className={`phase-dot phase-${session.phase === 'BLOCKED' ? 'waiting_for_acceptance' : session.phase.toLowerCase()}`} />
           {!collapsed ? <span className="session-name"><strong>{session.name}</strong><small>{phaseLabel(session.phase)}</small></span> : null}
         </button>
         {!collapsed ? <button className="more-button" type="button" aria-label={`打开“${session.name}”菜单`} onClick={() => setMenuId(menuId === session.id ? null : session.id)}>•••</button> : null}
