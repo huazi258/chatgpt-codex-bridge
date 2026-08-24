@@ -4,7 +4,9 @@ mod relay_protocol;
 
 use chrono::{DateTime, Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
-use relay_codex_worker::{RelayCodexProcessTransport, RelayCodexTransportEvent};
+use relay_codex_worker::{
+    RelayCodexProcessTransport, RelayCodexTransport, RelayCodexTransportEvent,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -4258,25 +4260,72 @@ fn relay_codex_worker(
     commands: std_mpsc::Receiver<RelayCodexCommand>,
     turn_active: Arc<AtomicBool>,
 ) {
-    let mut host = TauriRelayCodexWorkerHost::new(app.clone());
     let command = codex_command();
     let mut transport = match RelayCodexProcessTransport::spawn(&command, &working_directory) {
         Ok(transport) => transport,
         Err(error) => {
-            host.failed(&module_id, Some(initial_cycle_id.as_str()), error);
+            TauriRelayCodexWorkerHost::new(app.clone()).failed(
+                &module_id,
+                Some(initial_cycle_id.as_str()),
+                error,
+            );
             return;
         }
     };
+    let mut host = TauriRelayCodexWorkerHost::new(app.clone());
+    let release_acknowledgement = run_relay_codex_worker_core(
+        &mut transport,
+        &mut host,
+        &module_id,
+        &initial_cycle_id,
+        &commands,
+        &turn_active,
+    );
+    let release_result = transport.shutdown();
+    let state = app.state::<AppState>();
+    let cleared_session = clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
+    if release_acknowledgement.is_none() && cleared_session {
+        if let Ok(connection) = state.connection.lock() {
+            let stopped = connection
+                .query_row(
+                    "SELECT phase = 'STOPPED' FROM relay_modules WHERE id = ?1",
+                    [&module_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+            if stopped {
+                let _ = append_relay_event(
+                    &connection,
+                    &module_id,
+                    "CODEX_THREAD_RELEASED",
+                    "模块已终止，Codex 对话已在当前回合收尾后释放。",
+                );
+            }
+        }
+    }
+    if let Some(acknowledgement) = release_acknowledgement {
+        let _ = acknowledgement.send(release_result);
+    }
+}
+
+fn run_relay_codex_worker_core<T: RelayCodexTransport, H: RelayCodexWorkerHost>(
+    transport: &mut T,
+    host: &mut H,
+    module_id: &str,
+    initial_cycle_id: &str,
+    commands: &std_mpsc::Receiver<RelayCodexCommand>,
+    turn_active: &Arc<AtomicBool>,
+) -> Option<std_mpsc::Sender<Result<(), String>>> {
     if let Err(error) = transport.send_json(
         json!({ "method": "initialize", "id": 1, "params": { "clientInfo": { "name": "chatgpt-codex-middleware", "title": "ChatGPT × Codex Middleware", "version": env!("CARGO_PKG_VERSION") } } }),
     ) {
-        host.failed(&module_id, Some(initial_cycle_id.as_str()), error);
-        return;
+        host.failed(module_id, Some(initial_cycle_id), error);
+        return None;
     }
 
     let mut thread_id: Option<String> = None;
     let mut pending_turn: Option<(String, String)> = None;
-    let mut active_cycle_id = Some(initial_cycle_id);
+    let mut active_cycle_id = Some(initial_cycle_id.to_string());
     let mut next_request_id = 3_i64;
     let mut outstanding = Some((1_i64, RelayCodexOutstandingRpc::Initialize));
     let mut final_summary = String::new();
@@ -4468,31 +4517,7 @@ fn relay_codex_worker(
         }
     }
     turn_active.store(false, Ordering::SeqCst);
-    let release_result = transport.shutdown();
-    let state = app.state::<AppState>();
-    let cleared_session = clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
-    if release_acknowledgement.is_none() && cleared_session {
-        if let Ok(connection) = state.connection.lock() {
-            let stopped = connection
-                .query_row(
-                    "SELECT phase = 'STOPPED' FROM relay_modules WHERE id = ?1",
-                    [&module_id],
-                    |row| row.get::<_, bool>(0),
-                )
-                .unwrap_or(false);
-            if stopped {
-                let _ = append_relay_event(
-                    &connection,
-                    &module_id,
-                    "CODEX_THREAD_RELEASED",
-                    "模块已终止，Codex 对话已在当前回合收尾后释放。",
-                );
-            }
-        }
-    }
-    if let Some(acknowledgement) = release_acknowledgement {
-        let _ = acknowledgement.send(release_result);
-    }
+    release_acknowledgement
 }
 
 fn relay_codex_thread_ready(app: &AppHandle, module_id: &str, thread_id: &str) {
@@ -5663,6 +5688,7 @@ fn handle_orchestration_protocol(app: AppHandle, envelope: ProtocolEnvelope) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     fn input() -> InactiveModuleInput {
         InactiveModuleInput {
@@ -5983,6 +6009,24 @@ mod tests {
         callbacks: Vec<String>,
     }
 
+    struct ScriptedRelayCodexTransport {
+        events: VecDeque<RelayCodexTransportEvent>,
+        sent: Vec<Value>,
+    }
+
+    impl RelayCodexTransport for ScriptedRelayCodexTransport {
+        fn send_json(&mut self, value: Value) -> Result<(), String> {
+            self.sent.push(value);
+            Ok(())
+        }
+
+        fn recv_event(&mut self, _timeout: std::time::Duration) -> RelayCodexTransportEvent {
+            self.events
+                .pop_front()
+                .unwrap_or(RelayCodexTransportEvent::Closed("script exhausted".into()))
+        }
+    }
+
     impl RelayCodexWorkerHost for TestRelayCodexWorkerHost {
         fn thread_ready(&mut self, module_id: &str, thread_id: &str) {
             self.callbacks
@@ -6034,6 +6078,71 @@ mod tests {
                 "failed:module-a:cycle-b:失败",
             ]
         );
+    }
+
+    #[test]
+    fn relay_codex_worker_core_runs_scripted_happy_path() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "完成任务".into(),
+            })
+            .expect("queue initial turn");
+        drop(sender);
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 2, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "turn": { "id": "turn-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({
+                    "method": "item/completed",
+                    "params": { "item": { "type": "agentMessage", "text": "完成" } }
+                })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+                ),
+                RelayCodexTransportEvent::Closed("script complete".into()),
+            ]),
+            sent: Vec::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost::default();
+        let turn_active = Arc::new(AtomicBool::new(false));
+
+        let acknowledgement = run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-a",
+            &receiver,
+            &turn_active,
+        );
+
+        assert!(acknowledgement.is_none());
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter_map(|frame| frame.get("method").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["initialize", "initialized", "thread/start", "turn/start"]
+        );
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "thread_ready:module-a:thread-a"));
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_started:module-a:cycle-a:thread-a:turn-a"));
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_completed:module-a:cycle-a:完成"));
     }
 
     fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {

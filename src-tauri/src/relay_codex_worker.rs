@@ -13,6 +13,11 @@ pub enum RelayCodexTransportEvent {
     ProtocolError(String),
 }
 
+pub trait RelayCodexTransport {
+    fn send_json(&mut self, value: Value) -> Result<(), String>;
+    fn recv_event(&mut self, timeout: Duration) -> RelayCodexTransportEvent;
+}
+
 pub struct RelayCodexProcessTransport {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -63,7 +68,18 @@ impl RelayCodexProcessTransport {
         })
     }
 
-    pub fn send_json(&mut self, value: Value) -> Result<(), String> {
+    pub fn shutdown(mut self) -> Result<(), String> {
+        drop(self.stdin);
+        let _ = self.child.kill();
+        self.child
+            .wait()
+            .map(|_| ())
+            .map_err(|error| format!("无法结束 Codex 对话：{error}"))
+    }
+}
+
+impl RelayCodexTransport for RelayCodexProcessTransport {
+    fn send_json(&mut self, value: Value) -> Result<(), String> {
         serde_json::to_writer(&mut self.stdin, &value)
             .map_err(|error| format!("无法编码 Codex 请求：{error}"))?;
         self.stdin
@@ -74,7 +90,7 @@ impl RelayCodexProcessTransport {
             .map_err(|error| format!("无法刷新 Codex 请求：{error}"))
     }
 
-    pub fn recv_event(&self, timeout: Duration) -> RelayCodexTransportEvent {
+    fn recv_event(&mut self, timeout: Duration) -> RelayCodexTransportEvent {
         match self.events.recv_timeout(timeout) {
             Ok(Ok(value)) => RelayCodexTransportEvent::Message(value),
             Ok(Err(error)) => RelayCodexTransportEvent::ProtocolError(error),
@@ -83,14 +99,5 @@ impl RelayCodexProcessTransport {
                 RelayCodexTransportEvent::Closed("Codex App Server 已在回合完成前退出。".into())
             }
         }
-    }
-
-    pub fn shutdown(mut self) -> Result<(), String> {
-        drop(self.stdin);
-        let _ = self.child.kill();
-        self.child
-            .wait()
-            .map(|_| ())
-            .map_err(|error| format!("无法结束 Codex 对话：{error}"))
     }
 }
