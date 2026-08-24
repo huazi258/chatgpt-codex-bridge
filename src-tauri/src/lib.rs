@@ -7711,6 +7711,12 @@ mod tests {
     #[test]
     fn relay_codex_protocol_marks_malformed_or_disconnected_thread_start_unknown_without_retry() {
         let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "P1".into(),
+            })
+            .expect("queue P1");
         drop(sender);
         let mut transport = ScriptedRelayCodexTransport {
             events: VecDeque::from([
@@ -7748,6 +7754,12 @@ mod tests {
     #[test]
     fn relay_codex_protocol_keeps_explicit_thread_start_error_distinct_from_unknown() {
         let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "P1".into(),
+            })
+            .expect("queue P1");
         drop(sender);
         let mut transport = ScriptedRelayCodexTransport {
             events: VecDeque::from([
@@ -7786,6 +7798,12 @@ mod tests {
     #[test]
     fn relay_codex_protocol_arms_thread_start_before_send_failure() {
         let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-a".into(),
+                prompt: "P1".into(),
+            })
+            .expect("queue P1");
         drop(sender);
         let mut transport = ScriptedRelayCodexTransport {
             events: VecDeque::from([RelayCodexTransportEvent::Message(
@@ -7888,6 +7906,7 @@ mod tests {
         for (kind, state, owner, last, allowed) in cases {
             let connection = relay_connection();
             insert_relay_module(&connection, "module-a", "恢复模块");
+            insert_relay_module(&connection, "module-other", "其他模块");
             if matches!(kind, RelayCodexAcquisitionKind::ResumeKnownActive) {
                 connection
                     .execute(
@@ -8691,6 +8710,7 @@ mod tests {
     fn relay_codex_start_new_revalidates_reserved_target_without_partial_mutation() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-a", "恢复模块");
+        insert_relay_module(&connection, "module-other", "其他模块");
         insert_relay_codex_cycle(&connection, "cycle-a", "module-a", 1, None)
             .expect("pending cycle");
         connection
@@ -8729,7 +8749,8 @@ mod tests {
         connection
             .execute(
                 "UPDATE relay_codex_threads
-                 SET state = 'UNAVAILABLE', owner_module_id = NULL, last_module_id = 'module-other'
+                 SET state = 'UNAVAILABLE', owner_module_id = NULL, last_module_id = 'module-other',
+                     reservation_previous_state = NULL
                  WHERE thread_id = 'thread-a'",
                 [],
             )
