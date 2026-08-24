@@ -7,7 +7,8 @@ import { RelayAcceptancePanel } from './components/RelayAcceptancePanel';
 import { RelayModuleActions } from './components/RelayModuleActions';
 import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
 import { RelayCodexThreadCandidateList } from './components/RelayCodexThreadCandidateList';
-import type { RelayCodexThreadCandidate, RelayCodexThreadTarget, RelayModuleCreationInput, RelayThreadResumeModuleFields } from './relay-thread-resume';
+import { RelayCodexRecoveryPanel } from './components/RelayCodexRecoveryPanel';
+import type { RelayCodexRecoveryAction, RelayCodexThreadCandidate, RelayCodexThreadStateSnapshot, RelayCodexThreadTarget, RelayModuleCreationInput, RelayThreadResumeModuleFields } from './relay-thread-resume';
 
 type RelayKind = 'MANUAL' | 'AUTOMATION';
 
@@ -45,6 +46,7 @@ export default function App() {
   const [codexThreadTarget, setCodexThreadTarget] = useState<RelayCodexThreadTarget>({ mode: 'NEW' });
   const [threadCandidates, setThreadCandidates] = useState<RelayCodexThreadCandidate[] | null>(null);
   const [threadRefreshBusy, setThreadRefreshBusy] = useState(false);
+  const [codexRecoveryState, setCodexRecoveryState] = useState<RelayCodexThreadStateSnapshot | null>(null);
   const [text, setText] = useState('');
   const [kind, setKind] = useState<RelayKind>('MANUAL');
   const selected = useMemo(
@@ -83,6 +85,10 @@ export default function App() {
     setThreadCandidates(null);
     setCodexThreadTarget((target) => target.mode === 'EXISTING' ? { mode: 'EXISTING', threadId: '' } : target);
   }
+  async function refreshCodexRecoveryState(moduleId = selectedId) {
+    if (!moduleId) return setCodexRecoveryState(null);
+    setCodexRecoveryState(await invoke<RelayCodexThreadStateSnapshot>('get_relay_codex_thread_state', { moduleId }));
+  }
 
   async function refreshCodexThreads() {
     const workingDirectory = draft.workingDirectory.trim();
@@ -110,6 +116,13 @@ export default function App() {
     void refreshCodexCycles().catch((error) => setNotice(`无法读取 Codex 通讯状态：${String(error)}`));
   }, [selectedId]);
   useEffect(() => {
+    if (selected?.phase === 'RECOVERY_REQUIRED') {
+      void refreshCodexRecoveryState(selected.id).catch((error) => setNotice(`无法读取 Codex 恢复状态：${String(error)}`));
+    } else {
+      setCodexRecoveryState(null);
+    }
+  }, [selected?.id, selected?.phase]);
+  useEffect(() => {
     let stopStatus: (() => void) | undefined;
     let stopControl: (() => void) | undefined;
     let stopCodex: (() => void) | undefined;
@@ -121,7 +134,7 @@ export default function App() {
       void refreshModules().catch(() => undefined); void refreshMessages().catch(() => undefined); void refreshRecoveryMessages().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
     }).then((unsubscribe) => { stopControl = unsubscribe; });
     void listen<{ moduleId: string }>('relay-codex', () => {
-      void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
+      void refreshModules().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined); void refreshCodexRecoveryState().catch(() => undefined);
     }).then((unsubscribe) => { stopCodex = unsubscribe; });
     return () => { stopStatus?.(); stopControl?.(); stopCodex?.(); };
   }, [selectedId]);
@@ -192,7 +205,28 @@ export default function App() {
       refreshRecoveryMessages(),
       refreshCodexCycles(moduleId),
       refreshChannelSnapshot(),
+      refreshCodexRecoveryState(moduleId),
     ]);
+  }
+
+  async function recoverSelectedCodexThread(action: RelayCodexRecoveryAction) {
+    if (!selected) return;
+    setBusy(true);
+    try {
+      await invoke('recover_relay_codex', { moduleId: selected.id, action });
+      setNotice('已提交 Codex 对话恢复操作；请依据后端返回的下一步继续。');
+    } catch (error) {
+      const detail = String(error);
+      setNotice(`Codex 对话恢复失败：${detail}`);
+      throw error;
+    } finally {
+      try {
+        await refreshAfterModuleAction(selected.id);
+      } catch (error) {
+        setNotice(`无法刷新 Codex 恢复状态：${String(error)}`);
+      }
+      setBusy(false);
+    }
   }
 
   async function acceptSelectedModule() {
@@ -271,6 +305,7 @@ export default function App() {
         <section className="form-section relay-summary"><div><h3>模块状态</h3><p className="execution-status">工作目录：{selected.workingDirectory}</p></div><p className="execution-status">已开始循环：{selected.startedCycles} / {selected.maxCycles} · 最长运行：{selected.maxRuntimeMinutes} 分钟 · 无效自动化回复：{selected.invalidReplyCount}</p>{selected.codexThreadId ? <p className="protocol-result">已获取 Codex 对话 · {selected.codexThreadId.slice(0, 12)}</p> : selected.resumeThreadId ? <p className="protocol-result">已选择现有对话 · {selected.resumeThreadId.slice(0, 12)}</p> : <p className="execution-status">新 Codex 对话 · 尚未创建</p>}</section>
         {selected.phase === 'COMPLETED' ? <section className="form-section relay-terminal-notice"><h3>已验收完成</h3><p className="execution-status">该模块已完成验收，保留历史记录且不会再发送消息或启动 Codex。</p></section> : null}
         {selected.phase === 'STOPPED' ? <section className="form-section relay-terminal-notice"><h3>已终止</h3><p className="execution-status">该模块已由用户终止，保留历史记录且不会再发送消息或启动 Codex。</p></section> : null}
+        {selected.phase === 'RECOVERY_REQUIRED' ? <RelayCodexRecoveryPanel snapshot={codexRecoveryState} busy={busy} onAction={recoverSelectedCodexThread} /> : null}
         {selected.phase === 'WAITING_FOR_ACCEPTANCE' ? <RelayAcceptancePanel blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onAccept={acceptSelectedModule} onSubmitFeedback={submitAcceptanceFeedback} /> : null}
         <RelayModuleActions phase={selected.phase} stopAfterTurn={selected.stopAfterTurn} blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onTerminate={terminateSelectedModule} />
         <CodexCommunicationPanel cycles={codexCycles} />

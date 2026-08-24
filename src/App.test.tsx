@@ -5,8 +5,15 @@ import { CodexCommunicationPanel } from './components/CodexCommunicationPanel';
 import { CodexCycleCard } from './components/CodexCycleCard';
 import { GlobalChannelStatus } from './components/GlobalChannelStatus';
 import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
+import type { RelayCodexThreadStateSnapshot } from './relay-thread-resume';
 
-let modules = [
+interface TestRelayModule {
+  id: string; name: string; workingDirectory: string; maxCycles: number; maxRuntimeMinutes: number;
+  retryTemplate: string; phase: string; stopAfterTurn: boolean; invalidReplyCount: number; startedCycles: number;
+  resumeThreadId?: string | null; codexThreadId?: string | null; codexRecoveryReason?: string | null;
+}
+
+let modules: TestRelayModule[] = [
   { id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', stopAfterTurn: false, invalidReplyCount: 0, startedCycles: 0 },
 ];
 let recoveryMessages: Array<{ messageId: string; moduleId: string; moduleName: string; sequenceNumber: number; kind: string; createdAt: string }> = [];
@@ -15,6 +22,9 @@ let relayMessages: Array<{ id: string; sequenceNumber: number; direction: 'TO_CH
 let terminateError: Error | null = null;
 let createError: Error | null = null;
 let threadCandidates: Array<{ threadId: string; name?: string | null; source: string; status: string; branch?: string | null; recencyAt: number | null; selectable: boolean; disabledReason?: string | null }> = [];
+let recoverySnapshot: RelayCodexThreadStateSnapshot | null = null;
+let recoveryActionError: Error | null = null;
+let recoveryActionHandler: ((action: { type: string; threadId?: string }) => void) | null = null;
 let channelSnapshot: RelayChannelSnapshot = {
   chatgpt: { status: 'IDLE', recoveryBlockerCount: 0 },
   codex: { status: 'IDLE' },
@@ -29,7 +39,16 @@ invoke.mockImplementation(async (command: string, args?: { input?: { name: strin
   if (command === 'list_relay_recovery_messages') return recoveryMessages;
   if (command === 'list_relay_codex_cycles') return codexCycles;
   if (command === 'get_relay_channel_snapshot') return channelSnapshot;
+  if (command === 'get_relay_codex_thread_state') {
+    if (!recoverySnapshot) throw new Error('no recovery state');
+    return recoverySnapshot;
+  }
   if (command === 'list_relay_codex_threads_for_cwd') return threadCandidates;
+  if (command === 'recover_relay_codex') {
+    if (recoveryActionError) throw recoveryActionError;
+    recoveryActionHandler?.((args as { action: { type: string; threadId?: string } }).action);
+    return undefined;
+  }
   if (command === 'create_relay_module') {
     if (createError) throw createError;
     const input = args?.input;
@@ -60,6 +79,9 @@ describe('传话模块创建入口', () => {
     terminateError = null;
     createError = null;
     threadCandidates = [];
+    recoverySnapshot = null;
+    recoveryActionError = null;
+    recoveryActionHandler = null;
     channelSnapshot = {
       chatgpt: { status: 'IDLE', recoveryBlockerCount: 0 },
       codex: { status: 'IDLE' },
@@ -238,6 +260,112 @@ describe('Codex 对话创建选择', () => {
     expect(await screen.findByText(/创建失败：.*对话状态已变化，请刷新/)).toBeTruthy();
     expect(screen.getByRole('heading', { name: '创建传话模块' })).toBeTruthy();
     expect(screen.getByRole('button', { name: '已选择' })).toBeTruthy();
+  });
+});
+
+describe('Codex 对话恢复面板', () => {
+  const baseRecoverySnapshot: RelayCodexThreadStateSnapshot = {
+    moduleId: 'existing',
+    workingDirectory: 'G:\\projects\\resume',
+    intendedThreadId: 'thread-intended',
+    acquiredThreadId: 'thread-acquired',
+    registry: { threadId: 'thread-intended', workingDirectory: 'G:\\projects\\resume', state: 'UNAVAILABLE', ownerModuleId: null, lastModuleId: 'existing', reservationPreviousState: null, updatedAt: '2026-08-24T00:00:00Z' },
+    recoveryReason: 'THREAD_REACQUIRE_REQUIRED',
+    pendingCycle: { id: 'cycle-1', cycleNumber: 1, status: 'WAITING_TO_SEND_CODEX', promptText: '请继续任务。' },
+    summary: '应用重启或连接中断后无法确认此前 Codex 对话占用状态，未自动恢复。',
+    allowedActions: [{ type: 'REACQUIRE_THREAD' }],
+  };
+
+  beforeEach(() => {
+    modules = [{ id: 'existing', name: '恢复模块', workingDirectory: 'G:\\projects\\resume', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'RECOVERY_REQUIRED', stopAfterTurn: false, invalidReplyCount: 0, startedCycles: 1, resumeThreadId: 'thread-intended', codexThreadId: 'thread-acquired', codexRecoveryReason: 'THREAD_REACQUIRE_REQUIRED' }];
+    recoveryMessages = [];
+    codexCycles = [];
+    relayMessages = [];
+    recoverySnapshot = { ...baseRecoverySnapshot };
+    recoveryActionError = null;
+    recoveryActionHandler = null;
+    threadCandidates = [{ threadId: 'thread-choice', name: '候选对话', source: 'cli', status: 'idle', branch: null, recencyAt: null, selectable: true }];
+    invoke.mockClear();
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.mocked(window.confirm).mockRestore();
+  });
+
+  async function renderRecovery() {
+    render(<App />);
+    await screen.findByRole('heading', { name: '恢复模块' });
+    await screen.findByRole('heading', { name: 'Codex 对话恢复' });
+  }
+
+  it('RECOVERY_REQUIRED 读取并展示后端摘要、身份、登记和 pending cycle', async () => {
+    await renderRecovery();
+    expect(invoke).toHaveBeenCalledWith('get_relay_codex_thread_state', { moduleId: 'existing' });
+    expect(screen.getByText(baseRecoverySnapshot.summary)).toBeTruthy();
+    expect(screen.getByText('预期对话：thread-intended')).toBeTruthy();
+    expect(screen.getByText('已获取对话：thread-acquired')).toBeTruthy();
+    expect(screen.getByText('登记状态：UNAVAILABLE')).toBeTruthy();
+    expect(screen.getByText(/待处理提示 · Cycle 1 · WAITING_TO_SEND_CODEX/)).toBeTruthy();
+    expect(screen.getByText('请继续任务。')).toBeTruthy();
+  });
+
+  it('非 recovery 模块不读取也不显示恢复面板', async () => {
+    modules = [{ ...modules[0], phase: 'READY' }];
+    render(<App />);
+    await screen.findByRole('heading', { name: '恢复模块' });
+    expect(screen.queryByRole('heading', { name: 'Codex 对话恢复' })).toBeNull();
+    expect(invoke).not.toHaveBeenCalledWith('get_relay_codex_thread_state', expect.anything());
+  });
+
+  it('按钮完全跟随 backend allowedActions，未知 turn 不提供重试', async () => {
+    recoverySnapshot = { ...baseRecoverySnapshot, recoveryReason: 'TURN_START_UNKNOWN', summary: '无法确认任务是否已启动，禁止直接重发。', allowedActions: [] };
+    await renderRecovery();
+    expect(screen.getByText('无法确认任务是否已启动，禁止直接重发。')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '重试发送任务' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '重新获取此对话' })).toBeNull();
+  });
+
+  it('REACQUIRE 只调用一次，不会自动重试发送任务', async () => {
+    await renderRecovery();
+    fireEvent.click(screen.getByRole('button', { name: '重新获取此对话' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('recover_relay_codex', { moduleId: 'existing', action: { type: 'REACQUIRE_THREAD' } }));
+    expect(invoke).not.toHaveBeenCalledWith('recover_relay_codex', { moduleId: 'existing', action: { type: 'RETRY_TURN_START' } });
+  });
+
+  it('后端下一快照允许 RETRY_TURN_START 后才显示重试按钮', async () => {
+    recoveryActionHandler = () => { recoverySnapshot = { ...baseRecoverySnapshot, allowedActions: [{ type: 'RETRY_TURN_START' }] }; };
+    await renderRecovery();
+    fireEvent.click(screen.getByRole('button', { name: '重新获取此对话' }));
+    await screen.findByRole('button', { name: '重试发送任务' });
+    expect(invoke).not.toHaveBeenCalledWith('recover_relay_codex', { moduleId: 'existing', action: { type: 'RETRY_TURN_START' } });
+  });
+
+  it('SELECT_EXISTING 使用固定工作目录，成功后不自动继续', async () => {
+    recoverySnapshot = { ...baseRecoverySnapshot, allowedActions: [{ type: 'SELECT_EXISTING_THREAD' }] };
+    recoveryActionHandler = () => { recoverySnapshot = { ...baseRecoverySnapshot, allowedActions: [{ type: 'RETRY_RESUME' }] }; };
+    await renderRecovery();
+    fireEvent.click(screen.getByRole('button', { name: '选择现有 Codex 对话' }));
+    expect(screen.getByText('工作目录固定为：G:\\projects\\resume')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '刷新对话' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('list_relay_codex_threads_for_cwd', { workingDirectory: 'G:\\projects\\resume' }));
+    fireEvent.click(await screen.findByRole('button', { name: '选择此对话' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('recover_relay_codex', { moduleId: 'existing', action: { type: 'SELECT_EXISTING_THREAD', threadId: 'thread-choice' } }));
+    expect(invoke).not.toHaveBeenCalledWith('recover_relay_codex', { moduleId: 'existing', action: { type: 'RETRY_RESUME' } });
+    expect(await screen.findByRole('button', { name: '重新尝试继续此对话' })).toBeTruthy();
+  });
+
+  it('START_NEW 需要用户确认，失败操作显示后端错误并刷新状态', async () => {
+    recoverySnapshot = { ...baseRecoverySnapshot, allowedActions: [{ type: 'START_NEW_THREAD' }] };
+    vi.mocked(window.confirm).mockReturnValueOnce(false);
+    await renderRecovery();
+    fireEvent.click(screen.getByRole('button', { name: '改用新 Codex 对话' }));
+    expect(invoke).not.toHaveBeenCalledWith('recover_relay_codex', expect.anything());
+    recoveryActionError = new Error('后端拒绝恢复');
+    fireEvent.click(screen.getByRole('button', { name: '改用新 Codex 对话' }));
+    expect(await screen.findByText(/恢复操作失败：.*后端拒绝恢复/)).toBeTruthy();
+    expect(invoke).toHaveBeenCalledWith('get_relay_codex_thread_state', { moduleId: 'existing' });
   });
 });
 

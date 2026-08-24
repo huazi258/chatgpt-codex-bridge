@@ -125,6 +125,11 @@ nav { display: grid; gap: 9px; }
 .relay-thread-candidate strong { color: #273c5d; font-size: 14px; }
 .relay-thread-candidate p { margin: 5px 0 0; color: #52637d; font-size: 12px; line-height: 1.4; }
 .relay-thread-candidate .relay-thread-disabled-reason { color: #a82f39; font-weight: 800; }
+.relay-codex-recovery-panel { display: grid; gap: 14px; }
+.relay-codex-recovery-panel h3, .relay-codex-recovery-panel h4 { margin-bottom: 0; }
+.recovery-details { display: grid; gap: 6px; }
+.recovery-details p { margin: 0; color: #52637d; font-size: 13px; }
+.recovery-thread-picker { padding-top: 14px; border-top: 1px solid #d9e1ec; }
 
 @media (max-width: 980px) {
   body { min-width: 0; }
