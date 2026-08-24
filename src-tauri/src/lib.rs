@@ -5149,7 +5149,7 @@ fn start_or_continue_relay_codex_turn(
                 return Err(reason.into());
             }
         }
-        if let Err(error) = verify_relay_codex_resume_reservation_in(&connection, &module) {
+        if let Err(error) = verify_relay_codex_thread_ownership_for_turn_in(&connection, &module) {
             let _ = set_relay_codex_pending_cycle_error(&connection, cycle_id, &error);
             emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
             return Err(error);
@@ -5186,9 +5186,30 @@ fn start_or_continue_relay_codex_turn(
         let turn_active = Arc::new(AtomicBool::new(false));
         let app_for_worker = app.clone();
         let working_directory = module.working_directory.clone();
-        let execution_mode = match module.resume_thread_id.clone() {
-            Some(thread_id) => RelayCodexExecutionMode::ResumeReservedThenTurn { thread_id },
-            None => RelayCodexExecutionMode::NewThenTurn,
+        let execution_mode = match relay_codex_execution_mode_for_new_session(&module) {
+            Ok(execution_mode) => execution_mode,
+            Err(reason) => {
+                drop(sessions);
+                let connection = state
+                    .connection
+                    .lock()
+                    .map_err(|_| "数据库锁已损坏。".to_string())?;
+                set_relay_phase(&connection, module_id, "RECOVERY_REQUIRED")?;
+                set_relay_codex_recovery_reason(
+                    &connection,
+                    module_id,
+                    Some(RelayCodexRecoveryReason::ThreadReacquireRequired),
+                )?;
+                set_relay_codex_pending_cycle_error(&connection, cycle_id, &reason)?;
+                append_relay_event(
+                    &connection,
+                    module_id,
+                    "CODEX_THREAD_REACQUIRE_REQUIRED",
+                    "已获取的 Codex 对话没有当前进程的 live worker，未自动重新恢复。",
+                )?;
+                emit_relay_codex_changed(app, module_id, cycle_id, "FAILED");
+                return Err(reason);
+            }
         };
         let worker_module_id = module_id.to_string();
         let initial_cycle_id = cycle_id.to_string();
@@ -6213,7 +6234,24 @@ fn relay_codex_thread_acquired(
     confirm_relay_codex_thread_acquisition_in(&connection, module_id, thread_id, kind)
 }
 
-fn verify_relay_codex_resume_reservation_in(
+fn relay_codex_execution_mode_for_new_session(
+    module: &RelayModuleRecord,
+) -> Result<RelayCodexExecutionMode, String> {
+    match (
+        module.resume_thread_id.as_deref(),
+        module.codex_thread_id.as_deref(),
+    ) {
+        (None, _) => Ok(RelayCodexExecutionMode::NewThenTurn),
+        (Some(thread_id), None) => Ok(RelayCodexExecutionMode::ResumeReservedThenTurn {
+            thread_id: thread_id.to_string(),
+        }),
+        (Some(_), Some(_)) => {
+            Err("已获取的 Codex 对话没有当前进程的 live worker，未自动重新恢复。".into())
+        }
+    }
+}
+
+fn verify_relay_codex_thread_ownership_for_turn_in(
     connection: &Connection,
     module: &RelayModuleRecord,
 ) -> Result<(), String> {
@@ -6221,11 +6259,18 @@ fn verify_relay_codex_resume_reservation_in(
         return Ok(());
     };
     let record = get_relay_codex_thread(connection, thread_id)?;
-    let reserved_by_module = record.is_some_and(|record| {
-        record.state == RelayCodexThreadState::Reserved
-            && record.owner_module_id.as_deref() == Some(module.id.as_str())
-    });
-    if reserved_by_module {
+    let owned_for_turn = match module.codex_thread_id.as_deref() {
+        None => record.is_some_and(|record| {
+            record.state == RelayCodexThreadState::Reserved
+                && record.owner_module_id.as_deref() == Some(module.id.as_str())
+        }),
+        Some(codex_thread_id) if codex_thread_id == thread_id => record.is_some_and(|record| {
+            record.state == RelayCodexThreadState::Active
+                && record.owner_module_id.as_deref() == Some(module.id.as_str())
+        }),
+        Some(_) => false,
+    };
+    if owned_for_turn {
         return Ok(());
     }
     set_relay_phase(connection, &module.id, "RECOVERY_REQUIRED")?;
@@ -7739,6 +7784,12 @@ mod tests {
             std_mpsc::Sender<RelayCodexCommand>,
             std_mpsc::Sender<Result<(), String>>,
         )>,
+        turn_sender: Option<std_mpsc::Sender<RelayCodexCommand>>,
+        follow_up_turns_after_completion: VecDeque<(String, String)>,
+        release_after_completion: Option<(
+            std_mpsc::Sender<RelayCodexCommand>,
+            std_mpsc::Sender<Result<(), String>>,
+        )>,
     }
 
     struct ScriptedRelayCodexTransport {
@@ -7809,6 +7860,17 @@ mod tests {
         fn turn_completed(&mut self, module_id: &str, cycle_id: &str, summary: &str) {
             self.callbacks
                 .push(format!("turn_completed:{module_id}:{cycle_id}:{summary}"));
+            if let Some((cycle_id, prompt)) = self.follow_up_turns_after_completion.pop_front() {
+                self.turn_sender
+                    .as_ref()
+                    .expect("follow-up turn sender")
+                    .send(RelayCodexCommand::StartTurn { cycle_id, prompt })
+                    .expect("inject follow-up turn after completion");
+            } else if let Some((sender, acknowledgement)) = self.release_after_completion.take() {
+                sender
+                    .send(RelayCodexCommand::Release { acknowledgement })
+                    .expect("release completed worker");
+            }
         }
 
         fn failed(&mut self, module_id: &str, cycle_id: Option<&str>, reason: String) {
@@ -8074,6 +8136,133 @@ mod tests {
     }
 
     #[test]
+    fn relay_existing_multi_cycle_ownership_validation_is_acquisition_aware() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "继续模块");
+        connection
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set reserved target");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: Some("RELEASED".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed reservation");
+
+        let pre_acquisition = get_relay_module(&connection, "module-a")
+            .expect("read module")
+            .expect("module exists");
+        verify_relay_codex_thread_ownership_for_turn_in(&connection, &pre_acquisition)
+            .expect("reserved target remains valid before first acquisition");
+        assert_eq!(
+            relay_codex_execution_mode_for_new_session(&pre_acquisition),
+            Ok(RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            })
+        );
+
+        confirm_relay_codex_thread_acquisition_in(
+            &connection,
+            "module-a",
+            "thread-a",
+            RelayCodexAcquisitionKind::ReservedResume,
+        )
+        .expect("confirm first acquisition");
+        let acquired = get_relay_module(&connection, "module-a")
+            .expect("read acquired module")
+            .expect("module exists");
+        let registry = get_relay_codex_thread(&connection, "thread-a")
+            .expect("read acquired registry")
+            .expect("registry exists");
+        assert_eq!(acquired.resume_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(acquired.codex_thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(registry.state, RelayCodexThreadState::Active);
+        assert_eq!(registry.owner_module_id.as_deref(), Some("module-a"));
+        verify_relay_codex_thread_ownership_for_turn_in(&connection, &acquired)
+            .expect("acquired target remains valid for later cycles");
+        assert!(relay_codex_execution_mode_for_new_session(&acquired).is_err());
+
+        for (number, prompt, turn_id) in [(1, "P1", "turn-1"), (2, "P2", "turn-2")] {
+            let cycle = create_relay_codex_cycle(&connection, "module-a", number, prompt)
+                .expect("create cycle");
+            mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some(turn_id))
+                .expect("confirm turn start");
+            assert_eq!(
+                complete_relay_codex_turn_in(&connection, "module-a", &cycle.id, "完成")
+                    .expect("complete turn"),
+                RelayCodexTurnCompletion::ReturnedToChatGpt
+            );
+        }
+        let started_cycles: i64 = connection
+            .query_row(
+                "SELECT started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read started cycle count");
+        assert_eq!(started_cycles, 2);
+        let third_cycle_validation = get_relay_module(&connection, "module-a")
+            .expect("read module for third cycle")
+            .expect("module exists");
+        verify_relay_codex_thread_ownership_for_turn_in(&connection, &third_cycle_validation)
+            .expect("third cycle remains valid on the acquired thread");
+
+        let wrong_owner = relay_connection();
+        insert_relay_module(&wrong_owner, "module-a", "继续模块");
+        insert_relay_module(&wrong_owner, "module-other", "其他模块");
+        wrong_owner
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-a', codex_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set acquired target");
+        upsert_relay_codex_thread(
+            &wrong_owner,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Active,
+                owner_module_id: Some("module-other".into()),
+                last_module_id: Some("module-other".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed foreign owner");
+        let foreign_module = get_relay_module(&wrong_owner, "module-a")
+            .expect("read foreign module")
+            .expect("module exists");
+        assert!(
+            verify_relay_codex_thread_ownership_for_turn_in(&wrong_owner, &foreign_module).is_err()
+        );
+
+        let mismatch = relay_connection();
+        insert_relay_module(&mismatch, "module-a", "继续模块");
+        mismatch
+            .execute(
+                "UPDATE relay_modules SET resume_thread_id = 'thread-a', codex_thread_id = 'thread-b' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set mismatched targets");
+        let mismatched_module = get_relay_module(&mismatch, "module-a")
+            .expect("read mismatched module")
+            .expect("module exists");
+        assert!(
+            verify_relay_codex_thread_ownership_for_turn_in(&mismatch, &mismatched_module).is_err()
+        );
+    }
+
+    #[test]
     fn relay_codex_acquisition_confirmation_persists_each_safe_registry_transition() {
         let cases = [
             (
@@ -8240,7 +8429,7 @@ mod tests {
             .expect("read module")
             .expect("module exists");
 
-        assert!(verify_relay_codex_resume_reservation_in(&connection, &module).is_err());
+        assert!(verify_relay_codex_thread_ownership_for_turn_in(&connection, &module).is_err());
         let after = get_relay_module(&connection, "module-a")
             .expect("read module")
             .expect("module exists");
@@ -8304,6 +8493,143 @@ mod tests {
             .sent
             .iter()
             .any(|frame| frame.get("method").and_then(Value::as_str) == Some("thread/start")));
+    }
+
+    #[test]
+    fn relay_existing_multi_cycle_reuses_one_acquired_worker_and_thread() {
+        let (sender, receiver) = std_mpsc::channel();
+        sender
+            .send(RelayCodexCommand::StartTurn {
+                cycle_id: "cycle-1".into(),
+                prompt: "P1".into(),
+            })
+            .expect("queue first turn");
+        let (release_acknowledgement, _release_receiver) = std_mpsc::channel();
+        let mut transport = ScriptedRelayCodexTransport {
+            events: VecDeque::from([
+                RelayCodexTransportEvent::Message(json!({ "id": 1, "result": {} })),
+                RelayCodexTransportEvent::Message(json!({ "id": 2, "result": { "data": [{
+                    "id": "thread-a", "cwd": "G:\\workspace", "source": "cli",
+                    "status": { "type": "idle" }
+                }] } })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 3, "result": { "thread": { "id": "thread-a" } } }),
+                ),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 4, "result": { "turn": { "id": "turn-1" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({
+                    "method": "item/completed",
+                    "params": { "item": { "type": "agentMessage", "text": "完成 1" } }
+                })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+                ),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 5, "result": { "turn": { "id": "turn-2" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({
+                    "method": "item/completed",
+                    "params": { "item": { "type": "agentMessage", "text": "完成 2" } }
+                })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+                ),
+                RelayCodexTransportEvent::Message(
+                    json!({ "id": 6, "result": { "turn": { "id": "turn-3" } } }),
+                ),
+                RelayCodexTransportEvent::Message(json!({
+                    "method": "item/completed",
+                    "params": { "item": { "type": "agentMessage", "text": "完成 3" } }
+                })),
+                RelayCodexTransportEvent::Message(
+                    json!({ "method": "turn/completed", "params": { "turn": { "status": "completed" } } }),
+                ),
+            ]),
+            sent: Vec::new(),
+            send_results: VecDeque::new(),
+        };
+        let mut host = TestRelayCodexWorkerHost {
+            turn_sender: Some(sender.clone()),
+            follow_up_turns_after_completion: VecDeque::from([
+                ("cycle-2".into(), "P2".into()),
+                ("cycle-3".into(), "P3".into()),
+            ]),
+            release_after_completion: Some((sender, release_acknowledgement)),
+            ..Default::default()
+        };
+        let turn_active = Arc::new(AtomicBool::new(false));
+        let acknowledgement = run_relay_codex_worker_core(
+            &mut transport,
+            &mut host,
+            "module-a",
+            "cycle-1",
+            r"G:\workspace",
+            &RelayCodexExecutionMode::ResumeReservedThenTurn {
+                thread_id: "thread-a".into(),
+            },
+            &receiver,
+            &turn_active,
+        );
+
+        let methods = transport
+            .sent
+            .iter()
+            .filter_map(|frame| frame.get("method").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let third_turn_start = methods
+            .iter()
+            .enumerate()
+            .filter(|(_, method)| **method == "turn/start")
+            .nth(2)
+            .expect("third cycle starts a third turn")
+            .0;
+        assert_eq!(
+            methods[..third_turn_start]
+                .iter()
+                .filter(|method| **method == "turn/start")
+                .count(),
+            2,
+            "cycles 1 and 2 only start their own turns"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "thread/resume")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "thread/start")
+                .count(),
+            0
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "turn/start")
+                .count(),
+            3
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| **method == "thread/list")
+                .count(),
+            1
+        );
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_completed:module-a:cycle-2:完成 2"));
+        assert!(host
+            .callbacks
+            .iter()
+            .any(|callback| callback == "turn_completed:module-a:cycle-3:完成 3"));
+        assert!(acknowledgement.is_some());
+        assert!(!turn_active.load(Ordering::SeqCst));
     }
 
     #[test]
