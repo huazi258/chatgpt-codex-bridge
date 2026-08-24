@@ -3643,14 +3643,19 @@ fn terminate_relay_module_with_active_turn_in(
     Ok(outcome)
 }
 
-fn submit_relay_acceptance_feedback_in(
+fn submit_relay_automation_feedback_in(
     connection: &Connection,
     module_id: &str,
     text: &str,
+    required_phase: &str,
+    empty_text_error: &str,
+    wrong_phase_error: &str,
+    feedback_event_type: &str,
+    feedback_event_detail: &str,
 ) -> Result<String, String> {
     let feedback = text.trim();
     if feedback.is_empty() {
-        return Err("验收反馈不能为空。".into());
+        return Err(empty_text_error.into());
     }
     let transaction = connection
         .unchecked_transaction()
@@ -3667,8 +3672,8 @@ fn submit_relay_acceptance_feedback_in(
         .optional()
         .map_err(|error| format!("无法读取传话模块：{error}"))?
         .ok_or_else(|| "传话模块不存在。".to_string())?;
-    if module.phase != "WAITING_FOR_ACCEPTANCE" {
-        return Err("模块当前未等待人工验收，不能提交验收反馈。".into());
+    if module.phase != required_phase {
+        return Err(wrong_phase_error.into());
     }
     if module.stop_after_turn {
         return Err("模块正在终止，不能提交验收反馈。".into());
@@ -3705,13 +3710,47 @@ fn submit_relay_acceptance_feedback_in(
     append_relay_event_in_transaction(
         &transaction,
         module_id,
-        "ACCEPTANCE_FEEDBACK_QUEUED",
-        &format!("requestId={message_id}; 已将人工验收反馈加入自动化发送队列。"),
+        feedback_event_type,
+        &format!("requestId={message_id}; {feedback_event_detail}"),
     )?;
     transaction
         .commit()
         .map_err(|error| format!("无法提交验收反馈事务：{error}"))?;
     Ok(message_id)
+}
+
+fn submit_relay_acceptance_feedback_in(
+    connection: &Connection,
+    module_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    submit_relay_automation_feedback_in(
+        connection,
+        module_id,
+        text,
+        "WAITING_FOR_ACCEPTANCE",
+        "验收反馈不能为空。",
+        "模块当前未等待人工验收，不能提交验收反馈。",
+        "ACCEPTANCE_FEEDBACK_QUEUED",
+        "已将人工验收反馈加入自动化发送队列。",
+    )
+}
+
+fn submit_relay_blocked_feedback_in(
+    connection: &Connection,
+    module_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    submit_relay_automation_feedback_in(
+        connection,
+        module_id,
+        text,
+        "BLOCKED",
+        "人工回复不能为空。",
+        "模块当前不需要人工处理，不能提交回复。",
+        "BLOCKED_FEEDBACK_QUEUED",
+        "已将人工回复加入自动化发送队列。",
+    )
 }
 
 fn relay_codex_turn_is_active_for_module(
@@ -3911,6 +3950,52 @@ fn submit_relay_acceptance_feedback(
 }
 
 #[tauri::command]
+fn submit_relay_blocked_feedback(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_id: String,
+    text: String,
+) -> Result<(), String> {
+    let message_id = {
+        let connection = state
+            .connection
+            .lock()
+            .map_err(|_| "数据库锁已损坏。".to_string())?;
+        submit_relay_blocked_feedback_in(&connection, &module_id, &text)?
+    };
+    let _ = app.emit(
+        "relay-control",
+        json!({
+            "type": "BLOCKED_FEEDBACK_QUEUED",
+            "moduleId": module_id,
+            "requestId": message_id,
+        }),
+    );
+    dispatch_next_relay_message(&app, &state)
+}
+
+#[tauri::command]
+fn get_relay_blocked_reason(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<Option<String>, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    connection
+        .query_row(
+            "SELECT detail FROM relay_events
+             WHERE module_id = ?1 AND event_type IN ('BLOCKED', 'CONTROL_FAILED')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            [module_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("无法读取人工介入原因：{error}"))
+}
+
+#[tauri::command]
 fn list_relay_modules(state: State<'_, AppState>) -> Result<Vec<RelayModuleRecord>, String> {
     let connection = state
         .connection
@@ -3928,6 +4013,134 @@ fn list_relay_modules(state: State<'_, AppState>) -> Result<Vec<RelayModuleRecor
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("无法读取传话模块：{error}"))?;
     Ok(modules)
+}
+
+fn delete_relay_module_in(connection: &Connection, module_id: &str) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始删除会话事务：{error}"))?;
+    let module =
+        get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话会话不存在。".to_string())?;
+    let unknown_messages: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE module_id = ?1 AND delivery_state = 'UNKNOWN'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查会话不确定送达消息：{error}"))?;
+    if unknown_messages > 0 {
+        return Err("请先处理该会话的不确定送达消息，再终止并删除会话。".into());
+    }
+    let sent_messages: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_messages WHERE module_id = ?1 AND delivery_state = 'SENT'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查会话发送状态：{error}"))?;
+    if sent_messages > 0 || !matches!(module.phase.as_str(), "READY" | "COMPLETED" | "STOPPED") {
+        return Err("请先终止当前会话，再进行删除。".into());
+    }
+    let running_cycles: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = ?1 AND status = 'CODEX_RUNNING'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查会话运行状态：{error}"))?;
+    if running_cycles > 0 {
+        return Err("请先终止当前会话，再进行删除。".into());
+    }
+    let active_owned: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM relay_codex_threads
+             WHERE owner_module_id = ?1 AND state = 'ACTIVE'",
+            [module_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("无法检查 Codex 对话归属：{error}"))?;
+    if active_owned > 0 {
+        return Err("请先终止当前会话，再进行删除。".into());
+    }
+    rollback_relay_codex_reservation_on_terminal_in(&transaction, &module)?;
+    transaction
+        .execute(
+            "UPDATE relay_codex_threads SET last_module_id = NULL
+             WHERE last_module_id = ?1",
+            [module_id],
+        )
+        .map_err(|error| format!("无法解除 Codex 对话历史引用：{error}"))?;
+    transaction
+        .execute(
+            "UPDATE relay_codex_threads SET owner_module_id = NULL
+             WHERE owner_module_id = ?1 AND state NOT IN ('RESERVED', 'ACTIVE')",
+            [module_id],
+        )
+        .map_err(|error| format!("无法解除 Codex 对话归属引用：{error}"))?;
+    transaction
+        .execute("DELETE FROM relay_events WHERE module_id = ?1", [module_id])
+        .map_err(|error| format!("无法删除会话事件：{error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM relay_codex_cycles WHERE module_id = ?1",
+            [module_id],
+        )
+        .map_err(|error| format!("无法删除 Codex 循环：{error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM relay_messages WHERE module_id = ?1",
+            [module_id],
+        )
+        .map_err(|error| format!("无法删除会话消息：{error}"))?;
+    let deleted = transaction
+        .execute("DELETE FROM relay_modules WHERE id = ?1", [module_id])
+        .map_err(|error| format!("无法删除会话：{error}"))?;
+    if deleted != 1 {
+        return Err("传话会话不存在。".into());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交会话删除：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_relay_module(state: State<'_, AppState>, module_id: String) -> Result<(), String> {
+    let live_session = state
+        .relay_codex
+        .lock()
+        .map_err(|_| "Codex 会话锁已损坏。".to_string())?
+        .as_ref()
+        .is_some_and(|session| session.module_id == module_id);
+    if live_session {
+        return Err("请先终止当前会话，再进行删除。".into());
+    }
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    delete_relay_module_in(&connection, &module_id)
+}
+
+#[tauri::command]
+fn open_relay_working_directory(
+    state: State<'_, AppState>,
+    module_id: String,
+) -> Result<(), String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "数据库锁已损坏。".to_string())?;
+    let module =
+        get_relay_module(&connection, &module_id)?.ok_or_else(|| "传话会话不存在。".to_string())?;
+    if !Path::new(&module.working_directory).is_dir() {
+        return Err("所选 Codex 工作目录不存在。".into());
+    }
+    Command::new("explorer")
+        .arg(&module.working_directory)
+        .spawn()
+        .map_err(|error| format!("无法打开工作目录：{error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -10171,6 +10384,145 @@ mod tests {
     }
 
     #[test]
+    fn delete_relay_module_allows_only_terminal_or_empty_ready_sessions() {
+        for phase in ["READY", "COMPLETED", "STOPPED"] {
+            let connection = relay_connection();
+            let module_id = format!("delete-{phase}");
+            insert_relay_module(&connection, &module_id, "可删除会话");
+            connection
+                .execute(
+                    "UPDATE relay_modules SET phase = ?2 WHERE id = ?1",
+                    params![module_id, phase],
+                )
+                .expect("set terminal phase");
+            if phase == "COMPLETED" {
+                insert_relay_message(
+                    &connection,
+                    "delete-message",
+                    &module_id,
+                    1,
+                    "DELIVERED",
+                    "2026-08-17T00:00:00Z",
+                );
+                insert_relay_codex_cycle(&connection, "delete-cycle", &module_id, 1, None)
+                    .expect("cycle");
+            }
+            delete_relay_module_in(&connection, &module_id).expect("delete safe session");
+            let remaining: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_modules WHERE id = ?1",
+                    [&module_id],
+                    |row| row.get(0),
+                )
+                .expect("module count");
+            assert_eq!(remaining, 0, "{phase} should be deletable");
+            if phase == "COMPLETED" {
+                let child_rows: i64 = connection
+                    .query_row(
+                        "SELECT (SELECT COUNT(*) FROM relay_messages WHERE module_id = ?1) +
+                         (SELECT COUNT(*) FROM relay_codex_cycles WHERE module_id = ?1)",
+                        [&module_id],
+                        |row| row.get(0),
+                    )
+                    .expect("child count");
+                assert_eq!(child_rows, 0, "deleted sessions must not leave relay rows");
+            }
+        }
+    }
+
+    #[test]
+    fn delete_relay_module_rejects_pending_states_and_delivery_uncertainty() {
+        for phase in [
+            "WAITING_FOR_CHATGPT",
+            "WAITING_FOR_ACCEPTANCE",
+            "BLOCKED",
+            "RECOVERY_REQUIRED",
+            "CODEX_RUNNING",
+        ] {
+            let connection = relay_connection();
+            let module_id = format!("pending-{phase}");
+            insert_relay_module(&connection, &module_id, "待处理会话");
+            connection
+                .execute(
+                    "UPDATE relay_modules SET phase = ?2 WHERE id = ?1",
+                    params![module_id, phase],
+                )
+                .expect("set pending phase");
+            assert_eq!(
+                delete_relay_module_in(&connection, &module_id).unwrap_err(),
+                "请先终止当前会话，再进行删除。"
+            );
+        }
+
+        for delivery_state in ["SENT", "UNKNOWN"] {
+            let connection = relay_connection();
+            insert_relay_module(&connection, "pending-delivery", "待确认送达");
+            insert_relay_message(
+                &connection,
+                "pending-message",
+                "pending-delivery",
+                1,
+                delivery_state,
+                "2026-08-17T00:00:00Z",
+            );
+            let error = delete_relay_module_in(&connection, "pending-delivery").unwrap_err();
+            if delivery_state == "UNKNOWN" {
+                assert_eq!(error, "请先处理该会话的不确定送达消息，再终止并删除会话。");
+            } else {
+                assert_eq!(error, "请先终止当前会话，再进行删除。");
+            }
+        }
+
+        let connection = relay_connection();
+        insert_relay_module(&connection, "active-thread", "活动 Codex 对话");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'COMPLETED', codex_thread_id = 'thread-active'
+                 WHERE id = 'active-thread'",
+                [],
+            )
+            .expect("set acquired thread");
+        connection
+            .execute(
+                "INSERT INTO relay_codex_threads (
+                    thread_id, working_directory, state, owner_module_id, last_module_id,
+                    reservation_previous_state, updated_at
+                 ) VALUES ('thread-active', 'G:\\workspace', 'ACTIVE', 'active-thread',
+                    'active-thread', NULL, '2026-08-17T00:00:00Z')",
+                [],
+            )
+            .expect("active owned thread");
+        assert_eq!(
+            delete_relay_module_in(&connection, "active-thread").unwrap_err(),
+            "请先终止当前会话，再进行删除。"
+        );
+    }
+
+    #[test]
+    fn delete_relay_module_never_touches_working_directory_files() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "safe-delete", "安全删除");
+        let directory = std::env::temp_dir().join(format!("relay-delete-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).expect("create working directory");
+        let sentinel = directory.join("keep-me.txt");
+        fs::write(&sentinel, "project file").expect("write project file");
+        connection
+            .execute(
+                "UPDATE relay_modules SET working_directory = ?2 WHERE id = ?1",
+                params!["safe-delete", directory.to_string_lossy()],
+            )
+            .expect("set working directory");
+
+        delete_relay_module_in(&connection, "safe-delete").expect("delete session only");
+        assert_eq!(
+            fs::read_to_string(&sentinel).expect("sentinel remains"),
+            "project file"
+        );
+        fs::remove_file(&sentinel).expect("remove test file");
+        fs::remove_dir(&directory).expect("remove test directory");
+    }
+
+    #[test]
     fn terminal_relay_chatgpt_reply_persists_delivery_without_restarting_automation() {
         let connection = relay_connection();
         insert_relay_module(&connection, "module-stopped", "已终止模块");
@@ -10871,6 +11223,104 @@ mod tests {
             )
             .expect("feedback message count");
         assert_eq!(message_count, 1);
+    }
+
+    #[test]
+    fn relay_blocked_feedback_requires_blocked_phase_and_queues_one_automation_reply() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        assert!(
+            submit_relay_blocked_feedback_in(&connection, "module-a", "继续处理")
+                .expect_err("only blocked modules accept intervention replies")
+                .contains("不需要人工处理")
+        );
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'BLOCKED', codex_thread_id = 'thread-a', started_cycles = 3
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare blocked module");
+        assert!(
+            submit_relay_blocked_feedback_in(&connection, "module-a", "  ")
+                .expect_err("blank intervention reply")
+                .contains("不能为空")
+        );
+
+        let message_id = submit_relay_blocked_feedback_in(
+            &connection,
+            "module-a",
+            "  等待条件已经满足，请继续。  ",
+        )
+        .expect("queue blocked reply");
+        let message: (String, String, String) = connection
+            .query_row(
+                "SELECT kind, text, delivery_state FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("queued intervention reply");
+        assert_eq!(
+            message,
+            (
+                "AUTOMATION".into(),
+                "等待条件已经满足，请继续。".into(),
+                "QUEUED".into(),
+            )
+        );
+        let module: (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT phase, codex_thread_id, started_cycles FROM relay_modules WHERE id = 'module-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("module after intervention reply");
+        assert_eq!(
+            module,
+            ("WAITING_FOR_CHATGPT".into(), Some("thread-a".into()), 3)
+        );
+        assert!(
+            submit_relay_blocked_feedback_in(&connection, "module-a", "不应重复加入")
+                .expect_err("same blocked occurrence accepts one reply")
+                .contains("不需要人工处理")
+        );
+    }
+
+    #[test]
+    fn relay_blocked_feedback_queues_behind_global_unknown_without_bypassing_it() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "模块 A");
+        insert_relay_module(&connection, "module-b", "模块 B");
+        connection
+            .execute(
+                "UPDATE relay_modules SET phase = 'BLOCKED' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("prepare blocked module");
+        insert_relay_message(
+            &connection,
+            "unknown-b",
+            "module-b",
+            1,
+            "UNKNOWN",
+            "2026-08-18T00:00:00Z",
+        );
+
+        let message_id = submit_relay_blocked_feedback_in(&connection, "module-a", "请继续。")
+            .expect("feedback remains safe to queue");
+        assert!(matches!(
+            claim_next_relay_message_for_dispatch(&connection).expect("claim state"),
+            RelayDispatchClaim::RecoveryBlocked(1)
+        ));
+        let state: String = connection
+            .query_row(
+                "SELECT delivery_state FROM relay_messages WHERE id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .expect("blocked reply remains queued");
+        assert_eq!(state, "QUEUED");
     }
 
     #[test]
@@ -12431,7 +12881,11 @@ pub fn run() {
             accept_relay_module,
             terminate_relay_module,
             submit_relay_acceptance_feedback,
+            submit_relay_blocked_feedback,
+            get_relay_blocked_reason,
             list_relay_modules,
+            delete_relay_module,
+            open_relay_working_directory,
             list_relay_messages,
             list_relay_codex_cycles,
             get_relay_channel_snapshot,
