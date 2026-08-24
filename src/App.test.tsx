@@ -369,6 +369,30 @@ describe('Codex 对话恢复面板', () => {
   });
 });
 
+describe('模块 Codex 对话元数据', () => {
+  beforeEach(() => {
+    modules = [{ id: 'existing', name: '元数据模块', workingDirectory: 'G:\\projects\\resume', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', stopAfterTurn: false, invalidReplyCount: 0, startedCycles: 0, resumeThreadId: 'thread-selected-123456', codexThreadId: null }];
+    recoveryMessages = [];
+    codexCycles = [];
+    relayMessages = [];
+    invoke.mockClear();
+  });
+
+  afterEach(cleanup);
+
+  it('仅显示已选择或已获取的 Codex 对话 metadata，不显示 transcript', async () => {
+    const { unmount } = render(<App />);
+    await screen.findByRole('heading', { name: '元数据模块' });
+    expect(screen.getByText('已选择现有对话 · thread-selec')).toBeTruthy();
+    expect(screen.queryByText(/历史 Codex 对话/)).toBeNull();
+
+    modules = [{ ...modules[0], codexThreadId: 'thread-acquired-123456' }];
+    unmount();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('已获取 Codex 对话 · thread-acqui')).toBeTruthy());
+  });
+});
+
 describe('模块验收与终止', () => {
   beforeEach(() => {
     modules = [{ id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'WAITING_FOR_ACCEPTANCE', stopAfterTurn: false, invalidReplyCount: 0, startedCycles: 1 }];

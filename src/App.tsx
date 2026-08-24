@@ -133,11 +133,14 @@ export default function App() {
       setNotice(`已处理 ChatGPT 控制回复：${event.payload.type}${event.payload.reason ? `：${event.payload.reason}` : ''}`);
       void refreshModules().catch(() => undefined); void refreshMessages().catch(() => undefined); void refreshRecoveryMessages().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
     }).then((unsubscribe) => { stopControl = unsubscribe; });
-    void listen<{ moduleId: string }>('relay-codex', () => {
-      void refreshModules().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined); void refreshCodexRecoveryState().catch(() => undefined);
+    void listen<{ moduleId: string }>('relay-codex', (event) => {
+      void refreshModules().catch(() => undefined); void refreshCodexCycles().catch(() => undefined); void refreshChannelSnapshot().catch(() => undefined);
+      if (selected?.phase === 'RECOVERY_REQUIRED' && event.payload.moduleId === selected.id) {
+        void refreshCodexRecoveryState(selected.id).catch(() => undefined);
+      }
     }).then((unsubscribe) => { stopCodex = unsubscribe; });
     return () => { stopStatus?.(); stopControl?.(); stopCodex?.(); };
-  }, [selectedId]);
+  }, [selected?.id, selected?.phase, selectedId]);
 
   async function createModule(event: FormEvent) {
     event.preventDefault();
