@@ -1,8 +1,10 @@
 mod orchestration;
+mod relay_codex_worker;
 mod relay_protocol;
 
 use chrono::{DateTime, Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
+use relay_codex_worker::{RelayCodexProcessTransport, RelayCodexTransportEvent};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -4207,66 +4209,14 @@ fn relay_codex_worker(
     turn_active: Arc<AtomicBool>,
 ) {
     let command = codex_command();
-    let child = Command::new(&command)
-        .arg("app-server")
-        .current_dir(&working_directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let Ok(mut child) = child else {
-        relay_codex_failed(
-            &app,
-            &module_id,
-            Some(initial_cycle_id.as_str()),
-            "无法启动本地 Codex App Server。".into(),
-        );
-        return;
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        relay_codex_failed(
-            &app,
-            &module_id,
-            Some(initial_cycle_id.as_str()),
-            "Codex App Server 没有可用输入流。".into(),
-        );
-        return;
-    };
-    let Some(stdout) = child.stdout.take() else {
-        relay_codex_failed(
-            &app,
-            &module_id,
-            Some(initial_cycle_id.as_str()),
-            "Codex App Server 没有可用输出流。".into(),
-        );
-        return;
-    };
-    let Some(stderr) = child.stderr.take() else {
-        relay_codex_failed(
-            &app,
-            &module_id,
-            Some(initial_cycle_id.as_str()),
-            "Codex App Server 没有可用错误流。".into(),
-        );
-        return;
-    };
-    let (events_sender, events) = std_mpsc::channel::<Result<Value, String>>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let event = line
-                .map_err(|error| format!("无法读取 Codex 输出：{error}"))
-                .and_then(|line| {
-                    serde_json::from_str(&line)
-                        .map_err(|error| format!("Codex 输出不是 JSON：{error}"))
-                });
-            if events_sender.send(event).is_err() {
-                break;
-            }
+    let mut transport = match RelayCodexProcessTransport::spawn(&command, &working_directory) {
+        Ok(transport) => transport,
+        Err(error) => {
+            relay_codex_failed(&app, &module_id, Some(initial_cycle_id.as_str()), error);
+            return;
         }
-    });
-    std::thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
-    if let Err(error) = send_rpc(
-        &mut stdin,
+    };
+    if let Err(error) = transport.send_json(
         json!({ "method": "initialize", "id": 1, "params": { "clientInfo": { "name": "chatgpt-codex-middleware", "title": "ChatGPT × Codex Middleware", "version": env!("CARGO_PKG_VERSION") } } }),
     ) {
         relay_codex_failed(&app, &module_id, Some(initial_cycle_id.as_str()), error);
@@ -4296,8 +4246,7 @@ fn relay_codex_worker(
                     }
                     active_cycle_id = Some(cycle_id.clone());
                     if let Some(thread) = thread_id.as_deref() {
-                        if let Err(error) = send_rpc(
-                            &mut stdin,
+                        if let Err(error) = transport.send_json(
                             json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
                         ) {
                             relay_codex_failed(&app, &module_id, active_cycle_id.as_deref(), error);
@@ -4327,22 +4276,17 @@ fn relay_codex_worker(
                 }
             }
         }
-        match events.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(Err(error)) => {
+        match transport.recv_event(std::time::Duration::from_millis(100)) {
+            RelayCodexTransportEvent::ProtocolError(error) => {
                 relay_codex_failed(&app, &module_id, active_cycle_id.as_deref(), error);
                 break;
             }
-            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                relay_codex_failed(
-                    &app,
-                    &module_id,
-                    active_cycle_id.as_deref(),
-                    "Codex App Server 已在回合完成前退出。".into(),
-                );
+            RelayCodexTransportEvent::Timeout => continue,
+            RelayCodexTransportEvent::Closed(detail) => {
+                relay_codex_failed(&app, &module_id, active_cycle_id.as_deref(), detail);
                 break;
             }
-            Ok(Ok(message)) => {
+            RelayCodexTransportEvent::Message(message) => {
                 if let Some((request_id, rpc)) = outstanding.clone() {
                     match classify_relay_codex_rpc_response(&message, request_id) {
                         RelayCodexRpcOutcome::Unrelated => {}
@@ -4355,19 +4299,14 @@ fn relay_codex_worker(
                             );
                             break;
                         }
-                        RelayCodexRpcOutcome::MatchingSuccess => {
-                            match rpc {
-                                RelayCodexOutstandingRpc::Initialize => {
-                                    outstanding = None;
-                                    if send_rpc(&mut stdin, json!({ "method": "initialized", "params": {} }))
-                            .and_then(|_| {
-                                send_rpc(
-                                    &mut stdin,
-                                    json!({ "method": "thread/start", "id": 2, "params": {} }),
-                                )
-                            })
-                            .is_err()
-                        {
+                        RelayCodexRpcOutcome::MatchingSuccess => match rpc {
+                            RelayCodexOutstandingRpc::Initialize => {
+                                outstanding = None;
+                                if transport
+                                        .send_json(json!({ "method": "initialized", "params": {} }))
+                                        .and_then(|_| transport.send_json(json!({ "method": "thread/start", "id": 2, "params": {} })))
+                                        .is_err()
+                                    {
                             relay_codex_failed(
                                 &app,
                                 &module_id,
@@ -4376,27 +4315,26 @@ fn relay_codex_worker(
                             );
                             break;
                         }
-                                    outstanding = Some((2, RelayCodexOutstandingRpc::ThreadStart));
-                                }
-                                RelayCodexOutstandingRpc::ThreadStart => {
-                                    outstanding = None;
-                                    thread_id = message
-                                        .pointer("/result/thread/id")
-                                        .and_then(Value::as_str)
-                                        .map(ToOwned::to_owned);
-                                    let Some(thread) = thread_id.as_deref() else {
-                                        relay_codex_failed(
-                                            &app,
-                                            &module_id,
-                                            active_cycle_id.as_deref(),
-                                            "Codex 未返回对话 ID。".into(),
-                                        );
-                                        break;
-                                    };
-                                    relay_codex_thread_ready(&app, &module_id, thread);
-                                    if let Some((cycle_id, prompt)) = pending_turn.take() {
-                                        if let Err(error) = send_rpc(
-                                            &mut stdin,
+                                outstanding = Some((2, RelayCodexOutstandingRpc::ThreadStart));
+                            }
+                            RelayCodexOutstandingRpc::ThreadStart => {
+                                outstanding = None;
+                                thread_id = message
+                                    .pointer("/result/thread/id")
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned);
+                                let Some(thread) = thread_id.as_deref() else {
+                                    relay_codex_failed(
+                                        &app,
+                                        &module_id,
+                                        active_cycle_id.as_deref(),
+                                        "Codex 未返回对话 ID。".into(),
+                                    );
+                                    break;
+                                };
+                                relay_codex_thread_ready(&app, &module_id, thread);
+                                if let Some((cycle_id, prompt)) = pending_turn.take() {
+                                    if let Err(error) = transport.send_json(
                                             json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
                                         ) {
                                             relay_codex_failed(
@@ -4407,43 +4345,42 @@ fn relay_codex_worker(
                                             );
                                             break;
                                         }
-                                        outstanding = Some((
-                                            next_request_id,
-                                            RelayCodexOutstandingRpc::TurnStart {
-                                                cycle_id: cycle_id.clone(),
-                                                thread_id: thread.to_string(),
-                                            },
-                                        ));
-                                        next_request_id += 1;
-                                        final_summary.clear();
-                                    }
+                                    outstanding = Some((
+                                        next_request_id,
+                                        RelayCodexOutstandingRpc::TurnStart {
+                                            cycle_id: cycle_id.clone(),
+                                            thread_id: thread.to_string(),
+                                        },
+                                    ));
+                                    next_request_id += 1;
+                                    final_summary.clear();
                                 }
-                                RelayCodexOutstandingRpc::TurnStart {
-                                    cycle_id,
-                                    thread_id,
-                                } => {
-                                    outstanding = None;
-                                    let turn_id =
-                                        message.pointer("/result/turn/id").and_then(Value::as_str);
-                                    if let Err(error) = relay_codex_turn_started(
+                            }
+                            RelayCodexOutstandingRpc::TurnStart {
+                                cycle_id,
+                                thread_id,
+                            } => {
+                                outstanding = None;
+                                let turn_id =
+                                    message.pointer("/result/turn/id").and_then(Value::as_str);
+                                if let Err(error) = relay_codex_turn_started(
+                                    &app,
+                                    &module_id,
+                                    &cycle_id,
+                                    Some(&thread_id),
+                                    turn_id,
+                                ) {
+                                    relay_codex_failed(
                                         &app,
                                         &module_id,
-                                        &cycle_id,
-                                        Some(&thread_id),
-                                        turn_id,
-                                    ) {
-                                        relay_codex_failed(
-                                            &app,
-                                            &module_id,
-                                            Some(cycle_id.as_str()),
-                                            error,
-                                        );
-                                        break;
-                                    }
+                                        Some(cycle_id.as_str()),
+                                        error,
+                                    );
+                                    break;
                                 }
-                                RelayCodexOutstandingRpc::ThreadResume { .. } => {}
                             }
-                        }
+                            RelayCodexOutstandingRpc::ThreadResume { .. } => {}
+                        },
                     }
                 }
                 if message.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
@@ -4498,12 +4435,7 @@ fn relay_codex_worker(
         }
     }
     turn_active.store(false, Ordering::SeqCst);
-    drop(stdin);
-    let _ = child.kill();
-    let release_result = child
-        .wait()
-        .map(|_| ())
-        .map_err(|error| format!("无法结束 Codex 对话：{error}"));
+    let release_result = transport.shutdown();
     let state = app.state::<AppState>();
     let cleared_session = clear_relay_codex_session_if_matches(&state.relay_codex, &module_id);
     if release_acknowledgement.is_none() && cleared_session {
@@ -5999,6 +5931,18 @@ mod tests {
             ),
             RelayCodexRpcOutcome::MatchingSuccess
         );
+    }
+
+    #[test]
+    fn relay_codex_transport_events_keep_protocol_and_close_failures_distinct() {
+        assert!(matches!(
+            RelayCodexTransportEvent::ProtocolError("bad JSON".into()),
+            RelayCodexTransportEvent::ProtocolError(_)
+        ));
+        assert!(matches!(
+            RelayCodexTransportEvent::Closed("EOF".into()),
+            RelayCodexTransportEvent::Closed(_)
+        ));
     }
 
     fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {
