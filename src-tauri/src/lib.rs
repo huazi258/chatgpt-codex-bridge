@@ -4842,7 +4842,7 @@ struct RelayCodexThreadCandidate {
     source: String,
     status: String,
     branch: Option<String>,
-    recency_at: Option<String>,
+    recency_at: Option<i64>,
     selectable: bool,
     disabled_reason: Option<String>,
 }
@@ -4906,9 +4906,8 @@ fn relay_codex_thread_candidate_from_value(
             .map(ToOwned::to_owned),
         recency_at: thread
             .get("recencyAt")
-            .or_else(|| thread.get("updatedAt"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+            .and_then(Value::as_i64)
+            .or_else(|| thread.get("updatedAt").and_then(Value::as_i64)),
         selectable: disabled_reason.is_none(),
         disabled_reason,
     })
@@ -5866,8 +5865,8 @@ mod tests {
         let script = concat!(
             "{\"id\":1,\"result\":{}}\n",
             "{\"id\":2,\"result\":{\"data\":[",
-            "{\"id\":\"idle\",\"cwd\":\"G:\\\\workspace\",\"name\":null,\"source\":\"cli\",\"status\":{\"type\":\"idle\"},\"updatedAt\":\"2026-08-24T02:00:00Z\",\"preview\":\"must not escape\"},",
-            "{\"id\":\"active\",\"cwd\":\"G:\\\\workspace\",\"name\":\"active\",\"source\":\"vscode\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"updatedAt\":\"2026-08-24T01:00:00Z\"},",
+            "{\"id\":\"idle\",\"cwd\":\"G:\\\\workspace\",\"name\":null,\"source\":\"cli\",\"status\":{\"type\":\"idle\"},\"recencyAt\":1724464800,\"updatedAt\":1724461200,\"preview\":\"must not escape\"},",
+            "{\"id\":\"active\",\"cwd\":\"G:\\\\workspace\",\"name\":\"active\",\"source\":\"vscode\",\"status\":{\"type\":\"active\",\"activeFlags\":[]},\"recencyAt\":null,\"updatedAt\":1724457600},",
             "{\"id\":\"wrong-cwd\",\"cwd\":\"G:\\\\other\",\"source\":\"cli\",\"status\":{\"type\":\"idle\"}}],\"nextCursor\":\"page-2\"}}\n",
             "{\"id\":3,\"result\":{\"data\":[",
             "{\"id\":\"system\",\"cwd\":\"G:\\\\workspace\",\"source\":\"appServer\",\"status\":{\"type\":\"systemError\"}},",
@@ -5894,6 +5893,20 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|item| item.thread_id == "reserved" && !item.selectable));
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|item| item.thread_id == "idle")
+                .and_then(|item| item.recency_at),
+            Some(1724464800)
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|item| item.thread_id == "active")
+                .and_then(|item| item.recency_at),
+            Some(1724457600)
+        );
         let frames = String::from_utf8(output).expect("JSON lines");
         assert!(frames.contains("\"method\":\"thread/list\""));
         assert!(frames.contains("\"sourceKinds\":[\"cli\",\"vscode\",\"appServer\"]"));

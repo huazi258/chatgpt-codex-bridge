@@ -6,7 +6,7 @@ export interface RelayCodexThreadCandidate {
   source: string;
   status: RelayCodexThreadStatus;
   branch?: string | null;
-  recencyAt?: string | null;
+  recencyAt: number | null;
   selectable: boolean;
   disabledReason?: string | null;
 }
