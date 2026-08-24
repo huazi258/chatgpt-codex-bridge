@@ -157,6 +157,12 @@ struct RelayCodexSession {
     turn_active: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayCodexLiveRuntime {
+    module_id: String,
+    turn_active: bool,
+}
+
 enum RelayCodexCommand {
     StartTurn {
         cycle_id: String,
@@ -500,6 +506,56 @@ fn recover_relay_codex_thread_registry_on_restart_in(
             )?;
             changed += 1;
         }
+    }
+
+    let stale_running_cycles = transaction
+        .prepare(
+            "SELECT id, module_id FROM relay_codex_cycles
+             WHERE status = 'CODEX_RUNNING'",
+        )
+        .map_err(|error| format!("无法读取重启中断的 Codex 回合：{error}"))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("无法查询重启中断的 Codex 回合：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取重启中断的 Codex 回合：{error}"))?;
+    for (cycle_id, module_id) in stale_running_cycles {
+        let detail = "APP_RESTART_INTERRUPTED：应用重启后无法确认此前 Codex 回合的最终结果；该回合未自动重放。";
+        let cycle_changed = transaction
+            .execute(
+                "UPDATE relay_codex_cycles
+                 SET status = 'FAILED', error_text = ?2, updated_at = ?3
+                 WHERE id = ?1 AND status = 'CODEX_RUNNING'",
+                params![cycle_id, detail, &now],
+            )
+            .map_err(|error| format!("无法标记重启中断的 Codex 回合：{error}"))?;
+        if cycle_changed != 1 {
+            continue;
+        }
+        let module = get_relay_module(&transaction, &module_id)?
+            .ok_or_else(|| "传话模块不存在。".to_string())?;
+        if !matches!(module.phase.as_str(), "STOPPED" | "COMPLETED") {
+            if module.phase != "RECOVERY_REQUIRED" {
+                transaction
+                    .execute(
+                        "UPDATE relay_modules
+                         SET phase = 'RECOVERY_REQUIRED',
+                             codex_recovery_reason = 'THREAD_REACQUIRE_REQUIRED',
+                             codex_recovery_previous_phase = ?2, updated_at = ?3
+                         WHERE id = ?1",
+                        params![module_id, module.phase, &now],
+                    )
+                    .map_err(|error| format!("无法标记重启中断模块为恢复状态：{error}"))?;
+                changed += 1;
+            }
+        }
+        append_relay_event(
+            &transaction,
+            &module_id,
+            "CODEX_TURN_RESTART_INTERRUPTED",
+            &format!("cycleId={cycle_id}; {detail}"),
+        )?;
     }
     transaction
         .commit()
@@ -2578,6 +2634,13 @@ fn get_relay_codex_cycle_by_outbound_message(
 fn relay_channel_snapshot_from_connection(
     connection: &Connection,
 ) -> Result<RelayChannelSnapshot, String> {
+    relay_channel_snapshot_from_connection_with_live_runtime(connection, None)
+}
+
+fn relay_channel_snapshot_from_connection_with_live_runtime(
+    connection: &Connection,
+    live_runtime: Option<&RelayCodexLiveRuntime>,
+) -> Result<RelayChannelSnapshot, String> {
     let recovery_blocker_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM relay_messages
@@ -2664,41 +2727,44 @@ fn relay_channel_snapshot_from_connection(
         },
     };
 
-    let active_codex_cycle = connection
-        .query_row(
-            "SELECT cycle.module_id, module.name, cycle.cycle_number,
-                    cycle.codex_thread_id, cycle.codex_turn_id, cycle.status
-             FROM relay_codex_cycles AS cycle
-             JOIN relay_modules AS module ON module.id = cycle.module_id
-             WHERE cycle.status = 'CODEX_RUNNING'
-             ORDER BY cycle.codex_started_at ASC, cycle.id ASC LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|error| format!("无法读取运行中的 Codex 通讯循环：{error}"))?;
-    let codex = match active_codex_cycle {
-        Some((module_id, module_name, cycle_number, thread_id, turn_id, cycle_status)) => {
-            RelayCodexChannelSnapshot {
-                status: "RUNNING".into(),
-                active_module_id: Some(module_id),
-                active_module_name: Some(module_name),
-                cycle_number: Some(cycle_number),
-                codex_thread_id: thread_id,
-                codex_turn_id: turn_id,
-                cycle_status: Some(cycle_status),
-            }
+    let codex = if let Some(runtime) = live_runtime.filter(|runtime| runtime.turn_active) {
+        let module_name = connection
+            .query_row(
+                "SELECT name FROM relay_modules WHERE id = ?1",
+                [&runtime.module_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取活动 Codex 模块：{error}"))?;
+        let cycle = connection
+            .query_row(
+                "SELECT cycle_number, codex_thread_id, codex_turn_id, status
+                 FROM relay_codex_cycles
+                 WHERE module_id = ?1 AND status = 'CODEX_RUNNING'
+                 ORDER BY codex_started_at DESC, id DESC LIMIT 1",
+                [&runtime.module_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("无法读取活动 Codex 通讯循环：{error}"))?;
+        RelayCodexChannelSnapshot {
+            status: "RUNNING".into(),
+            active_module_id: Some(runtime.module_id.clone()),
+            active_module_name: module_name,
+            cycle_number: cycle.as_ref().map(|cycle| cycle.0),
+            codex_thread_id: cycle.as_ref().and_then(|cycle| cycle.1.clone()),
+            codex_turn_id: cycle.as_ref().and_then(|cycle| cycle.2.clone()),
+            cycle_status: cycle.map(|cycle| cycle.3),
         }
-        None => RelayCodexChannelSnapshot {
+    } else {
+        RelayCodexChannelSnapshot {
             status: "IDLE".into(),
             active_module_id: None,
             active_module_name: None,
@@ -2706,7 +2772,7 @@ fn relay_channel_snapshot_from_connection(
             codex_thread_id: None,
             codex_turn_id: None,
             cycle_status: None,
-        },
+        }
     };
 
     Ok(RelayChannelSnapshot { chatgpt, codex })
@@ -3460,7 +3526,7 @@ fn terminate_relay_module_with_active_turn_in(
     if module.phase == "COMPLETED" {
         return Err("模块已验收完成，不能终止。".into());
     }
-    if module.stop_after_turn {
+    if module.stop_after_turn && has_active_turn {
         transaction
             .commit()
             .map_err(|error| format!("无法提交重复终止模块事务：{error}"))?;
@@ -3478,14 +3544,6 @@ fn terminate_relay_module_with_active_turn_in(
     if unknown_count > 0 {
         return Err("请先处理本模块的不确定送达消息。".into());
     }
-    let running_cycle_count: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM relay_codex_cycles
-             WHERE module_id = ?1 AND status = 'CODEX_RUNNING'",
-            [module_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("无法检查 Codex 回合状态：{error}"))?;
     let queued_message_ids = {
         let mut statement = transaction
             .prepare(
@@ -3516,7 +3574,7 @@ fn terminate_relay_module_with_active_turn_in(
             &format!("requestId={message_id}; 模块已由用户终止，消息未发送。"),
         )?;
     }
-    let outcome = if running_cycle_count > 0 || has_active_turn {
+    let outcome = if has_active_turn {
         transaction
             .execute(
                 "UPDATE relay_modules SET stop_after_turn = 1, updated_at = ?2 WHERE id = ?1",
@@ -3531,6 +3589,37 @@ fn terminate_relay_module_with_active_turn_in(
         )?;
         RelayModuleTermination::StopRequested
     } else {
+        let stale_cycle_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id FROM relay_codex_cycles
+                     WHERE module_id = ?1 AND status = 'CODEX_RUNNING'",
+                )
+                .map_err(|error| format!("无法读取遗留 Codex 回合：{error}"))?;
+            let cycle_ids = statement
+                .query_map([module_id], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("无法查询遗留 Codex 回合：{error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("无法读取遗留 Codex 回合：{error}"))?;
+            cycle_ids
+        };
+        for cycle_id in stale_cycle_ids {
+            let detail = "模块终止时未发现对应的活动 Codex runtime；遗留回合未自动重放。";
+            transaction
+                .execute(
+                    "UPDATE relay_codex_cycles
+                     SET status = 'FAILED', error_text = ?2, updated_at = ?3
+                     WHERE id = ?1 AND status = 'CODEX_RUNNING'",
+                    params![cycle_id, detail, Utc::now().to_rfc3339()],
+                )
+                .map_err(|error| format!("无法标记终止中的遗留 Codex 回合：{error}"))?;
+            append_relay_event_in_transaction(
+                &transaction,
+                module_id,
+                "CODEX_TURN_FAILED",
+                &format!("cycleId={cycle_id}; {detail}"),
+            )?;
+        }
         rollback_relay_codex_reservation_on_terminal_in(&transaction, &module)?;
         transaction
             .execute(
@@ -3876,11 +3965,21 @@ fn list_relay_codex_cycles(
 
 #[tauri::command]
 fn get_relay_channel_snapshot(state: State<'_, AppState>) -> Result<RelayChannelSnapshot, String> {
+    let live_runtime = {
+        let sessions = state
+            .relay_codex
+            .lock()
+            .map_err(|_| "Codex 会话锁已损坏。".to_string())?;
+        sessions.as_ref().map(|session| RelayCodexLiveRuntime {
+            module_id: session.module_id.clone(),
+            turn_active: session.turn_active.load(Ordering::SeqCst),
+        })
+    };
     let connection = state
         .connection
         .lock()
         .map_err(|_| "数据库锁已损坏。".to_string())?;
-    relay_channel_snapshot_from_connection(&connection)
+    relay_channel_snapshot_from_connection_with_live_runtime(&connection, live_runtime.as_ref())
 }
 
 #[tauri::command]
@@ -6053,7 +6152,11 @@ fn confirm_relay_codex_thread_acquisition_in(
         let unresolved: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM relay_codex_cycles
-                 WHERE module_id = ?1 AND status IN ('CODEX_RUNNING', 'WAITING_TO_SEND_CODEX')",
+                 WHERE module_id = ?1
+                   AND (
+                     status IN ('CODEX_RUNNING', 'WAITING_TO_SEND_CODEX')
+                     OR (status = 'FAILED' AND error_text LIKE 'APP_RESTART_INTERRUPTED%')
+                   )",
                 [module_id],
                 |row| row.get(0),
             )
@@ -9227,7 +9330,7 @@ mod tests {
                 .next()
                 .expect("cycle exists")
                 .status,
-            "CODEX_RUNNING"
+            "FAILED"
         );
         assert_eq!(
             connection
@@ -9235,6 +9338,145 @@ mod tests {
                     .get::<_, i64>(0))
                 .expect("no automatic ChatGPT replay"),
             0
+        );
+    }
+
+    #[test]
+    fn relay_codex_restart_zombie_clears_cycle_and_unblocks_a_new_turn() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stale", "重启中断模块");
+        let stale_cycle =
+            create_relay_codex_cycle(&connection, "module-stale", 1, "P1").expect("create cycle");
+        mark_relay_codex_turn_started(
+            &connection,
+            &stale_cycle.id,
+            Some("thread-stale"),
+            Some("turn-stale"),
+        )
+        .expect("start stale turn");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-stale".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Active,
+                owner_module_id: Some("module-stale".into()),
+                last_module_id: Some("module-stale".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed active registry");
+
+        assert_eq!(
+            recover_relay_codex_thread_registry_on_restart_in(&connection)
+                .expect("restart recovery"),
+            1
+        );
+        let module = get_relay_module(&connection, "module-stale")
+            .expect("read stale module")
+            .expect("stale module exists");
+        assert_eq!(module.phase, "RECOVERY_REQUIRED");
+        assert_eq!(module.started_cycles, 1);
+        let cycle = get_relay_codex_cycle_by_id(&connection, &stale_cycle.id)
+            .expect("read stale cycle")
+            .expect("stale cycle exists");
+        assert_eq!(cycle.status, "FAILED");
+        assert!(cycle.error_text.as_deref().is_some_and(|error| {
+            error.contains("APP_RESTART_INTERRUPTED") && error.contains("未自动重放")
+        }));
+        assert!(cycle.result_text.is_none());
+        assert!(cycle.outbound_chatgpt_message_id.is_none());
+        let registry = get_relay_codex_thread(&connection, "thread-stale")
+            .expect("read stale registry")
+            .expect("stale registry exists");
+        assert_eq!(registry.state, RelayCodexThreadState::Unavailable);
+        assert!(registry.owner_module_id.is_none());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM relay_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("no replay messages"),
+            0
+        );
+        assert_eq!(
+            relay_channel_snapshot_from_connection(&connection)
+                .expect("stale persisted cycle is not a live runtime")
+                .codex
+                .status,
+            "IDLE"
+        );
+
+        insert_relay_module(&connection, "module-new", "新模块");
+        let new_cycle =
+            create_relay_codex_cycle(&connection, "module-new", 1, "P2").expect("create new cycle");
+        mark_relay_codex_turn_started(
+            &connection,
+            &new_cycle.id,
+            Some("thread-new"),
+            Some("turn-new"),
+        )
+        .expect("stale running index no longer blocks a new confirmed turn");
+    }
+
+    #[test]
+    fn terminate_relay_module_stale_running_cycle_stops_without_waiting_for_a_worker() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-stale", "无运行时模块");
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-stale", 1, "P1").expect("create cycle");
+        mark_relay_codex_turn_started(
+            &connection,
+            &cycle.id,
+            Some("thread-unavailable"),
+            Some("turn-stale"),
+        )
+        .expect("seed stale running cycle");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-unavailable".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Unavailable,
+                owner_module_id: None,
+                last_module_id: Some("module-stale".into()),
+                reservation_previous_state: None,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("seed unavailable registry");
+        connection
+            .execute(
+                "UPDATE relay_modules SET stop_after_turn = 1 WHERE id = 'module-stale'",
+                [],
+            )
+            .expect("seed stale stop request from before restart");
+
+        assert_eq!(
+            terminate_relay_module_in(&connection, "module-stale")
+                .expect("stale turn must not request a nonexistent worker stop"),
+            RelayModuleTermination::Stopped
+        );
+        let module = get_relay_module(&connection, "module-stale")
+            .expect("read stopped module")
+            .expect("module exists");
+        assert_eq!(module.phase, "STOPPED");
+        assert!(!module.stop_after_turn);
+        let interrupted = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("read interrupted cycle")
+            .expect("cycle exists");
+        assert_eq!(interrupted.status, "FAILED");
+        assert!(interrupted.error_text.as_deref().is_some_and(|error| {
+            error.contains("模块终止时未发现对应的活动 Codex runtime")
+        }));
+        assert!(interrupted.result_text.is_none());
+        assert!(interrupted.outbound_chatgpt_message_id.is_none());
+        assert_eq!(
+            get_relay_codex_thread(&connection, "thread-unavailable")
+                .expect("read unavailable registry")
+                .expect("registry exists")
+                .state,
+            RelayCodexThreadState::Unavailable
         );
     }
 
@@ -10571,7 +10813,7 @@ mod tests {
             )
             .expect("mark running cycle");
         assert_eq!(
-            terminate_relay_module_in(&connection, "module-running")
+            terminate_relay_module_with_active_turn_in(&connection, "module-running", true)
                 .expect("Task 6 records a stop request for a running Codex turn"),
             RelayModuleTermination::StopRequested
         );
@@ -10618,7 +10860,7 @@ mod tests {
             .expect("mark cycle running");
 
         assert_eq!(
-            terminate_relay_module_in(&connection, "module-running")
+            terminate_relay_module_with_active_turn_in(&connection, "module-running", true)
                 .expect("running turn accepts a stop request"),
             RelayModuleTermination::StopRequested
         );
@@ -10651,7 +10893,7 @@ mod tests {
             .expect("stop request count");
         assert_eq!(stop_events, 1);
         assert!(matches!(
-            terminate_relay_module_in(&connection, "module-running"),
+            terminate_relay_module_with_active_turn_in(&connection, "module-running", true),
             Ok(RelayModuleTermination::AlreadyStopRequested)
         ));
 
@@ -11301,8 +11543,14 @@ mod tests {
         mark_relay_codex_turn_started(&connection, &cycle.id, Some("thread-a"), Some("turn-a"))
             .expect("start cycle");
 
-        let snapshot = relay_channel_snapshot_from_connection(&connection)
-            .expect("read running Codex snapshot");
+        let snapshot = relay_channel_snapshot_from_connection_with_live_runtime(
+            &connection,
+            Some(&RelayCodexLiveRuntime {
+                module_id: "module-a".into(),
+                turn_active: true,
+            }),
+        )
+        .expect("read running Codex snapshot");
 
         assert_eq!(snapshot.codex.status, "RUNNING");
         assert_eq!(snapshot.codex.active_module_id.as_deref(), Some("module-a"));
