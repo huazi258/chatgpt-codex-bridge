@@ -4414,6 +4414,128 @@ fn allowed_relay_codex_recovery_actions_in(
     Ok(actions)
 }
 
+fn pending_relay_codex_cycle_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<RelayCodexCycleRecord, String> {
+    list_relay_codex_cycles_in(connection, module_id)?
+        .into_iter()
+        .find(|cycle| cycle.status == "WAITING_TO_SEND_CODEX")
+        .ok_or_else(|| "没有可恢复的待发送 Codex 提示词。".to_string())
+}
+
+fn prepare_relay_codex_start_new_thread_in(
+    connection: &Connection,
+    module_id: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始新 Codex 对话恢复事务：{error}"))?;
+    let module =
+        get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    pending_relay_codex_cycle_in(&transaction, module_id)?;
+    if let Some(thread_id) = module.resume_thread_id.as_deref() {
+        if let Some(record) = get_relay_codex_thread(&transaction, thread_id)? {
+            if record.state == RelayCodexThreadState::Reserved
+                && record.owner_module_id.as_deref() == Some(module_id)
+            {
+                match record.reservation_previous_state.as_deref() {
+                    Some("NONE") => {
+                        transaction
+                            .execute(
+                                "DELETE FROM relay_codex_threads WHERE thread_id = ?1 AND state = 'RESERVED' AND owner_module_id = ?2",
+                                params![thread_id, module_id],
+                            )
+                            .map_err(|error| format!("无法撤销新对话保留：{error}"))?;
+                    }
+                    Some("RELEASED") => set_relay_codex_thread_state(
+                        &transaction,
+                        thread_id,
+                        RelayCodexThreadState::Released,
+                        None,
+                        None,
+                    )?,
+                    _ => return Err("Codex 对话保留来源无效。".into()),
+                }
+            }
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE relay_modules
+             SET resume_thread_id = NULL, codex_thread_id = NULL, updated_at = ?2
+             WHERE id = ?1",
+            params![module_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法切换为新 Codex 对话：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交新 Codex 对话恢复：{error}"))?;
+    Ok(())
+}
+
+fn prepare_relay_codex_select_existing_thread_in(
+    connection: &Connection,
+    module_id: &str,
+    thread_id: &str,
+    working_directory: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始选择 Codex 对话事务：{error}"))?;
+    let module =
+        get_relay_module(&transaction, module_id)?.ok_or_else(|| "传话模块不存在。".to_string())?;
+    if module.resume_thread_id.is_some() || module.codex_thread_id.is_some() {
+        return Err("当前模块已有 Codex 对话目标，不能覆盖。".into());
+    }
+    pending_relay_codex_cycle_in(&transaction, module_id)?;
+    match get_relay_codex_thread(&transaction, thread_id)? {
+        None => {
+            transaction
+                .execute(
+                    "INSERT INTO relay_codex_threads (
+                    thread_id, working_directory, state, owner_module_id, last_module_id,
+                    reservation_previous_state, updated_at
+                 ) VALUES (?1, ?2, 'RESERVED', ?3, ?3, 'NONE', ?4)",
+                    params![
+                        thread_id,
+                        working_directory,
+                        module_id,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(|error| format!("无法保留 Codex 对话：{error}"))?;
+        }
+        Some(record) if record.state == RelayCodexThreadState::Released => {
+            let changed = transaction
+                .execute(
+                    "UPDATE relay_codex_threads
+                 SET state = 'RESERVED', owner_module_id = ?2, last_module_id = ?2,
+                     reservation_previous_state = 'RELEASED', updated_at = ?3
+                 WHERE thread_id = ?1 AND state = 'RELEASED' AND owner_module_id IS NULL",
+                    params![thread_id, module_id, Utc::now().to_rfc3339()],
+                )
+                .map_err(|error| format!("无法重新保留 Codex 对话：{error}"))?;
+            if changed != 1 {
+                return Err("Codex 对话保留已发生竞争变化。".into());
+            }
+        }
+        Some(_) => return Err("所选 Codex 对话当前不可保留。".into()),
+    }
+    transaction
+        .execute(
+            "UPDATE relay_modules
+         SET resume_thread_id = ?2, codex_thread_id = NULL, updated_at = ?3
+         WHERE id = ?1",
+            params![module_id, thread_id, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("无法保存所选 Codex 对话：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交 Codex 对话选择：{error}"))?;
+    Ok(())
+}
+
 fn send_relay_codex_start_turn(
     session: &RelayCodexSession,
     cycle_id: &str,
@@ -7327,6 +7449,68 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(cycle.status, "WAITING_TO_SEND_CODEX");
+    }
+
+    #[test]
+    fn relay_codex_recovery_target_mutations_preserve_p1_and_counter_facts() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "恢复模块");
+        let cycle =
+            create_relay_codex_cycle(&connection, "module-a", 7, "P1 原文  ").expect("create P1");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'RECOVERY_REQUIRED', resume_thread_id = 'thread-old',
+                     codex_recovery_reason = 'THREAD_START_UNKNOWN'
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set recovery");
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-old".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("reserve old");
+        prepare_relay_codex_start_new_thread_in(&connection, "module-a").expect("prepare new");
+        assert!(get_relay_codex_thread(&connection, "thread-old")
+            .expect("read old")
+            .is_none());
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(module.resume_thread_id, None);
+        assert_eq!(module.codex_thread_id, None);
+        assert_eq!(module.started_cycles, 0);
+        assert!(module.module_started_at.is_none());
+        let after = get_relay_codex_cycle_by_id(&connection, &cycle.id)
+            .expect("cycle")
+            .expect("P1");
+        assert_eq!(after.id, cycle.id);
+        assert_eq!(after.cycle_number, 7);
+        assert_eq!(after.prompt_text, "P1 原文  ");
+        assert_eq!(after.status, "WAITING_TO_SEND_CODEX");
+
+        prepare_relay_codex_select_existing_thread_in(
+            &connection,
+            "module-a",
+            "thread-new",
+            r"G:\workspace",
+        )
+        .expect("select no-row thread");
+        let selected = get_relay_codex_thread(&connection, "thread-new")
+            .expect("registry")
+            .expect("reserved");
+        assert_eq!(selected.state, RelayCodexThreadState::Reserved);
+        assert_eq!(selected.owner_module_id.as_deref(), Some("module-a"));
+        assert_eq!(selected.reservation_previous_state.as_deref(), Some("NONE"));
     }
 
     fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {
