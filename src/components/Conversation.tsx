@@ -122,7 +122,7 @@ export function Conversation(props: ConversationProps) {
         </section>;
       })}
       {props.session.phase === 'WAITING_FOR_ACCEPTANCE' ? <p className="inline-system">等待人工验收</p> : null}
-      {props.session.phase === 'BLOCKED' ? <p className="inline-system failed">⚠ 自动流程已暂停，需要人工处理</p> : null}
+      {props.session.phase === 'BLOCKED' ? <p className="inline-system attention-event">⚠ 自动流程已暂停，需要人工处理</p> : null}
       {props.session.phase === 'WAITING_FOR_CHATGPT' ? <p className="inline-system">正在等待 ChatGPT 回复…</p> : null}
       {terminalPhases.has(props.session.phase) ? <p className="inline-system">会话{phaseLabel(props.session.phase)}，历史记录仍可查看。</p> : null}
     </div>

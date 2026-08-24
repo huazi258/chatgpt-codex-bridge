@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { Conversation } from './components/Conversation';
+import { HumanInterventionDrawer } from './components/HumanInterventionDrawer';
 import { Modal } from './components/Modal';
 import { NewSessionForm } from './components/NewSessionForm';
 import { RelayCodexRecoveryPanel } from './components/RelayCodexRecoveryPanel';
@@ -11,6 +12,7 @@ import { TopBar } from './components/TopBar';
 import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
 import type { RelayCodexRecoveryAction, RelayCodexThreadCandidate, RelayCodexThreadStateSnapshot, RelayCodexThreadTarget, RelayModuleCreationInput } from './relay-thread-resume';
 import { terminalPhases, type BridgeStatus, type PairingInfo, type RelayKind, type RelayMessage, type RelayModule, type RelayRecoveryMessage } from './relay-ui';
+import { AttentionTransitionTracker, DesktopAttentionNotifier, attentionNotice } from './desktop-attention';
 
 const defaultRetry = '请根据既定格式，在回复最后且仅输出一个有效控制块：@@@CODEX_PROMPT@@@、@@@MODULE_DONE@@@ 或 @@@BLOCKED@@@。正在等待 Codex 用户输入时可使用 @@@CODEX_INPUT@@@。';
 const emptyDraft = { name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry };
@@ -47,6 +49,8 @@ export default function App() {
   const [deleteTarget, setDeleteTarget] = useState<RelayModule | null>(null);
   const shownAcceptance = useRef<string | null>(null);
   const shownBlocked = useRef<string | null>(null);
+  const attentionTracker = useRef(new AttentionTransitionTracker());
+  const desktopAttention = useRef(new DesktopAttentionNotifier());
   const selected = useMemo(() => creating ? null : modules.find((module) => module.id === selectedId) ?? null, [creating, modules, selectedId]);
 
   async function refreshModules(preferredId?: string, preserveCreation = creating) {
@@ -78,6 +82,19 @@ export default function App() {
   }, [selected?.id, selected?.phase]);
   useEffect(() => { localStorage.setItem('relay.sidebar.collapsed', String(sidebarCollapsed)); }, [sidebarCollapsed]);
   useEffect(() => { localStorage.setItem('relay.inspector.collapsed', String(inspectorCollapsed)); }, [inspectorCollapsed]);
+  useEffect(() => {
+    for (const session of attentionTracker.current.entered(modules)) {
+      const detail = session.id === selected?.id
+        ? session.phase === 'BLOCKED' ? blockedReason : session.phase === 'RECOVERY_REQUIRED' ? recoveryState?.summary : undefined
+        : undefined;
+      void desktopAttention.current.notify(attentionNotice(session, detail));
+    }
+  }, [modules, selected?.id, blockedReason, recoveryState?.summary]);
+  useEffect(() => {
+    const clear = () => void desktopAttention.current.clearAttention();
+    window.addEventListener('focus', clear);
+    return () => window.removeEventListener('focus', clear);
+  }, []);
   useEffect(() => {
     let stopStatus: (() => void) | undefined; let stopControl: (() => void) | undefined; let stopCodex: (() => void) | undefined;
     void listen<BridgeStatus>('chatgpt-status', (event) => { setBridge(event.payload); void refreshPairing(); void refreshSelected(); }).then((unsubscribe) => { stopStatus = unsubscribe; });
@@ -124,6 +141,8 @@ export default function App() {
   async function openDirectory(session: RelayModule) { try { await invoke('open_relay_working_directory', { moduleId: session.id }); } catch (error) { setNotice(`无法打开工作目录：${String(error)}`); } }
 
   const canTerminate = Boolean(selected && !terminalPhases.has(selected.phase) && !selected.stopAfterTurn);
+  const intervention = selected?.phase === 'BLOCKED' && blockedOpen ? 'blocked' : selected?.phase === 'WAITING_FOR_ACCEPTANCE' && acceptanceOpen ? 'acceptance' : null;
+  const selectedRecoveryMessages = selected ? recoveryMessages.filter((message) => message.moduleId === selected.id) : [];
   return <main className="relay-app">
     <SessionSidebar sessions={modules} selectedId={selectedId} creating={creating} collapsed={sidebarCollapsed} busy={busy} onCollapsedChange={setSidebarCollapsed} onCreate={() => { setSelectedId(null); setCreating(true); setNotice('请填写新会话的基本信息。'); }} onSelect={(id) => { setCreating(false); setSelectedId(id); }} onOpenDirectory={(session) => void openDirectory(session)} onDelete={setDeleteTarget} />
     <div className="relay-main"><TopBar selected={selected} snapshot={snapshot} pairing={pairing} bridge={bridge} canTerminate={canTerminate} stopping={busy} onConnectionDetails={() => setConnectionOpen(true)} onOpenHumanIntervention={() => { if (selected?.phase === 'WAITING_FOR_ACCEPTANCE') setAcceptanceOpen(true); if (selected?.phase === 'BLOCKED') setBlockedOpen(true); }} onTerminate={() => setStopConfirm(true)} />
@@ -133,10 +152,8 @@ export default function App() {
         <Conversation session={selected} messages={messages} cycles={cycles} recoveryMessages={recoveryMessages} notice={notice} text={text} kind={kind} busy={busy} onTextChange={setText} onKindChange={setKind} onSend={send} onRetryUnknown={(id) => void retryUnknown(id)} onContinueUnknown={(id) => void continueUnknown(id)} />
       </>}</div>
     </div>
-    {selected && !creating ? <SessionInspector session={selected} cycles={cycles} snapshot={snapshot} collapsed={inspectorCollapsed} onCollapsedChange={setInspectorCollapsed} onOpenDirectory={() => void openDirectory(selected)} /> : null}
+    {selected && !creating ? intervention ? <HumanInterventionDrawer kind={intervention} collapsed={inspectorCollapsed} busy={busy} blockedReason={blockedReason} feedback={intervention === 'blocked' ? blockedFeedback : feedback} recoveryMessages={selectedRecoveryMessages} acceptanceFeedbackOpen={acceptanceFeedback} onCollapsedChange={setInspectorCollapsed} onClose={() => intervention === 'blocked' ? setBlockedOpen(false) : setAcceptanceOpen(false)} onFeedbackChange={intervention === 'blocked' ? setBlockedFeedback : setFeedback} onSubmitBlocked={() => void submitBlockedFeedback()} onAccept={() => void accept()} onStartAcceptanceFeedback={() => setAcceptanceFeedback(true)} onBackToAcceptance={() => setAcceptanceFeedback(false)} onSubmitAcceptanceFeedback={() => void submitFeedback()} /> : <SessionInspector session={selected} cycles={cycles} snapshot={snapshot} collapsed={inspectorCollapsed} onCollapsedChange={setInspectorCollapsed} onOpenDirectory={() => void openDirectory(selected)} /> : null}
     {connectionOpen ? <Modal title="ChatGPT 连接详情" onClose={() => setConnectionOpen(false)}><p>{bridge?.detail ?? '在 Chrome 扩展中选择当前已登录的 ChatGPT 对话后配对。'}</p><label>本机地址<input readOnly value={pairing?.endpoint ?? '正在启动…'} /></label><label>一次性配对密钥<input readOnly value={pairing?.pairingSecret ?? '正在生成…'} /></label><button type="button" onClick={() => void refreshPairing().catch((error) => setNotice(String(error)))}>刷新连接状态</button></Modal> : null}
-    {acceptanceOpen && selected?.phase === 'WAITING_FOR_ACCEPTANCE' ? <Modal title={acceptanceFeedback ? '验收反馈' : '等待人工验收'} onClose={() => setAcceptanceOpen(false)}>{acceptanceFeedback ? <><p>请说明需要继续处理或补充验证的内容。</p><label>验收反馈<textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="输入反馈…" rows={5} /></label><div className="modal-actions"><button type="button" onClick={() => setAcceptanceFeedback(false)}>取消</button><button className="primary" type="button" disabled={busy || !feedback.trim()} onClick={() => void submitFeedback()}>提交并继续</button></div></> : <><p>ChatGPT 已请求结束当前会话。请检查代码、测试和执行结果。</p>{recoveryMessages.some((message) => message.moduleId === selected.id) ? <p className="message-warning">请先处理本会话的不确定送达消息。</p> : null}<div className="modal-actions"><button type="button" onClick={() => setAcceptanceFeedback(true)}>继续处理</button><button className="primary" type="button" disabled={busy || recoveryMessages.some((message) => message.moduleId === selected.id)} onClick={() => void accept()}>接受并完成</button></div></>}</Modal> : null}
-    {blockedOpen && selected?.phase === 'BLOCKED' ? <Modal title="需要人工处理" onClose={() => setBlockedOpen(false)}><p className="eyebrow">Action Required</p><p>ChatGPT 暂停了当前自动流程，需要你的输入后才能继续。</p><section><strong>原因</strong><pre>{blockedReason ?? '正在读取原因…'}</pre></section><label>回复 ChatGPT<textarea value={blockedFeedback} onChange={(event) => setBlockedFeedback(event.target.value)} placeholder="输入你的回复…" rows={5} /></label><div className="modal-actions"><button type="button" onClick={() => setBlockedOpen(false)}>稍后处理</button><button className="primary" type="button" disabled={busy || !blockedFeedback.trim()} onClick={() => void submitBlockedFeedback()}>提交并继续</button></div></Modal> : null}
     {stopConfirm && selected ? <Modal title="终止当前会话？" onClose={() => setStopConfirm(false)}><p>这将停止自动循环，但会保留已有的会话和执行记录。</p>{selected.phase === 'CODEX_RUNNING' ? <p>当前 Codex 回合会自然结束；其结果不会回传 ChatGPT。</p> : null}<div className="modal-actions"><button type="button" onClick={() => setStopConfirm(false)}>取消</button><button className="danger" type="button" disabled={busy} onClick={() => void terminate()}>终止会话</button></div></Modal> : null}
     {deleteTarget ? <Modal title={`删除“${deleteTarget.name}”？`} onClose={() => setDeleteTarget(null)}><p>此操作会删除该会话的消息历史和运行状态，但不会删除工作目录中的任何项目文件。</p><div className="modal-actions"><button type="button" onClick={() => setDeleteTarget(null)}>取消</button><button className="danger" type="button" disabled={busy} onClick={() => void deleteSession()}>删除会话</button></div></Modal> : null}
   </main>;

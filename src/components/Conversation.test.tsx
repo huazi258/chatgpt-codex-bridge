@@ -65,6 +65,9 @@ describe('Conversation timeline', () => {
     />);
 
     expect(screen.getByText(/等待 Codex 返回：RELAY_CORE_ROUND_2_OK/)).toBeTruthy();
-    expect(screen.getByText('⚠ 自动流程已暂停，需要人工处理')).toBeTruthy();
+    const interventionEvent = screen.getByText('⚠ 自动流程已暂停，需要人工处理');
+    expect(interventionEvent).toBeTruthy();
+    expect(interventionEvent.className).toContain('attention-event');
+    expect(interventionEvent.className).not.toContain('failed');
   });
 });

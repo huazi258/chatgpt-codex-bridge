@@ -3,5 +3,9 @@
   "identifier": "default",
   "description": "Default capability for the local middleware shell.",
   "windows": ["main"],
-  "permissions": ["core:default", "notification:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-request-user-attention",
+    "notification:default"
+  ]
 }

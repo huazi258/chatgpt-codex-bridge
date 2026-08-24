@@ -96,49 +96,63 @@ describe('会话工作台', () => {
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('continue_unknown_relay_message_without_resend', { messageId: 'unknown-1' }));
   });
 
-  it('验收 Modal 可关闭重开，并提交反馈', async () => {
+  it('验收 Drawer 可关闭重开，并提交反馈', async () => {
     modules = [module({ phase: 'WAITING_FOR_ACCEPTANCE' })];
     render(<App />);
-    await screen.findByRole('dialog', { name: '等待人工验收' });
-    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+    await screen.findByLabelText('等待人工验收');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByPlaceholderText('输入消息…')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '关闭人工处理' }));
+    expect(screen.getByText('会话信息')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '等待验收' }));
-    await screen.findByRole('dialog', { name: '等待人工验收' });
+    await screen.findByLabelText('等待人工验收');
     fireEvent.click(screen.getByRole('button', { name: '继续处理' }));
     fireEvent.change(screen.getByPlaceholderText('输入反馈…'), { target: { value: '请补充验证' } });
     fireEvent.click(screen.getByRole('button', { name: '提交并继续' }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('submit_relay_acceptance_feedback', { moduleId: 'one', text: '请补充验证' }));
   });
 
-  it('BLOCKED 自动打开人工介入 Modal，关闭后保持状态且可从顶栏重开', async () => {
+  it('BLOCKED 自动打开人工介入 Drawer，关闭后保持状态且可从顶栏重开', async () => {
     modules = [module({ phase: 'BLOCKED' })];
     blockedReason = '等待 Codex 返回：RELAY_CORE_ROUND_2_OK';
     render(<App />);
-    await screen.findByRole('dialog', { name: '需要人工处理' });
+    await screen.findByLabelText('需要人工处理');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByPlaceholderText('输入消息…')).toBeTruthy();
     expect(await screen.findByText(blockedReason)).toBeTruthy();
     expect((screen.getByRole('button', { name: '提交并继续' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: '稍后处理' }));
-    expect(screen.queryByRole('dialog', { name: '需要人工处理' })).toBeNull();
+    expect(screen.queryByLabelText('需要人工处理')).toBeNull();
     expect(screen.getByRole('button', { name: '需要人工处理' })).toBeTruthy();
     listeners.get('chatgpt-status')?.({ payload: { phase: 'CONNECTED', detail: '刷新' } });
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: '需要人工处理' })).toBeNull());
+    await waitFor(() => expect(screen.queryByLabelText('需要人工处理')).toBeNull());
     fireEvent.click(screen.getByRole('button', { name: '需要人工处理' }));
-    expect(await screen.findByRole('dialog', { name: '需要人工处理' })).toBeTruthy();
+    expect(await screen.findByLabelText('需要人工处理')).toBeTruthy();
   });
 
   it('BLOCKED 回复作为 automation continuation 提交并刷新为等待 ChatGPT', async () => {
     modules = [module({ phase: 'BLOCKED' })];
     blockedReason = '需要确认';
     render(<App />);
-    await screen.findByRole('dialog', { name: '需要人工处理' });
+    await screen.findByLabelText('需要人工处理');
     fireEvent.change(screen.getByPlaceholderText('输入你的回复…'), { target: { value: '条件已满足，请继续' } });
     fireEvent.click(screen.getByRole('button', { name: '提交并继续' }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('submit_relay_blocked_feedback', { moduleId: 'one', text: '条件已满足，请继续' }));
     await screen.findByRole('button', { name: '等待 ChatGPT' });
   });
 
+  it('验收 Drawer 的接受完成操作仍调用既有接口', async () => {
+    modules = [module({ phase: 'WAITING_FOR_ACCEPTANCE' })];
+    render(<App />);
+    await screen.findByLabelText('等待人工验收');
+    fireEvent.click(screen.getByRole('button', { name: '接受并完成' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('accept_relay_module', { moduleId: 'one' }));
+  });
+
   it('终止确认仍调用既有状态机接口', async () => {
     render(<App />);
     fireEvent.click(await screen.findByTitle('终止当前会话'));
+    expect(await screen.findByRole('dialog', { name: '终止当前会话？' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '终止会话' }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('terminate_relay_module', { moduleId: 'one' }));
   });
@@ -154,6 +168,7 @@ describe('会话工作台', () => {
     render(<App />);
     fireEvent.click(await screen.findByLabelText('打开“Bridge UI”菜单'));
     fireEvent.click(screen.getByRole('button', { name: '删除会话' }));
+    expect(await screen.findByRole('dialog', { name: '删除“Bridge UI”？' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '删除会话' }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('delete_relay_module', { moduleId: 'one' }));
     await screen.findByText('还没有会话。');
