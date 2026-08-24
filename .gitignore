@@ -1,8 +1,8 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/target-task6/
 src-tauri/.tauri/
 *.db
 *.db-shm
 *.db-wal
-
