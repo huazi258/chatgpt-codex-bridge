@@ -130,6 +130,34 @@ describe('会话工作台', () => {
     expect(await screen.findByLabelText('需要人工处理')).toBeTruthy();
   });
 
+  it('BLOCKED Drawer 独立于 Inspector 折叠状态，普通刷新不强制展开', async () => {
+    localStorage.setItem('relay.inspector.collapsed', 'true');
+    modules = [module({ phase: 'BLOCKED' })];
+    render(<App />);
+    const drawer = await screen.findByLabelText('需要人工处理');
+    expect(drawer.className).not.toContain('collapsed');
+    fireEvent.click(screen.getByRole('button', { name: '收起人工处理' }));
+    expect(screen.getByRole('button', { name: '展开人工处理' })).toBeTruthy();
+    listeners.get('chatgpt-status')?.({ payload: { phase: 'CONNECTED', detail: '刷新' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: '展开人工处理' })).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: '关闭人工处理' }));
+    expect(await screen.findByRole('button', { name: '展开会话信息' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '需要人工处理' }));
+    expect((await screen.findByLabelText('需要人工处理')).className).not.toContain('collapsed');
+  });
+
+  it('等待人工验收进入、收起和从顶栏重开时同样独立于 Inspector', async () => {
+    localStorage.setItem('relay.inspector.collapsed', 'true');
+    modules = [module({ phase: 'WAITING_FOR_ACCEPTANCE' })];
+    render(<App />);
+    expect((await screen.findByLabelText('等待人工验收')).className).not.toContain('collapsed');
+    fireEvent.click(screen.getByRole('button', { name: '收起人工处理' }));
+    fireEvent.click(screen.getByRole('button', { name: '关闭人工处理' }));
+    expect(await screen.findByRole('button', { name: '展开会话信息' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '等待验收' }));
+    expect((await screen.findByLabelText('等待人工验收')).className).not.toContain('collapsed');
+  });
+
   it('BLOCKED 回复作为 automation continuation 提交并刷新为等待 ChatGPT', async () => {
     modules = [module({ phase: 'BLOCKED' })];
     blockedReason = '需要确认';
