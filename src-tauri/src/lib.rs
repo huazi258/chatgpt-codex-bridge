@@ -754,6 +754,26 @@ enum RelayCodexRecoveryReason {
     ThreadBecameActiveBeforeResume,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexRecoveryAction {
+    RetryResume,
+    ReacquireThread,
+    StartNewThread,
+    RetryTurnStart,
+    SelectExistingThread { thread_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+enum RelayCodexRecoveryAllowedAction {
+    RetryResume,
+    ReacquireThread,
+    StartNewThread,
+    RetryTurnStart,
+    SelectExistingThread,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayChatGptChannelSnapshot {
@@ -4322,6 +4342,78 @@ fn set_relay_codex_recovery_reason(
     Ok(())
 }
 
+fn allowed_relay_codex_recovery_actions_in(
+    connection: &Connection,
+    module: &RelayModuleRecord,
+    has_runtime: bool,
+) -> Result<Vec<RelayCodexRecoveryAllowedAction>, String> {
+    if has_runtime || module.phase != "RECOVERY_REQUIRED" {
+        return Ok(Vec::new());
+    }
+    let Some(reason) = module.codex_recovery_reason.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let pending_p1 = list_relay_codex_cycles_in(connection, &module.id)?
+        .into_iter()
+        .any(|cycle| cycle.status == "WAITING_TO_SEND_CODEX");
+    let target_thread_id = module
+        .resume_thread_id
+        .as_deref()
+        .or(module.codex_thread_id.as_deref());
+    let registry = match target_thread_id {
+        Some(thread_id) => get_relay_codex_thread(connection, thread_id)?,
+        None => None,
+    };
+    let reserved_by_module = registry.as_ref().is_some_and(|record| {
+        record.state == RelayCodexThreadState::Reserved
+            && record.owner_module_id.as_deref() == Some(module.id.as_str())
+    });
+    let active_by_module = registry.as_ref().is_some_and(|record| {
+        record.state == RelayCodexThreadState::Active
+            && record.owner_module_id.as_deref() == Some(module.id.as_str())
+    });
+    let unavailable_from_module = registry.as_ref().is_some_and(|record| {
+        record.state == RelayCodexThreadState::Unavailable
+            && record.owner_module_id.is_none()
+            && record.last_module_id.as_deref() == Some(module.id.as_str())
+    });
+    let actions = match reason {
+        "THREAD_START_FAILED" => vec![RelayCodexRecoveryAllowedAction::StartNewThread],
+        "THREAD_START_UNKNOWN" if reserved_by_module => {
+            vec![RelayCodexRecoveryAllowedAction::RetryResume]
+        }
+        "THREAD_START_UNKNOWN" => vec![
+            RelayCodexRecoveryAllowedAction::StartNewThread,
+            RelayCodexRecoveryAllowedAction::SelectExistingThread,
+        ],
+        "THREAD_RESUME_FAILED" | "THREAD_BECAME_ACTIVE_BEFORE_RESUME" if reserved_by_module => {
+            vec![
+                RelayCodexRecoveryAllowedAction::RetryResume,
+                RelayCodexRecoveryAllowedAction::StartNewThread,
+            ]
+        }
+        "THREAD_RESUME_UNKNOWN" if unavailable_from_module => {
+            vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
+        }
+        "THREAD_RESUME_UNKNOWN"
+            if active_by_module && module.codex_thread_id.is_some() && pending_p1 =>
+        {
+            vec![RelayCodexRecoveryAllowedAction::RetryTurnStart]
+        }
+        "THREAD_REACQUIRE_REQUIRED" if unavailable_from_module => {
+            vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
+        }
+        "TURN_START_FAILED" if active_by_module && pending_p1 => {
+            vec![RelayCodexRecoveryAllowedAction::RetryTurnStart]
+        }
+        "TURN_START_UNKNOWN" if unavailable_from_module => {
+            vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
+        }
+        _ => Vec::new(),
+    };
+    Ok(actions)
+}
+
 fn send_relay_codex_start_turn(
     session: &RelayCodexSession,
     cycle_id: &str,
@@ -7130,6 +7222,111 @@ mod tests {
         assert_eq!(thread.state, RelayCodexThreadState::Unavailable);
         assert_eq!(thread.owner_module_id, None);
         assert_eq!(thread.last_module_id.as_deref(), Some("module-a"));
+    }
+
+    #[test]
+    fn relay_codex_recovery_actions_follow_persisted_authorization_matrix() {
+        let connection = relay_connection();
+        insert_relay_module(&connection, "module-a", "恢复模块");
+        let cycle = create_relay_codex_cycle(&connection, "module-a", 1, "P1").expect("create P1");
+        connection
+            .execute(
+                "UPDATE relay_modules
+                 SET phase = 'RECOVERY_REQUIRED', resume_thread_id = 'thread-a',
+                     codex_recovery_reason = 'THREAD_START_UNKNOWN'
+                 WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set recovery");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(
+            allowed_relay_codex_recovery_actions_in(&connection, &module, false).expect("actions"),
+            vec![
+                RelayCodexRecoveryAllowedAction::StartNewThread,
+                RelayCodexRecoveryAllowedAction::SelectExistingThread,
+            ]
+        );
+
+        upsert_relay_codex_thread(
+            &connection,
+            &RelayCodexThreadRecord {
+                thread_id: "thread-a".into(),
+                working_directory: r"G:\workspace".into(),
+                state: RelayCodexThreadState::Reserved,
+                owner_module_id: Some("module-a".into()),
+                last_module_id: Some("module-a".into()),
+                reservation_previous_state: Some("NONE".into()),
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("reserve");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(
+            allowed_relay_codex_recovery_actions_in(&connection, &module, false).expect("actions"),
+            vec![RelayCodexRecoveryAllowedAction::RetryResume]
+        );
+
+        set_relay_codex_thread_state(
+            &connection,
+            "thread-a",
+            RelayCodexThreadState::Unavailable,
+            None,
+            None,
+        )
+        .expect("unavailable");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_recovery_reason = 'THREAD_RESUME_UNKNOWN' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set unknown");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(
+            allowed_relay_codex_recovery_actions_in(&connection, &module, false).expect("actions"),
+            vec![RelayCodexRecoveryAllowedAction::ReacquireThread]
+        );
+
+        connection
+            .execute(
+                "UPDATE relay_codex_threads SET state = 'ACTIVE', owner_module_id = 'module-a' WHERE thread_id = 'thread-a'",
+                [],
+            )
+            .expect("activate");
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_thread_id = 'thread-a' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("record acquired");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert_eq!(
+            allowed_relay_codex_recovery_actions_in(&connection, &module, false).expect("actions"),
+            vec![RelayCodexRecoveryAllowedAction::RetryTurnStart]
+        );
+
+        connection
+            .execute(
+                "UPDATE relay_modules SET codex_recovery_reason = 'TURN_START_UNKNOWN' WHERE id = 'module-a'",
+                [],
+            )
+            .expect("set unsafe turn unknown");
+        let module = get_relay_module(&connection, "module-a")
+            .expect("module")
+            .expect("module exists");
+        assert!(
+            allowed_relay_codex_recovery_actions_in(&connection, &module, false)
+                .expect("actions")
+                .is_empty()
+        );
+        assert_eq!(cycle.status, "WAITING_TO_SEND_CODEX");
     }
 
     fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {
