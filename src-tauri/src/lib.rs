@@ -245,17 +245,20 @@ fn persist_relay_codex_start_recovery_in(
     reason: &str,
 ) -> Result<bool, String> {
     if let Some(recovery_reason) = relay_codex_start_recovery_reason(reason) {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| format!("无法开始 Codex 对话恢复事务：{error}"))?;
         if recovery_reason == RelayCodexRecoveryReason::TurnStartUnknown
             || recovery_reason == RelayCodexRecoveryReason::ThreadResumeUnknown
         {
-            if let Some(module) = get_relay_module(connection, module_id)? {
+            if let Some(module) = get_relay_module(&transaction, module_id)? {
                 if let Some(thread_id) = module
                     .codex_thread_id
                     .as_deref()
                     .or(module.resume_thread_id.as_deref())
                 {
                     set_relay_codex_thread_state(
-                        connection,
+                        &transaction,
                         thread_id,
                         RelayCodexThreadState::Unavailable,
                         None,
@@ -264,17 +267,20 @@ fn persist_relay_codex_start_recovery_in(
                 }
             }
         }
-        set_relay_phase(connection, module_id, "RECOVERY_REQUIRED")?;
-        set_relay_codex_recovery_reason(connection, module_id, Some(recovery_reason))?;
+        set_relay_phase(&transaction, module_id, "RECOVERY_REQUIRED")?;
+        set_relay_codex_recovery_reason(&transaction, module_id, Some(recovery_reason))?;
         if let Some(cycle_id) = cycle_id {
-            set_relay_codex_pending_cycle_error(connection, cycle_id, reason)?;
+            set_relay_codex_pending_cycle_error(&transaction, cycle_id, reason)?;
         }
         append_relay_event(
-            connection,
+            &transaction,
             module_id,
             "CODEX_THREAD_RECOVERY_REQUIRED",
             reason,
         )?;
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交 Codex 对话恢复：{error}"))?;
         return Ok(true);
     }
     Ok(false)
