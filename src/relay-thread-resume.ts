@@ -27,6 +27,7 @@ export interface RelayModuleCreationInput {
 export interface RelayThreadResumeModuleFields {
   resumeThreadId?: string | null;
   codexRecoveryReason?: string | null;
+  codexThreadId?: string | null;
 }
 
 export type RelayCodexRecoveryAction =

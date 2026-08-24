@@ -13,6 +13,8 @@ let recoveryMessages: Array<{ messageId: string; moduleId: string; moduleName: s
 let codexCycles: RelayCodexCycle[] = [];
 let relayMessages: Array<{ id: string; sequenceNumber: number; direction: 'TO_CHATGPT' | 'FROM_CHATGPT' | 'TO_CODEX' | 'FROM_CODEX'; kind: 'MANUAL' | 'AUTOMATION' | 'SYSTEM'; text: string; deliveryState: string }> = [];
 let terminateError: Error | null = null;
+let createError: Error | null = null;
+let threadCandidates: Array<{ threadId: string; name?: string | null; source: string; status: string; branch?: string | null; recencyAt: number | null; selectable: boolean; disabledReason?: string | null }> = [];
 let channelSnapshot: RelayChannelSnapshot = {
   chatgpt: { status: 'IDLE', recoveryBlockerCount: 0 },
   codex: { status: 'IDLE' },
@@ -27,7 +29,9 @@ invoke.mockImplementation(async (command: string, args?: { input?: { name: strin
   if (command === 'list_relay_recovery_messages') return recoveryMessages;
   if (command === 'list_relay_codex_cycles') return codexCycles;
   if (command === 'get_relay_channel_snapshot') return channelSnapshot;
+  if (command === 'list_relay_codex_threads_for_cwd') return threadCandidates;
   if (command === 'create_relay_module') {
+    if (createError) throw createError;
     const input = args?.input;
     if (!input) throw new Error('missing module input');
     const created = { id: 'created', name: input.name, workingDirectory: input.workingDirectory, maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', stopAfterTurn: false, invalidReplyCount: 0, startedCycles: 0 };
@@ -54,6 +58,8 @@ describe('传话模块创建入口', () => {
     codexCycles = [];
     relayMessages = [];
     terminateError = null;
+    createError = null;
+    threadCandidates = [];
     channelSnapshot = {
       chatgpt: { status: 'IDLE', recoveryBlockerCount: 0 },
       codex: { status: 'IDLE' },
@@ -136,6 +142,102 @@ describe('传话模块创建入口', () => {
     expect(container.querySelector('.message-history')?.textContent).not.toContain('这是内部 Codex 生命周期结果。');
     expect(container.querySelector('.message-history')?.textContent).not.toContain('RELAY_E2E_OK');
     expect(container.querySelector('.message-history')?.textContent).not.toContain('Codex 运行中');
+  });
+});
+
+describe('Codex 对话创建选择', () => {
+  beforeEach(() => {
+    modules = [{ id: 'existing', name: '原有模块', workingDirectory: 'G:\\projects\\existing', maxCycles: 12, maxRuntimeMinutes: 240, retryTemplate: '重试', phase: 'READY', stopAfterTurn: false, invalidReplyCount: 0, startedCycles: 0 }];
+    recoveryMessages = [];
+    codexCycles = [];
+    relayMessages = [];
+    createError = null;
+    threadCandidates = [
+      { threadId: 'thread-selectable-123456', name: '可继续的对话', source: 'cli', status: 'idle', branch: 'main', recencyAt: 1724457600000, selectable: true },
+      { threadId: 'thread-unnamed-123456', name: null, source: 'vscode', status: 'notLoaded', branch: null, recencyAt: null, selectable: true },
+      { threadId: 'thread-active-123456', name: '正在运行', source: 'appServer', status: 'active', branch: null, recencyAt: null, selectable: false, disabledReason: '当前正在运行，暂不可选择' },
+      { threadId: 'thread-error-123456', name: '系统错误', source: 'cli', status: 'systemError', branch: null, recencyAt: null, selectable: false, disabledReason: 'Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。' },
+    ];
+    invoke.mockClear();
+  });
+
+  afterEach(cleanup);
+
+  async function openCreation() {
+    render(<App />);
+    await screen.findByRole('heading', { name: '原有模块' });
+    fireEvent.click(screen.getByRole('button', { name: '新建模块' }));
+    await screen.findByRole('heading', { name: '创建传话模块' });
+    fireEvent.change(screen.getByLabelText('模块名称'), { target: { value: '继续模块' } });
+    fireEvent.change(screen.getByLabelText('Codex 工作目录'), { target: { value: 'G:\\projects\\resume' } });
+  }
+
+  it('明确展示新建和继续现有 Codex 对话两种模式', async () => {
+    await openCreation();
+    expect(screen.getByLabelText(/新建 Codex 对话/)).toBeTruthy();
+    expect(screen.getByLabelText(/继续现有 Codex 对话/)).toBeTruthy();
+  });
+
+  it('NEW 创建发送 mode=NEW 且不发现对话', async () => {
+    await openCreation();
+    fireEvent.click(screen.getByRole('button', { name: '创建传话模块' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('create_relay_module', expect.objectContaining({ input: expect.objectContaining({ codexThreadTarget: { mode: 'NEW' } }) })));
+    expect(invoke).not.toHaveBeenCalledWith('list_relay_codex_threads_for_cwd', expect.anything());
+  });
+
+  it('EXISTING 未刷新或未选择时不能创建', async () => {
+    await openCreation();
+    fireEvent.click(screen.getByLabelText(/继续现有 Codex 对话/));
+    expect((screen.getByRole('button', { name: '创建传话模块' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText('请刷新对话后再选择；工作目录变更后需要重新刷新。')).toBeTruthy();
+  });
+
+  it('刷新按当前 cwd 调用，渲染候选元数据和不可选原因', async () => {
+    await openCreation();
+    fireEvent.click(screen.getByLabelText(/继续现有 Codex 对话/));
+    fireEvent.click(screen.getByRole('button', { name: '刷新对话' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('list_relay_codex_threads_for_cwd', { workingDirectory: 'G:\\projects\\resume' }));
+    expect(await screen.findByText('可继续的对话')).toBeTruthy();
+    expect(screen.getByText('来源：cli · 状态：idle')).toBeTruthy();
+    expect(screen.getByText(/^分支：main/)).toBeTruthy();
+    expect(screen.getByText('未命名 Codex 对话')).toBeTruthy();
+    expect(screen.getByText('当前正在运行，暂不可选择')).toBeTruthy();
+    expect(screen.getByText('Codex 对话当前处于系统错误状态，暂不可选择；请在 Codex 中恢复后刷新。')).toBeTruthy();
+    expect((screen.getAllByRole('button', { name: '不可选择' })[0] as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('选择可继续候选后精确发送 EXISTING threadId', async () => {
+    await openCreation();
+    fireEvent.click(screen.getByLabelText(/继续现有 Codex 对话/));
+    fireEvent.click(screen.getByRole('button', { name: '刷新对话' }));
+    await screen.findByText('可继续的对话');
+    fireEvent.click(screen.getAllByRole('button', { name: '选择此对话' })[0]);
+    fireEvent.click(screen.getByRole('button', { name: '创建传话模块' }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('create_relay_module', expect.objectContaining({ input: expect.objectContaining({ codexThreadTarget: { mode: 'EXISTING', threadId: 'thread-selectable-123456' } }) })));
+  });
+
+  it('工作目录改变会清空已刷新候选和选择', async () => {
+    await openCreation();
+    fireEvent.click(screen.getByLabelText(/继续现有 Codex 对话/));
+    fireEvent.click(screen.getByRole('button', { name: '刷新对话' }));
+    await screen.findByText('可继续的对话');
+    fireEvent.click(screen.getAllByRole('button', { name: '选择此对话' })[0]);
+    fireEvent.change(screen.getByLabelText('Codex 工作目录'), { target: { value: 'G:\\projects\\other' } });
+    expect(screen.queryByText('可继续的对话')).toBeNull();
+    expect((screen.getByRole('button', { name: '创建传话模块' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('创建时后端最终校验失败会保留创建页面和用户选择', async () => {
+    createError = new Error('对话状态已变化，请刷新');
+    await openCreation();
+    fireEvent.click(screen.getByLabelText(/继续现有 Codex 对话/));
+    fireEvent.click(screen.getByRole('button', { name: '刷新对话' }));
+    await screen.findByText('可继续的对话');
+    fireEvent.click(screen.getAllByRole('button', { name: '选择此对话' })[0]);
+    fireEvent.click(screen.getByRole('button', { name: '创建传话模块' }));
+    expect(await screen.findByText(/创建失败：.*对话状态已变化，请刷新/)).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '创建传话模块' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '已选择' })).toBeTruthy();
   });
 });
 

@@ -113,6 +113,18 @@ nav { display: grid; gap: 9px; }
 .mode-switch { display: flex; gap: 8px; }
 .mode-switch button { padding: 8px 10px; border: 1px solid #cbd5e3; border-radius: 7px; color: #52637d; background: #fff; font-weight: 800; font-size: 13px; }
 .mode-switch button.selected { border-color: #5379c7; color: #284e9f; background: #edf3ff; }
+.codex-thread-target { display: grid; gap: 10px; margin: 0 0 17px; padding: 14px; border: 1px solid #d9e1ec; border-radius: 9px; }
+.codex-thread-target legend { padding: 0 5px; color: #47536a; font-size: 13px; font-weight: 800; }
+.codex-thread-target label { grid-template-columns: auto 1fr; align-items: start; margin: 0; }
+.codex-thread-target input { width: auto; margin-top: 3px; }
+.codex-thread-target span { grid-column: 2; color: #66738a; font-size: 12px; font-weight: 500; line-height: 1.45; }
+.codex-thread-picker { display: grid; gap: 12px; margin: -2px 0 17px; }
+.relay-thread-candidates { display: grid; gap: 10px; }
+.relay-thread-candidate { display: flex; align-items: start; justify-content: space-between; gap: 16px; padding: 14px; border: 1px solid #d9e1ec; border-radius: 9px; background: #f8fbff; }
+.relay-thread-candidate.selected { border-color: #5379c7; background: #edf3ff; }
+.relay-thread-candidate strong { color: #273c5d; font-size: 14px; }
+.relay-thread-candidate p { margin: 5px 0 0; color: #52637d; font-size: 12px; line-height: 1.4; }
+.relay-thread-candidate .relay-thread-disabled-reason { color: #a82f39; font-weight: 800; }
 
 @media (max-width: 980px) {
   body { min-width: 0; }

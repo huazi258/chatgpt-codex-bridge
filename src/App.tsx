@@ -6,14 +6,16 @@ import { GlobalChannelStatus } from './components/GlobalChannelStatus';
 import { RelayAcceptancePanel } from './components/RelayAcceptancePanel';
 import { RelayModuleActions } from './components/RelayModuleActions';
 import type { RelayChannelSnapshot, RelayCodexCycle } from './relay-observability';
+import { RelayCodexThreadCandidateList } from './components/RelayCodexThreadCandidateList';
+import type { RelayCodexThreadCandidate, RelayCodexThreadTarget, RelayModuleCreationInput, RelayThreadResumeModuleFields } from './relay-thread-resume';
 
 type RelayKind = 'MANUAL' | 'AUTOMATION';
 
 interface PairingInfo { endpoint: string; pairingSecret: string; paired: boolean; }
 interface BridgeStatus { phase: string; detail: string; }
-interface RelayModule {
+interface RelayModule extends RelayThreadResumeModuleFields {
   id: string; name: string; workingDirectory: string; maxCycles: number; maxRuntimeMinutes: number;
-  retryTemplate: string; phase: string; codexThreadId?: string; invalidReplyCount: number; startedCycles: number;
+  retryTemplate: string; phase: string; invalidReplyCount: number; startedCycles: number;
   stopAfterTurn: boolean;
 }
 interface RelayMessage {
@@ -40,6 +42,9 @@ export default function App() {
   const [notice, setNotice] = useState('正在加载本地传话状态…');
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState({ name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry });
+  const [codexThreadTarget, setCodexThreadTarget] = useState<RelayCodexThreadTarget>({ mode: 'NEW' });
+  const [threadCandidates, setThreadCandidates] = useState<RelayCodexThreadCandidate[] | null>(null);
+  const [threadRefreshBusy, setThreadRefreshBusy] = useState(false);
   const [text, setText] = useState('');
   const [kind, setKind] = useState<RelayKind>('MANUAL');
   const selected = useMemo(
@@ -74,6 +79,27 @@ export default function App() {
   }
   async function refreshPairing() { setPairing(await invoke<PairingInfo>('get_chatgpt_pairing')); }
 
+  function resetThreadSelection() {
+    setThreadCandidates(null);
+    setCodexThreadTarget((target) => target.mode === 'EXISTING' ? { mode: 'EXISTING', threadId: '' } : target);
+  }
+
+  async function refreshCodexThreads() {
+    const workingDirectory = draft.workingDirectory.trim();
+    if (!workingDirectory) return setNotice('请先填写 Codex 工作目录。');
+    setThreadRefreshBusy(true);
+    setThreadCandidates(null);
+    setCodexThreadTarget({ mode: 'EXISTING', threadId: '' });
+    try {
+      setThreadCandidates(await invoke<RelayCodexThreadCandidate[]>('list_relay_codex_threads_for_cwd', { workingDirectory }));
+      setNotice('已刷新 Codex 对话列表，请明确选择一个可继续的对话。');
+    } catch (error) {
+      setNotice(`刷新 Codex 对话失败：${String(error)}`);
+    } finally {
+      setThreadRefreshBusy(false);
+    }
+  }
+
   useEffect(() => {
     Promise.all([refreshModules(), refreshPairing(), refreshRecoveryMessages(), refreshChannelSnapshot()])
       .then(() => setNotice('本地传话状态已就绪。先在 Chrome 扩展中绑定当前 ChatGPT 对话。'))
@@ -105,14 +131,22 @@ export default function App() {
     if (!draft.name.trim() || !draft.workingDirectory.trim()) return setNotice('请填写模块名称和 Codex 工作目录。');
     setBusy(true);
     try {
-      const module = await invoke<RelayModule>('create_relay_module', { input: {
+      if (codexThreadTarget.mode === 'EXISTING' && !codexThreadTarget.threadId) {
+        return setNotice('请刷新并选择要继续的 Codex 对话。');
+      }
+      const input: RelayModuleCreationInput = {
         name: draft.name.trim(), workingDirectory: draft.workingDirectory.trim(), maxCycles: Number(draft.maxCycles),
-        maxRuntimeMinutes: Number(draft.maxRuntimeMinutes), retryTemplate: draft.retryTemplate.trim()
-      }});
+        maxRuntimeMinutes: Number(draft.maxRuntimeMinutes), retryTemplate: draft.retryTemplate.trim(), codexThreadTarget,
+      };
+      const module = await invoke<RelayModule>('create_relay_module', { input });
       await refreshModules(module.id, false);
       setIsCreatingModule(false);
       setDraft({ name: '', workingDirectory: '', maxCycles: '12', maxRuntimeMinutes: '240', retryTemplate: defaultRetry });
-      setNotice(`已创建“${module.name}”。创建不会发送消息或启动 Codex。`);
+      setCodexThreadTarget({ mode: 'NEW' });
+      setThreadCandidates(null);
+      setNotice(codexThreadTarget.mode === 'NEW'
+        ? `已创建“${module.name}”；收到首个有效 Codex 提示后才会创建 Codex 对话。`
+        : `已创建“${module.name}”并保留所选 Codex 对话；收到首个有效 Codex 提示后才会继续。`);
     } catch (error) { setNotice(`创建失败：${String(error)}`); } finally { setBusy(false); }
   }
 
@@ -232,9 +266,9 @@ export default function App() {
       <p className="notice" role="status">{notice}</p>
       <section className="form-section connection-card"><div><h3>ChatGPT 浏览器连接</h3><p className="execution-status">{bridge?.detail ?? '在 Chrome 扩展中选择当前已登录的 ChatGPT 对话后配对。'}</p></div><label>本机地址<input readOnly value={pairing?.endpoint ?? '正在启动…'} /></label><label>一次性配对密钥<input readOnly value={pairing?.pairingSecret ?? '正在生成…'} /></label><button className="secondary" type="button" onClick={() => void refreshPairing().catch((error) => setNotice(String(error)))} disabled={busy}>刷新连接状态</button></section>
       {recoveryMessages.length > 0 ? <section className="form-section uncertain-delivery"><h3>待人工处理的不确定送达消息</h3><p>存在待人工处理的不确定送达消息</p><p className="execution-status">为遵守不确定送达规则，所有消息会保持安全阻塞，直到你逐条明确决定。</p>{recoveryMessages.map((message) => <article className="message system" key={message.messageId}><header><strong>{message.moduleName} · 第 {message.sequenceNumber} 条 · {message.kind === 'MANUAL' ? '手动' : '自动化'}</strong><span>UNKNOWN</span></header><div className="uncertain-delivery"><button className="secondary" disabled={busy} type="button" onClick={() => void retryUnknownMessage(message.messageId)}>明确重发这条消息</button><button className="secondary" disabled={busy} type="button" onClick={() => void continueUnknownMessageWithoutResend(message.messageId)}>不重发并继续</button></div></article>)}</section> : null}
-      {!selected ? <form className="form-section" onSubmit={createModule}><h3>新建模块</h3><label>模块名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="例如：中间件 V2 实现" /></label><label>Codex 工作目录<input value={draft.workingDirectory} onChange={(event) => setDraft({ ...draft, workingDirectory: event.target.value })} placeholder="G:\\projects\\your-project" /></label><div className="budget-grid"><label>最大自动循环次数<input inputMode="numeric" value={draft.maxCycles} onChange={(event) => setDraft({ ...draft, maxCycles: event.target.value })} /></label><label>模块最长时间（分钟）<input inputMode="numeric" value={draft.maxRuntimeMinutes} onChange={(event) => setDraft({ ...draft, maxRuntimeMinutes: event.target.value })} /></label></div><label>协议重试模板<textarea rows={3} value={draft.retryTemplate} onChange={(event) => setDraft({ ...draft, retryTemplate: event.target.value })} /></label><button className="primary" disabled={busy} type="submit">创建传话模块</button></form> : <>
+      {!selected ? <form className="form-section" onSubmit={createModule}><h3>新建模块</h3><label>模块名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="例如：中间件 V2 实现" /></label><label>Codex 工作目录<input value={draft.workingDirectory} onChange={(event) => { setDraft({ ...draft, workingDirectory: event.target.value }); resetThreadSelection(); }} placeholder="G:\\projects\\your-project" /></label><fieldset className="codex-thread-target"><legend>Codex 对话</legend><label><input type="radio" name="codex-thread-target" checked={codexThreadTarget.mode === 'NEW'} onChange={() => { setCodexThreadTarget({ mode: 'NEW' }); setThreadCandidates(null); }} />新建 Codex 对话<span>收到本模块第一份有效 Codex 提示后才创建。</span></label><label><input type="radio" name="codex-thread-target" checked={codexThreadTarget.mode === 'EXISTING'} onChange={() => { setCodexThreadTarget({ mode: 'EXISTING', threadId: '' }); setThreadCandidates(null); }} />继续现有 Codex 对话<span>先选择此工作目录下可继续的 Codex 对话；创建模块时只保留，不会立即继续执行。</span></label></fieldset>{codexThreadTarget.mode === 'EXISTING' ? <section className="codex-thread-picker"><div className="inline-actions"><button className="secondary" type="button" disabled={busy || threadRefreshBusy || !draft.workingDirectory.trim()} onClick={() => void refreshCodexThreads()}>{threadRefreshBusy ? '正在刷新…' : '刷新对话'}</button></div>{threadCandidates === null ? <p className="execution-status">请刷新对话后再选择；工作目录变更后需要重新刷新。</p> : <RelayCodexThreadCandidateList candidates={threadCandidates} selectedThreadId={codexThreadTarget.threadId} busy={busy || threadRefreshBusy} onSelect={(threadId) => setCodexThreadTarget({ mode: 'EXISTING', threadId })} />}</section> : null}<div className="budget-grid"><label>最大自动循环次数<input inputMode="numeric" value={draft.maxCycles} onChange={(event) => setDraft({ ...draft, maxCycles: event.target.value })} /></label><label>模块最长时间（分钟）<input inputMode="numeric" value={draft.maxRuntimeMinutes} onChange={(event) => setDraft({ ...draft, maxRuntimeMinutes: event.target.value })} /></label></div><label>协议重试模板<textarea rows={3} value={draft.retryTemplate} onChange={(event) => setDraft({ ...draft, retryTemplate: event.target.value })} /></label><button className="primary" disabled={busy || threadRefreshBusy || (codexThreadTarget.mode === 'EXISTING' && (!threadCandidates || !codexThreadTarget.threadId))} type="submit">创建传话模块</button></form> : <>
         <GlobalChannelStatus snapshot={channelSnapshot} />
-        <section className="form-section relay-summary"><div><h3>模块状态</h3><p className="execution-status">工作目录：{selected.workingDirectory}</p></div><p className="execution-status">已开始循环：{selected.startedCycles} / {selected.maxCycles} · 最长运行：{selected.maxRuntimeMinutes} 分钟 · 无效自动化回复：{selected.invalidReplyCount}</p>{selected.codexThreadId ? <p className="protocol-result">Codex 对话：{selected.codexThreadId}</p> : <p className="execution-status">首个有效 CODEX_PROMPT 到来后才会创建 Codex 对话。</p>}</section>
+        <section className="form-section relay-summary"><div><h3>模块状态</h3><p className="execution-status">工作目录：{selected.workingDirectory}</p></div><p className="execution-status">已开始循环：{selected.startedCycles} / {selected.maxCycles} · 最长运行：{selected.maxRuntimeMinutes} 分钟 · 无效自动化回复：{selected.invalidReplyCount}</p>{selected.codexThreadId ? <p className="protocol-result">已获取 Codex 对话 · {selected.codexThreadId.slice(0, 12)}</p> : selected.resumeThreadId ? <p className="protocol-result">已选择现有对话 · {selected.resumeThreadId.slice(0, 12)}</p> : <p className="execution-status">新 Codex 对话 · 尚未创建</p>}</section>
         {selected.phase === 'COMPLETED' ? <section className="form-section relay-terminal-notice"><h3>已验收完成</h3><p className="execution-status">该模块已完成验收，保留历史记录且不会再发送消息或启动 Codex。</p></section> : null}
         {selected.phase === 'STOPPED' ? <section className="form-section relay-terminal-notice"><h3>已终止</h3><p className="execution-status">该模块已由用户终止，保留历史记录且不会再发送消息或启动 Codex。</p></section> : null}
         {selected.phase === 'WAITING_FOR_ACCEPTANCE' ? <RelayAcceptancePanel blockedByUnknown={recoveryMessages.some((message) => message.moduleId === selected.id)} busy={busy} onAccept={acceptSelectedModule} onSubmitFeedback={submitAcceptanceFeedback} /> : null}
