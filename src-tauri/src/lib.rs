@@ -161,6 +161,38 @@ enum RelayCodexCommand {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayCodexOutstandingRpc {
+    Initialize,
+    ThreadStart,
+    ThreadResume { thread_id: String },
+    TurnStart { cycle_id: String, thread_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayCodexRpcOutcome {
+    MatchingSuccess,
+    MatchingExplicitError(String),
+    Unrelated,
+}
+
+fn classify_relay_codex_rpc_response(message: &Value, request_id: i64) -> RelayCodexRpcOutcome {
+    if message.get("id").and_then(Value::as_i64) != Some(request_id) {
+        return RelayCodexRpcOutcome::Unrelated;
+    }
+    if let Some(detail) = message
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        RelayCodexRpcOutcome::MatchingExplicitError(detail.to_string())
+    } else if message.get("result").is_some() {
+        RelayCodexRpcOutcome::MatchingSuccess
+    } else {
+        RelayCodexRpcOutcome::MatchingExplicitError("响应缺少 result。".into())
+    }
+}
+
 fn release_relay_codex_session(
     sessions: &Mutex<Option<RelayCodexSession>>,
     module_id: &str,
@@ -4245,6 +4277,7 @@ fn relay_codex_worker(
     let mut pending_turn: Option<(String, String)> = None;
     let mut active_cycle_id = Some(initial_cycle_id);
     let mut next_request_id = 3_i64;
+    let mut outstanding = Some((1_i64, RelayCodexOutstandingRpc::Initialize));
     let mut final_summary = String::new();
     let mut release_acknowledgement: Option<std_mpsc::Sender<Result<(), String>>> = None;
     'worker: loop {
@@ -4270,16 +4303,13 @@ fn relay_codex_worker(
                             relay_codex_failed(&app, &module_id, active_cycle_id.as_deref(), error);
                             break 'worker;
                         }
-                        if let Err(error) = relay_codex_turn_started(
-                            &app,
-                            &module_id,
-                            &cycle_id,
-                            Some(thread),
-                            None,
-                        ) {
-                            relay_codex_failed(&app, &module_id, Some(cycle_id.as_str()), error);
-                            break 'worker;
-                        }
+                        outstanding = Some((
+                            next_request_id,
+                            RelayCodexOutstandingRpc::TurnStart {
+                                cycle_id: cycle_id.clone(),
+                                thread_id: thread.to_string(),
+                            },
+                        ));
                         next_request_id += 1;
                         final_summary.clear();
                     } else {
@@ -4313,22 +4343,23 @@ fn relay_codex_worker(
                 break;
             }
             Ok(Ok(message)) => {
-                if let Some(error) = message
-                    .get("error")
-                    .and_then(|value| value.get("message"))
-                    .and_then(Value::as_str)
-                {
-                    relay_codex_failed(
-                        &app,
-                        &module_id,
-                        active_cycle_id.as_deref(),
-                        format!("Codex App Server 错误：{error}"),
-                    );
-                    break;
-                }
-                match message.get("id").and_then(Value::as_i64) {
-                    Some(1) => {
-                        if send_rpc(&mut stdin, json!({ "method": "initialized", "params": {} }))
+                if let Some((request_id, rpc)) = outstanding.clone() {
+                    match classify_relay_codex_rpc_response(&message, request_id) {
+                        RelayCodexRpcOutcome::Unrelated => {}
+                        RelayCodexRpcOutcome::MatchingExplicitError(error) => {
+                            relay_codex_failed(
+                                &app,
+                                &module_id,
+                                active_cycle_id.as_deref(),
+                                format!("Codex App Server 请求被明确拒绝：{error}"),
+                            );
+                            break;
+                        }
+                        RelayCodexRpcOutcome::MatchingSuccess => {
+                            match rpc {
+                                RelayCodexOutstandingRpc::Initialize => {
+                                    outstanding = None;
+                                    if send_rpc(&mut stdin, json!({ "method": "initialized", "params": {} }))
                             .and_then(|_| {
                                 send_rpc(
                                     &mut stdin,
@@ -4345,56 +4376,75 @@ fn relay_codex_worker(
                             );
                             break;
                         }
-                    }
-                    Some(2) => {
-                        thread_id = message
-                            .pointer("/result/thread/id")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned);
-                        let Some(thread) = thread_id.as_deref() else {
-                            relay_codex_failed(
-                                &app,
-                                &module_id,
-                                active_cycle_id.as_deref(),
-                                "Codex 未返回对话 ID。".into(),
-                            );
-                            break;
-                        };
-                        relay_codex_thread_ready(&app, &module_id, thread);
-                        if let Some((cycle_id, prompt)) = pending_turn.take() {
-                            if let Err(error) = send_rpc(
-                                &mut stdin,
-                                json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
-                            ) {
-                                relay_codex_failed(
-                                    &app,
-                                    &module_id,
-                                    Some(cycle_id.as_str()),
-                                    error,
-                                );
-                                break;
+                                    outstanding = Some((2, RelayCodexOutstandingRpc::ThreadStart));
+                                }
+                                RelayCodexOutstandingRpc::ThreadStart => {
+                                    outstanding = None;
+                                    thread_id = message
+                                        .pointer("/result/thread/id")
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned);
+                                    let Some(thread) = thread_id.as_deref() else {
+                                        relay_codex_failed(
+                                            &app,
+                                            &module_id,
+                                            active_cycle_id.as_deref(),
+                                            "Codex 未返回对话 ID。".into(),
+                                        );
+                                        break;
+                                    };
+                                    relay_codex_thread_ready(&app, &module_id, thread);
+                                    if let Some((cycle_id, prompt)) = pending_turn.take() {
+                                        if let Err(error) = send_rpc(
+                                            &mut stdin,
+                                            json!({ "method": "turn/start", "id": next_request_id, "params": { "threadId": thread, "input": [{ "type": "text", "text": prompt }] } }),
+                                        ) {
+                                            relay_codex_failed(
+                                                &app,
+                                                &module_id,
+                                                Some(cycle_id.as_str()),
+                                                error,
+                                            );
+                                            break;
+                                        }
+                                        outstanding = Some((
+                                            next_request_id,
+                                            RelayCodexOutstandingRpc::TurnStart {
+                                                cycle_id: cycle_id.clone(),
+                                                thread_id: thread.to_string(),
+                                            },
+                                        ));
+                                        next_request_id += 1;
+                                        final_summary.clear();
+                                    }
+                                }
+                                RelayCodexOutstandingRpc::TurnStart {
+                                    cycle_id,
+                                    thread_id,
+                                } => {
+                                    outstanding = None;
+                                    let turn_id =
+                                        message.pointer("/result/turn/id").and_then(Value::as_str);
+                                    if let Err(error) = relay_codex_turn_started(
+                                        &app,
+                                        &module_id,
+                                        &cycle_id,
+                                        Some(&thread_id),
+                                        turn_id,
+                                    ) {
+                                        relay_codex_failed(
+                                            &app,
+                                            &module_id,
+                                            Some(cycle_id.as_str()),
+                                            error,
+                                        );
+                                        break;
+                                    }
+                                }
+                                RelayCodexOutstandingRpc::ThreadResume { .. } => {}
                             }
-                            if let Err(error) = relay_codex_turn_started(
-                                &app,
-                                &module_id,
-                                &cycle_id,
-                                Some(thread),
-                                None,
-                            ) {
-                                relay_codex_failed(
-                                    &app,
-                                    &module_id,
-                                    Some(cycle_id.as_str()),
-                                    error,
-                                );
-                                break;
-                            }
-                            next_request_id += 1;
-                            final_summary.clear();
                         }
                     }
-                    Some(_) => {}
-                    None => {}
                 }
                 if message.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
                 {
@@ -5916,6 +5966,39 @@ mod tests {
         assert!(!frames.contains("thread/resume"));
         assert!(!frames.contains("thread/start"));
         assert!(!frames.contains("turn/start"));
+    }
+
+    #[test]
+    fn relay_codex_worker_requires_matching_rpc_success_before_confirming_turn_start() {
+        let request_id = 9;
+        assert_eq!(
+            classify_relay_codex_rpc_response(
+                &json!({ "method": "item/agentMessage/delta", "params": { "delta": "ignored" } }),
+                request_id,
+            ),
+            RelayCodexRpcOutcome::Unrelated
+        );
+        assert_eq!(
+            classify_relay_codex_rpc_response(
+                &json!({ "id": 8, "result": { "turn": { "id": "wrong" } } }),
+                request_id,
+            ),
+            RelayCodexRpcOutcome::Unrelated
+        );
+        assert_eq!(
+            classify_relay_codex_rpc_response(
+                &json!({ "id": request_id, "error": { "message": "denied" } }),
+                request_id,
+            ),
+            RelayCodexRpcOutcome::MatchingExplicitError("denied".into())
+        );
+        assert_eq!(
+            classify_relay_codex_rpc_response(
+                &json!({ "id": request_id, "result": { "turn": { "id": "turn-a" } } }),
+                request_id,
+            ),
+            RelayCodexRpcOutcome::MatchingSuccess
+        );
     }
 
     fn relay_module_input(target: RelayCodexThreadTargetInput) -> RelayModuleInput {
