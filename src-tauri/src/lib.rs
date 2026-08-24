@@ -4818,7 +4818,10 @@ fn relay_codex_thread_resumed(
         .connection
         .lock()
         .map_err(|_| "数据库锁已损坏。".to_string())?;
-    let changed = connection
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("无法开始继续 Codex 对话事务：{error}"))?;
+    let changed = transaction
         .execute(
             "UPDATE relay_codex_threads
              SET state = 'ACTIVE', reservation_previous_state = NULL, updated_at = ?3
@@ -4829,7 +4832,7 @@ fn relay_codex_thread_resumed(
     if changed != 1 {
         return Err("所选 Codex 对话不再由当前模块保留，不能继续。".into());
     }
-    connection
+    transaction
         .execute(
             "UPDATE relay_modules
              SET codex_thread_id = ?2, codex_recovery_reason = NULL, updated_at = ?3
@@ -4838,11 +4841,14 @@ fn relay_codex_thread_resumed(
         )
         .map_err(|error| format!("无法保存继续的 Codex 对话：{error}"))?;
     append_relay_event(
-        &connection,
+        &transaction,
         module_id,
         "CODEX_THREAD_RESUMED",
         "已继续所选 Codex 对话。",
     )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("无法提交继续 Codex 对话：{error}"))?;
     Ok(())
 }
 
