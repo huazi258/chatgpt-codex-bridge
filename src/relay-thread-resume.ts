@@ -42,3 +42,32 @@ export type RelayCodexRecoveryAllowedAction =
   | { type: 'START_NEW_THREAD' }
   | { type: 'RETRY_TURN_START' }
   | { type: 'SELECT_EXISTING_THREAD' };
+
+export interface RelayCodexThreadRegistryState {
+  threadId: string;
+  workingDirectory: string;
+  state: 'RESERVED' | 'ACTIVE' | 'RELEASED' | 'UNAVAILABLE' | string;
+  ownerModuleId?: string | null;
+  lastModuleId?: string | null;
+  reservationPreviousState?: string | null;
+  updatedAt: string;
+}
+
+export interface RelayCodexThreadRecoveryCycle {
+  id: string;
+  cycleNumber: number;
+  status: string;
+  promptText: string;
+}
+
+export interface RelayCodexThreadStateSnapshot {
+  moduleId: string;
+  workingDirectory: string;
+  intendedThreadId?: string | null;
+  acquiredThreadId?: string | null;
+  registry?: RelayCodexThreadRegistryState | null;
+  recoveryReason?: string | null;
+  pendingCycle?: RelayCodexThreadRecoveryCycle | null;
+  summary: string;
+  allowedActions: RelayCodexRecoveryAllowedAction[];
+}
